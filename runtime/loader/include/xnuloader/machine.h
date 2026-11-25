@@ -30,7 +30,8 @@ typedef enum {
 
 // pci (a block or the Data store only): a virtio-blk PCI function instead of a virtio-mmio window, base and size its
 // configuration space (crosvm's CAM: 0x100; QEMU's ECAM: 0x1000); node "virtio-pci-N" or "data-store", compatible
-// "oneios,virtio-pci", no "droidvm,intid" (OneiOSHostedDisk polls; the line is the PCI host's, not the board's). An input
+// "oneios,virtio-pci", no "droidvm,intid" (OneiOSHostedDisk polls; the line is the PCI host's, not the board's: only the GPU
+// takes one, xl_machine.gpu_intid). An input
 // device on PCI is the bus instead (xnuloader-crosvm --display): node "input-pci", compatible "oneios,virtio-input-pci",
 // base and size bus 0 of the CAM; the kernel finds crosvm's virtio-input functions on it and polls them. The sound card on
 // PCI is a bus too (xnuloader-crosvm --audio): node "virtio-snd", compatible "oneios,virtio-snd-pci", base and size bus 0
@@ -57,6 +58,10 @@ typedef struct {
   // /arm-io/virtio-gpu drm-host-pool: physical base and size of the memory, outside the kernel's window, in which
   // the host's 3D renderer keeps what the guest maps (UniXNU-droidvm DroidVMVirtioGpu3D.cpp); size 0 for no 3D.
   uint64_t    gpu_pool_base, gpu_pool_size;
+  // /arm-io/virtio-gpu droidvm,intid on PCI (xnuloader-crosvm --gpu-intid): the GIC line crosvm's PCI host routes the GPU's
+  // function to (its interrupt-map: 00:0c.0 to SPI 4, INTID 36, level-high, no other device on it); the transport then sleeps on
+  // it instead of polling the used ring (DroidVMVirtioGpu.cpp, staged). 0: none, the transport polls.
+  uint32_t    gpu_intid;
   // /arm-io/virtio-media media-host-pool: physical base and size of the memory, outside the kernel's window, in
   // which the video encoder's MMAP'd V4L2 buffers live (runtime/bridges/encoder); the guest maps it as the codec's
   // OUTPUT/CAPTURE buffers (UniXNU-droidvm DroidVMVirtioMedia.c). Size 0 for no encoder.

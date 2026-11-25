@@ -725,13 +725,40 @@ The native VM must cost more than bare Android, but much of today's gap is waste
   55.7 °C mean). So the default is now the governor's own scaling; `--gpu-floor 607` / `--cpu-floor 60` stay as opt-in
   for an A/B. A real battery-drain number (fuel-gauge `current_now`, or `dumpsys batterystats`) still needs the phone;
   the residency and temperature are a proxy, not watts.
-- **The virtio-gpu transport busy-polls (the structural cost, not yet fixed).** The guest's virtio-gpu on crosvm's PCI
-  has no interrupt: the loader gives PCI functions no `droidvm,intid` (`runtime/loader/src/machine.c`, the `XL_DEV_GPU`
-  case), so the transport (`DroidVMVirtioGpu.cpp`, vendored under `kits/droidvm`, staged by `kernel/build-native.sh`,
-  not a tracked file) waits on each fence by polling the used ring with 100 µs sleeps — a vCPU never deep-idles and the
-  submit→fence round trip is ~6.6 ms with the GPU ~1–30% busy. The fix is not shippable from the PC: it needs either
-  (a) crosvm's virtio-pci MSI-X delivered and the vendored transport sleeping on it, verified against Gunyah's
-  interrupt delivery on the phone (a line that never fires costs every wait its ~20 ms guard — unprovable on QEMU), or
-  (b) an adaptive backoff in that vendored transport (tight spin while a submission is in flight for latency, a real
-  sleep/WFI only when nothing is pending for power). Both touch vendored source and need a phone A/B; see
-  `native-frame-latency` for the frame-rate half.
+- **The virtio-gpu transport's waits sleep on the GPU's interrupt (implemented 2026-11-25, branch `native-gpu-irq`;
+  needs the phone A/B).** Before, the guest's virtio-gpu on crosvm's PCI had no interrupt: the loader gave PCI
+  functions no `droidvm,intid`, so the transport (`DroidVMVirtioGpu.cpp`, vendored under `kits/droidvm`, staged by
+  `kernel/build-native.sh`, not a tracked file) waited on each fence by polling the used ring with 100 µs sleeps (a VM
+  exit each), and a vCPU never deep-idled while anything animated (serial: `virtio-gpu: ... interrupt 0 (0)`). The
+  transport could already sleep on a line: given the node's `droidvm,intid` it attaches that SPI (level), spins 300 µs
+  on a wait, then turns the queue's interrupt on and sleeps on it with a 20 ms guard; in PCI mode its read of the ISR
+  acknowledges the line. crosvm's PCI host gives every function its own level-high line (take12's `fdt.dtb`,
+  `interrupt-map`: 00:0c.0, the GPU, to SPI 4 = INTID 36; the disks 00:02.0-00:06.0 to SPI 5-9, 00:01.0 to 10,
+  00:07.0-00:0a.0 to 11-14: none shared). So:
+  - `xnuloader-crosvm --gpu-intid N` (with `--gpu`/`--gpu-scanout` and `--image`; off by default, existing Images are
+    unchanged) writes `droidvm,intid = N` on `/arm-io/virtio-gpu` (`xl_machine.gpu_intid`; the other PCI functions
+    still get none and poll), prints `GPU interrupt: INTID N (crosvm's SPI N-32)` and adds `gpu-intid N` to
+    `OUT.disks`. No kernel rebuild: the transport reads the property at boot.
+  - `phone vm-boot` checks it before the kernel's GPU starts: once crosvm's tree is whole, beside the
+    `drm2kgsl_host@` check, the script reads the tree as hex words (`od -An -tx1 -v`, `tr`, `sed`, `grep -o -E`) and
+    wants exactly one `interrupt-map` entry for the GPU's device (child address `device << 11`, any pin, any GIC
+    phandle) naming SPI N-32, level-high. Then run.txt says `gpu: the GPU's interrupt is intid 36 (crosvm's SPI 4):
+    its waits sleep on it`; otherwise it says what crosvm gave (`gpu: crosvm routes 00:0c.0 to GIC type ... number
+    ... flags ...`, or no entry, or more than one) and stops the VM (`stop.request`, result `refused pool`): a wrong
+    line could be another device's level interrupt, which the GPU's handler would never acknowledge (a storm).
+  - Tested on the PC: the loader's tests (the property on the PCI GPU node only when set, = N; none on the PCI
+    store; an INTID outside 32-1019 and a line without a PCI GPU refused), vm-boot's tests (the parse and its
+    refusals; the check run by the PC's `sh` on trees as crosvm writes them: the match passes, another SPI, an edge
+    line, no entry and two entries stop the VM), and the check by hand on take12's real `fdt.dtb` (36 passes, 37
+    stops). **Not tested: Gunyah's delivery of crosvm's INTx line to the guest** (the first SPI this kernel attaches
+    in a crosvm VM; QEMU cannot prove it) and toybox's `od`/`sed`/`grep -o -E` on the phone.
+  - What proves it on the phone (take14, `out/crosvm/kernel-hd-wifi-2560-irq.img`): run.txt's `gpu: the GPU's
+    interrupt is intid 36 ...` line; serial.txt's `virtio-gpu: control queue of 256 commands and cursor queue ready,
+    features ..., interrupt 36 (0)` (`0` is attach's kIOReturnSuccess; the line before it still says `polled (no
+    interrupt)`: that text is the vendored transport's, printed before it reads the property); then frames as
+    smooth as take12's or better with less CPU (thermal.txt's perf-cluster clock and idle, the board's temperature).
+    The failure sign: frames far worse than take12's (stalls of ~20 ms on every wait that outlives the 300 µs spin)
+    = the waits run to their 20 ms guard, i.e. Gunyah does not deliver the line; the A/B is then the same image
+    without `--gpu-intid` (`kernel-hd-wifi-2560.img`). The transport's counters (`droidvm_virtio_gpu_waits[6]`
+    interrupts, `[7]` sleeps that ran to their guard) are not printed by anything yet. Should the line not come, the
+    other road stays an adaptive backoff in the vendored transport (see `native-frame-latency` for the frame-rate half).

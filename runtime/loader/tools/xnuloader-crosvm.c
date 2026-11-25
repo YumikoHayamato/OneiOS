@@ -6,7 +6,7 @@
 // stub (interrupts masked, x0 = boot_args, a branch to the entry); the kernel's window (xl_boot_place: its segments, the
 // device tree, boot_args) at its physical base, 32 MiB aligned with the kernel's own base as on the bench.
 //   xnuloader-crosvm KERNEL OUT [--cpus N] [--ram-mib N] [--timebase HZ] [--args TEXT] [--args-add TEXT] [--swiotlb MIB]
-//                    [--image DIR [--phone-image DIR] [--phone-data FILE]] [--shared-ram [--gpu | --gpu-scanout] [--audio] [--wifi]]
+//                    [--image DIR [--phone-image DIR] [--phone-data FILE]] [--shared-ram [--gpu | --gpu-scanout [--gpu-intid N]] [--audio] [--wifi]]
 // --ram-mib is the VM's (crosvm --mem): the window ends below crosvm's FDT and its restricted DMA pool (--swiotlb, 8 MiB
 // by default, 32 with --display, up to 1024; the RAM's last MIB). Writes OUT (the Image), OUT.adt (the device tree the kernel is given:
 // xnuloader-inspect adt FILE) and, with --image, OUT.disks; prints the layout.
@@ -65,6 +65,13 @@
 // starts its scanout client (oneios-virtio-scanout=1, staged/display.rs NATIVE_PROBE), crosvm shows the scanout in an
 // Android Surface it is given (its --android-display-service, the display helper's --crosvm-display), with no copy on
 // either CPU. OUT.disks then has "scanout WIDTH HEIGHT HZ" for crosvm's display.
+// --gpu-intid N (with --gpu or --gpu-scanout, and --image; default none): the GPU's interrupt, INTID N, as /arm-io/virtio-gpu's droidvm,intid:
+// the transport (DroidVMVirtioGpu.cpp, staged) then spins 300 us on a wait and sleeps on that level line after it (20 ms guard,
+// the PCI ISR's read acknowledges it), where without it the waits poll the used ring with 100 us sleeps. crosvm's PCI host gives
+// each function its own level-high line (its tree's interrupt-map: 00:0c.0, the GPU, to SPI 4 = INTID 36; the disks 5-9);
+// the kernel cannot read that map, so N is given here and vm-boot checks it against crosvm's tree before the GPU starts
+// (a wrong line could be another device's level interrupt), with --image only. The label is unchanged; OUT.disks then has
+// "gpu-intid N".
 // --audio (with --shared-ram): the speaker, crosvm's virtio-snd card (vm-boot: `--virtio-snd backend=aaudio`, AAudio on the
 // phone) for the kernel's audio archive (DroidVMVirtioSnd.c with staged/audio.rs SND_TRANSPORT_PCI under DroidVMAudio.cpp's
 // Speaker and Mic). crosvm places the card itself (its option has no pci-address), so /arm-io/virtio-snd
@@ -135,7 +142,7 @@ static uint8_t *slurp(const char *path, size_t *size)
 static void usage(void)
 {
   fprintf(stderr, "usage: xnuloader-crosvm KERNEL OUT [--cpus N] [--ram-mib N] [--timebase HZ] [--args TEXT] [--args-add TEXT] [--swiotlb MIB]\n"
-                  "                        [--image DIR [--phone-image DIR] [--phone-data FILE] [--display WxH [--scale 2|3] [--hz N]]] [--shared-ram [--gpu | --gpu-scanout] [--audio] [--wifi]]\n");
+                  "                        [--image DIR [--phone-image DIR] [--phone-data FILE] [--display WxH [--scale 2|3] [--hz N]]] [--shared-ram [--gpu | --gpu-scanout [--gpu-intid N]] [--audio] [--wifi]]\n");
   exit(2);
 }
 
@@ -157,6 +164,7 @@ int main(int argc, char **argv)
   const char *kernel_path = argv[1], *out = argv[2], *args = default_args, *image_dir = NULL;
   const char *phone_image = "/data/local/tmp/oneios/image", *phone_data = "/data/local/tmp/oneios-vmboot/data.img";
   unsigned cpus = 1, ram_mib = 2048, swiotlb_mib = 0;
+  unsigned gpu_intid = 0;
   unsigned display_w = 0, display_h = 0, display_scale = 3, display_hz = 60;
   uint32_t timebase = 19200000;         // the S25's (vm-probe: CNTFRQ_EL0 in the VM)
   bool shared_ram = false, gpu = false, gpu_scanout = false, audio = false, wifi = false;
@@ -185,6 +193,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[i], "--scale")) display_scale = (unsigned)strtoul(argv[++i], NULL, 0);
     else if (!strcmp(argv[i], "--hz")) display_hz = (unsigned)strtoul(argv[++i], NULL, 0);
     else if (!strcmp(argv[i], "--prime-list")) prime_list_path = argv[++i];
+    else if (!strcmp(argv[i], "--gpu-intid")) gpu_intid = (unsigned)strtoul(argv[++i], NULL, 0);
     else usage();
   }
   if (cpus < 1 || cpus > XL_MAX_CPUS || ram_mib < 512 || ram_mib > 6144) { fprintf(stderr, "xnuloader-crosvm: 1-%d CPUs, 512-6144 MiB\n", XL_MAX_CPUS); return 2; }
@@ -194,6 +203,8 @@ int main(int argc, char **argv)
   if (audio && !shared_ram) { fprintf(stderr, "xnuloader-crosvm: --audio needs --shared-ram\n"); return 2; }
   if (wifi && !shared_ram) { fprintf(stderr, "xnuloader-crosvm: --wifi needs --shared-ram\n"); return 2; }
   if (gpu_scanout && !display_w) { fprintf(stderr, "xnuloader-crosvm: --gpu-scanout needs --display\n"); return 2; }
+  // an SPI of the GIC, for the GPU only (the other PCI functions poll), with --image: OUT.disks carries it to vm-boot's check
+  if (gpu_intid && (!gpu || !image_dir || gpu_intid < 32 || gpu_intid > 1019)) { fprintf(stderr, "xnuloader-crosvm: --gpu-intid needs --gpu or --gpu-scanout and --image, an SPI: 32 to 1019\n"); return 2; }
   if (display_w && (!image_dir || display_w < 320 || display_h < 320 || display_w > 4096 || display_h > 4096 ||
                     (display_scale != 2 && display_scale != 3) || display_hz < 24 || display_hz > 120)) {
     fprintf(stderr, "xnuloader-crosvm: --display 320x320 to 4096x4096 with --image, --scale 2 or 3, --hz 24 to 120\n");
@@ -337,6 +348,7 @@ int main(int argc, char **argv)
     m.dev[m.ndev++] = (xl_device){ XL_DEV_GPU, PCI_CAM + ((uint64_t)GPU_PCI_DEV << ECAM_DEV_SHIFT), 0x1000, true };
     m.gpu_pool_base = drm_host;
     m.gpu_pool_size = DRM_HOST_MIB << 20;
+    m.gpu_intid = gpu_intid;
   }
   // the input bus: all of bus 0 on AVF's CAM; on Droid-VM's ECAM the input's device only, one step of the kernel's scan
   if (display_w)
@@ -455,6 +467,7 @@ int main(int argc, char **argv)
     if (display_w) fprintf(d, "input touch\n");
     if (gpu) fprintf(d, "gpu 00:%02x.0 %llu 0x%llx\n", GPU_PCI_DEV, (unsigned long long)DRM_HOST_MIB, (unsigned long long)drm_host);
     if (gpu_scanout) fprintf(d, "scanout %u %u %u\n", display_w, display_h, display_hz);
+    if (gpu_intid) fprintf(d, "gpu-intid %u\n", gpu_intid);
     if (audio) fprintf(d, "audio\n");
     if (wifi) fprintf(d, "wifi\n");
     for (unsigned i = 0; i < ndisk; i++) {
@@ -485,6 +498,9 @@ int main(int argc, char **argv)
   if (gpu)
     printf("  GPU: virtio-gpu at 00:%02x.0 (crosvm --gpu virglrenderer, drm2kgsl), drm2kgsl's host arena %llu MiB at PA 0x%llx\n",
            GPU_PCI_DEV, (unsigned long long)DRM_HOST_MIB, (unsigned long long)drm_host);
+  if (gpu_intid)
+    printf("  GPU interrupt: INTID %u (crosvm's SPI %u) as /arm-io/virtio-gpu droidvm,intid: its waits sleep on it (vm-boot checks crosvm's interrupt-map)\n",
+           gpu_intid, gpu_intid - 32);
   else
     printf("  restricted DMA pool (crosvm --swiotlb %u) at PA 0x%llx\n", swiotlb_mib, (unsigned long long)pool);
   if (display_w)

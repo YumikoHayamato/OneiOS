@@ -384,6 +384,30 @@ static void test_machine(void)
     CHECK(gpu && !xl_adt_get(gpu, "droidvm,intid"));
     xl_adt_free(pt);
   }
+  // with --gpu-intid: crosvm's line for the GPU's function as droidvm,intid on its node, and on no other PCI node; an INTID
+  // that is not an SPI, and a line without a GPU on PCI, are refused
+  machine_default(&m);
+  m.dev[4] = (xl_device){ XL_DEV_GPU, 0x10000 + (12 << 15), 0x1000, true };
+  m.dev[2].pci = true;
+  m.gpu_intid = 36;
+  pt = xl_machine_tree(&m, &err);
+  CHECK(pt != NULL);
+  if (pt) {
+    p = xl_adt_get(xl_adt_find(pt, "arm-io/virtio-gpu"), "droidvm,intid");
+    uint32_t line = 0;
+    if (p && p->length == 4) memcpy(&line, p->value, 4);
+    CHECK(p && p->length == 4 && line == 36);
+    const xl_adt_node *store = xl_adt_find(pt, "arm-io/data-store");
+    CHECK(store && !xl_adt_get(store, "droidvm,intid"));
+    xl_adt_free(pt);
+  }
+  m.gpu_intid = 31;
+  CHECK(xl_machine_tree(&m, &err) == NULL);
+  m.gpu_intid = 1020;
+  CHECK(xl_machine_tree(&m, &err) == NULL);
+  machine_default(&m);
+  m.gpu_intid = 36;
+  CHECK(xl_machine_tree(&m, &err) == NULL);    // the GPU of the default board is an MMIO window: its line is the board's
   // the sound card on PCI (xnuloader-crosvm --audio): all of bus 0 of crosvm's ECAM as reg, no board line (the driver polls)
   machine_default(&m);
   m.dev[4] = (xl_device){ XL_DEV_SND, 0x10000, 0x100000, true };

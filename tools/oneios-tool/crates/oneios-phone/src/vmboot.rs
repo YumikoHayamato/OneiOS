@@ -128,6 +128,9 @@ pub struct Disks {
     pub gpu: Option<Gpu>,
     /// `scanout WIDTH HEIGHT HZ` (xnuloader-crosvm --gpu-scanout): the screen through crosvm's own display
     pub scanout: Option<(u32, u32, u32)>,
+    /// `gpu-intid N` (xnuloader-crosvm --gpu-intid): the GIC line the kernel's GPU sleeps on, checked against crosvm's
+    /// interrupt-map (gpu_intid_check)
+    pub gpu_intid: Option<u32>,
     /// `audio` (xnuloader-crosvm --audio): the kernel's sound card, crosvm's virtio-snd with its AAudio backend (the speaker)
     pub audio: bool,
     /// `wifi` (xnuloader-crosvm --wifi): the kernel's Wi-Fi, crosvm's virtio-net on a tap that `wifictl tap` carries to wlan0
@@ -160,7 +163,7 @@ fn plain(text: &str) -> bool {
 
 pub fn parse_disks(text: &str) -> Result<Disks> {
     let (mut swiotlb, mut pool, mut store, mut fb, mut input, mut gpu, mut scanout) = (None, None, None, None, false, None, None);
-    let (mut audio, mut wifi) = (false, false);
+    let (mut audio, mut wifi, mut gpu_intid) = (false, false, None);
     let mut blocks = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let words: Vec<&str> = line.split_whitespace().collect();
@@ -185,6 +188,13 @@ pub fn parse_disks(text: &str) -> Result<Disks> {
             ["input", "touch"] => input = true,
             ["audio"] => audio = true,
             ["wifi"] => wifi = true,
+            ["gpu-intid", n] => {
+                let n: u32 = n.parse().context("gpu-intid N")?;
+                if !(32..=1019).contains(&n) {
+                    bail!("gpu-intid {n}: an SPI of the GIC, 32 to 1019");
+                }
+                gpu_intid = Some(n);
+            }
             ["gpu", pci, mib, pa] => {
                 let ok = pci.len() == 7 && pci.as_bytes()[2] == b':' && pci.as_bytes()[5] == b'.' && plain(pci);
                 if !ok {
@@ -203,13 +213,16 @@ pub fn parse_disks(text: &str) -> Result<Disks> {
                 }
                 scanout = Some((w, h, hz));
             }
-            _ => bail!("a line of the disks list that is not one of swiotlb-mib, pool, store, block, fb, input, gpu, scanout, audio, wifi: {line:?}"),
+            _ => bail!("a line of the disks list that is not one of swiotlb-mib, pool, store, block, fb, input, gpu, gpu-intid, scanout, audio, wifi: {line:?}"),
         }
     }
     let (store, store_gib) = store.context("no store line")?;
-    let d = Disks { swiotlb: swiotlb.context("no swiotlb-mib line")?, pool: pool.context("no pool line")?, store, store_gib, blocks, fb, input, gpu, scanout, audio, wifi };
+    let d = Disks { swiotlb: swiotlb.context("no swiotlb-mib line")?, pool: pool.context("no pool line")?, store, store_gib, blocks, fb, input, gpu, scanout, gpu_intid, audio, wifi };
     if d.scanout.is_some() && (d.gpu.is_none() || d.fb.is_none()) {
         bail!("a scanout without the GPU or the screen: xnuloader-crosvm gives it with --gpu-scanout and --display");
+    }
+    if d.gpu_intid.is_some() && d.gpu.is_none() {
+        bail!("a GPU interrupt without the GPU: xnuloader-crosvm gives it with --gpu-intid beside --gpu");
     }
     if d.input && d.fb.is_none() {
         bail!("the input bus without a screen: xnuloader-crosvm gives both with --display");
@@ -256,6 +269,30 @@ pub fn parse_disks(text: &str) -> Result<Disks> {
 /// the clock. Pinning 607 MHz the whole session only burned power. A session that wants to A/B a pinned floor passes
 /// `--gpu-floor 607` (607 MHz is one of the S25 GPU's 15 clocks, 160 to 1200 MHz).
 pub const GPU_FLOOR_MHZ: u32 = 0;
+
+/// The check of the GPU's interrupt (`gpu-intid N`, xnuloader-crosvm --gpu-intid), run once crosvm's tree is whole: its
+/// PCI host's `interrupt-map` must route the GPU's function (`pci`, crosvm's pci-address=; the map's child address is
+/// the device's bits alone, `interrupt-map-mask` 0xf800) to SPI N-32, level-high, in one entry. An entry is 10 cells:
+/// the child's address (3) and pin, the GIC's phandle (any), its address (2, zero), the SPI's type (0), number and flags
+/// (4, level-high); the tree is read as hex words with the phone's toybox (`od`, `tr`, `sed`, `grep -o -E`). Not so, or
+/// no entry: the line is not the GPU's (it could be another device's level interrupt, which the GPU's handler would
+/// never acknowledge), so the VM is stopped before the kernel's GPU sleeps on it. The function is the script's
+/// `gpu_irq`, which says what crosvm gave on `gpu:` lines and fails on a mismatch.
+pub fn gpu_intid_check(pci: &str, intid: u32) -> String {
+    let dev = u32::from_str_radix(pci.get(3..5).unwrap_or("0"), 16).unwrap_or(0);
+    let (child, spi) = (dev << 11, intid - 32);
+    format!(
+        "gpu_irq() {{\n  \
+         set -- $(od -An -tx1 -v $D/fdt.dtb | tr -d ' \\n' | sed 's/......../& /g' | \
+         grep -o -E ' {child:08x} 00000000 00000000 0000000[1-4] [0-9a-f]{{8}} 00000000 00000000 [0-9a-f]{{8}} [0-9a-f]{{8}} [0-9a-f]{{8}}')\n  \
+         if [ $# = 0 ]; then echo \"gpu: crosvm's interrupt-map has no entry for {pci}: intid {intid} is not known to be the GPU's line, stopped before the kernel's GPU sleeps on it\"; return 1; fi\n  \
+         if [ $# != 10 ]; then echo \"gpu: crosvm's interrupt-map has more than one entry for {pci} ($*): stopped before the kernel's GPU sleeps on intid {intid}\"; return 1; fi\n  \
+         if [ $8 = 00000000 ] && [ $9 = {spi:08x} ] && [ ${{10}} = 00000004 ]; then echo \"gpu: the GPU's interrupt is intid {intid} (crosvm's SPI {spi}): its waits sleep on it\"; return 0; fi\n  \
+         echo \"gpu: crosvm routes {pci} to GIC type 0x$8 number 0x$9 flags 0x${{10}}, not SPI {spi} level-high (type 0, number 0x{spi:x}, flags 4) as the Image's intid {intid}: stopped before the kernel's GPU sleeps on a line that is not its own\"; return 1\n\
+         }}\n\
+         if [ \"$pool\" != bad ] && ! gpu_irq; then pool=bad; touch $D/stop.request; fi\n"
+    )
+}
 
 pub fn boot_script(l: &Label, seconds: u32, thp: bool, sha: &str, disks: Option<&Disks>) -> String {
     boot_script_with(l, seconds, thp, sha, disks, false, false, &Tuning::DEFAULT)
@@ -667,6 +704,7 @@ pub fn boot_script_with(l: &Label, seconds: u32, thp: bool, sha: &str, disks: Op
                                  else echo \"gpu: crosvm's tree has no drm2kgsl_host@{x:x}: stopped before the kernel's GPU starts\"; pool=bad; touch $D/stop.request; fi; fi\n",
                                 x = g.drm_host
                             )
+                            + &d.gpu_intid.map(|n| gpu_intid_check(&g.pci, n)).unwrap_or_default()
                         })
                         .unwrap_or_default(),
                 )
@@ -1041,7 +1079,7 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
     let run = fs::read_to_string(Path::new(out).join("run.txt")).unwrap_or_default();
     for line in run.lines().filter(|l| {
         l.starts_with("disk") || l.starts_with("store:") || l.starts_with("pool:") || l.starts_with("/data:") || l.starts_with("display:")
-            || l.starts_with("touch:")
+            || l.starts_with("touch:") || l.starts_with("gpu:")
     }) {
         println!("vm-boot: {line}");
     }
@@ -1314,6 +1352,81 @@ mod tests {
         assert!(!plain.contains("--gpu ") && !plain.contains("drm2kgsl_host"));
     }
 
+    const GPU: &str = "gpu 00:0c.0 8 0x15f800000\n";
+
+    /// The GPU interrupt's check of a boot script run by the PC's `sh` on a tree of `words` (big-endian, as an FDT's
+    /// cells): what it said, `$pool` after it, and whether it asked for the VM's stop.
+    fn gpu_irq_run(script: &str, words: &[u32]) -> (String, String, bool) {
+        let from = script.find("gpu_irq() {\n").unwrap();
+        let end = "! gpu_irq; then pool=bad; touch $D/stop.request; fi\n";
+        let to = from + script[from..].find(end).unwrap() + end.len();
+        let dir = std::env::temp_dir().join(format!("oneios-vmboot-gpuirq-{}-{}", std::process::id(), words.iter().map(|w| *w as u64).sum::<u64>()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("fdt.dtb"), words.iter().flat_map(|w| w.to_be_bytes()).collect::<Vec<u8>>()).unwrap();
+        let body = format!("D={}\npool=\n{}echo \"pool=$pool\"\n", dir.display(), &script[from..to]);
+        let out = std::process::Command::new("sh").arg("-c").arg(&body).output().unwrap();
+        let stop = dir.join("stop.request").exists();
+        fs::remove_dir_all(&dir).ok();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let pool = text.lines().last().unwrap_or("").trim_start_matches("pool=").to_string();
+        (text, pool, stop)
+    }
+
+    /// An interrupt-map entry as crosvm writes it: device DEV's INTA to the GIC (phandle 1) as SPI `spi` with `flags`.
+    fn map_entry(dev: u32, spi: u32, flags: u32) -> [u32; 10] {
+        [dev << 11, 0, 0, 1, 1, 0, 0, 0, spi, flags]
+    }
+
+    #[test]
+    fn the_gpu_interrupt_is_given_only_when_crosvms_map_routes_the_gpu_to_it() {
+        // the line: an SPI, only beside the GPU; none, no check
+        let d = parse_disks(&format!("{SCREEN}{GPU}gpu-intid 36\n")).unwrap();
+        assert_eq!(d.gpu_intid, Some(36));
+        assert_eq!(parse_disks(&format!("{SCREEN}{GPU}")).unwrap().gpu_intid, None);
+        assert!(parse_disks(&format!("{SCREEN}gpu-intid 36\n")).is_err());
+        assert!(parse_disks(&format!("{SCREEN}{GPU}gpu-intid 31\n")).is_err() && parse_disks(&format!("{SCREEN}{GPU}gpu-intid 1020\n")).is_err());
+        let l = Label { ram: 2560, cpus: 6, swiotlb: 32, shared: true, gpu: true };
+        let s = boot_script(&l, 900, true, "ab12", Some(&d));
+        let without = boot_script(&l, 900, true, "ab12", Some(&parse_disks(&format!("{SCREEN}{GPU}")).unwrap()));
+        assert!(!without.contains("gpu_irq") && !without.contains("interrupt-map"));
+        // the check: after the arena's, before the bridge, on 00:0c.0's child address and SPI 4
+        assert!(s.contains("grep -o -E ' 00006000 00000000 00000000 0000000[1-4] [0-9a-f]{8} 00000000 00000000 [0-9a-f]{8} [0-9a-f]{8} [0-9a-f]{8}'"));
+        assert!(s.contains("[ $9 = 00000004 ] && [ ${10} = 00000004 ]"));
+        assert!(s.find("drm2kgsl_host@").unwrap() < s.find("gpu_irq() {").unwrap());
+        assert!(s.find("! gpu_irq; then pool=bad; touch $D/stop.request").unwrap() < s.find("TMPDIR=$D $D/displayctl pool").unwrap());
+        // run by the PC's sh on trees as crosvm writes them (take12's: the disks at 2 to 6 on SPI 5 to 9, the GPU at 12 on 4)
+        let header = [0xd00d_feedu32, 0x1de2, 0x38, 0x1c00, 3, 400, 0x1a5];
+        let tree = |gpu: Option<[u32; 10]>| -> Vec<u32> {
+            let mut w = header.to_vec();
+            w.extend(map_entry(2, 5, 4));
+            w.extend(map_entry(3, 6, 4));
+            if let Some(e) = gpu {
+                w.extend(e);
+            }
+            w.extend(map_entry(1, 10, 4));
+            w.extend([0xf800, 0, 0, 7, 9]);
+            w
+        };
+        let (said, pool, stop) = gpu_irq_run(&s, &tree(Some(map_entry(12, 4, 4))));
+        assert!(said.contains("gpu: the GPU's interrupt is intid 36 (crosvm's SPI 4): its waits sleep on it"), "{said}");
+        assert!(pool.is_empty() && !stop);
+        // another line, an edge line, no entry, two entries: stopped, and the run says what crosvm gave
+        let (said, pool, stop) = gpu_irq_run(&s, &tree(Some(map_entry(12, 6, 4))));
+        assert!(said.contains("crosvm routes 00:0c.0 to GIC type 0x00000000 number 0x00000006 flags 0x00000004, not SPI 4") && pool == "bad" && stop, "{said}");
+        let (said, pool, stop) = gpu_irq_run(&s, &tree(Some(map_entry(12, 4, 1))));
+        assert!(said.contains("flags 0x00000001, not SPI 4 level-high") && pool == "bad" && stop, "{said}");
+        let (said, pool, stop) = gpu_irq_run(&s, &tree(None));
+        assert!(said.contains("has no entry for 00:0c.0") && pool == "bad" && stop, "{said}");
+        let mut two = tree(Some(map_entry(12, 4, 4)));
+        two.extend(map_entry(12, 4, 4));
+        let (said, pool, stop) = gpu_irq_run(&s, &two);
+        assert!(said.contains("more than one entry for 00:0c.0") && pool == "bad" && stop, "{said}");
+        // a pool already refused is not checked again
+        let refused = s.replace("if [ \"$pool\" != bad ] && ! gpu_irq", "pool=bad\nif [ \"$pool\" != bad ] && ! gpu_irq");
+        let (said, _, stop) = gpu_irq_run(&refused, &tree(None));
+        assert!(!said.contains("gpu:") && !stop, "{said}");
+    }
+
     #[test]
     fn a_shared_ram_image_runs_under_droid_vms_crosvm() {
         assert_eq!(
@@ -1452,8 +1565,10 @@ mod tests {
         let l = Label { ram: 3072, cpus: 1, swiotlb: 8, shared: false, gpu: false };
         let l32 = Label { ram: 2880, cpus: 1, swiotlb: 32, shared: false, gpu: false };
         let touch = parse_disks(&format!("{SCREEN}input touch\n")).unwrap();
+        let irq = parse_disks(&format!("{SCREEN}{GPU}gpu-intid 36\n")).unwrap();
+        let lgpu = Label { ram: 2560, cpus: 6, swiotlb: 32, shared: true, gpu: true };
         for (n, script) in [boot_script(&l, 600, true, "ab12", Some(&d)), boot_script(&l, 60, false, "ab12", None), boot_script(&l32, 900, true, "ab12", Some(&screen)),
-                            boot_script(&l32, 900, true, "ab12", Some(&touch))]
+                            boot_script(&l32, 900, true, "ab12", Some(&touch)), boot_script(&lgpu, 900, true, "ab12", Some(&irq))]
             .iter()
             .enumerate()
         {

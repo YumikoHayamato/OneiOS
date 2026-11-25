@@ -124,6 +124,7 @@ xl_adt_node *xl_machine_tree(const xl_machine *m, const char **error)
   if (m->timebase_hz == 0) FAIL("the timebase frequency is missing");
   if ((m->dram_base | m->dram_size) & 0x3fff) FAIL("the RAM base and size must be 16 KiB aligned");
   if (m->armio_base == 0) FAIL("the arm-io base must not be 0");
+  if (m->gpu_intid && (m->gpu_intid < 32 || m->gpu_intid > 1019)) FAIL("the GPU's interrupt must be an SPI: INTID 32 to 1019");
   if (m->ncpu > 1 && (!m->psci_method || (strcmp(m->psci_method, "hvc") && strcmp(m->psci_method, "smc"))))
     FAIL("more than one CPU needs a PSCI conduit");
   if (m->gic_redist_size < m->gic_redist_stride * m->ncpu) FAIL("the redistributor window is smaller than one frame per CPU");
@@ -331,6 +332,7 @@ xl_adt_node *xl_machine_tree(const xl_machine *m, const char **error)
   xl_adt_set_str(xl_adt_add(io, "wlan"), "device_type", "wlan");
 
   unsigned blocks = 0, inputs = 0;
+  bool gpu_line = false;
   for (unsigned i = 0; i < m->ndev; i++) {
     const xl_device *d = &m->dev[i];
     char name[32];
@@ -377,7 +379,10 @@ xl_adt_node *xl_machine_tree(const xl_machine *m, const char **error)
     // The line of the window on the board's GIC: SPI INTID 32 + its index, under the name UniXNU-droidvm's
     // transports read. Not "interrupts": the tree has no interrupt-controller node (ArmCpu owns the GIC), and
     // IOKit's IODTMapOneInterrupt walks the parents of a node with "interrupts" forever looking for one.
+    // On PCI the line is the PCI host's (crosvm's interrupt-map), not the board's: only the GPU is given its own
+    // (gpu_intid, which vm-boot checks against crosvm's tree); the other functions poll.
     if (!d->pci) xl_adt_set_u32(n, "droidvm,intid", XL_BOARD_VIRTIO_SPI + i);
+    else if (d->kind == XL_DEV_GPU && m->gpu_intid) { xl_adt_set_u32(n, "droidvm,intid", m->gpu_intid); gpu_line = true; }
     if (d->kind == XL_DEV_GPU && m->gpu_pool_size) {
       uint64_t pool[2] = { m->gpu_pool_base, m->gpu_pool_size };
       xl_adt_set(n, "drm-host-pool", pool, sizeof pool);
@@ -387,6 +392,7 @@ xl_adt_node *xl_machine_tree(const xl_machine *m, const char **error)
       xl_adt_set(n, "media-host-pool", pool, sizeof pool);
     }
   }
+  if (m->gpu_intid && !gpu_line) FAIL("an interrupt for the GPU without the GPU on PCI");
   if (m->cpufreq_size) {
     xl_adt_node *freq = xl_adt_add(io, "cpufreq");
     xl_adt_set_str(freq, "compatible", "oneios,cpufreq");

@@ -241,7 +241,11 @@ space in crosvm's CAM (`0x10000 + device << 11`) with its identity, hash list an
 the pool: in a protected VM crosvm reads and writes no other guest memory); the files are the phone's
 (`--phone-image`, default the staged set `/data/local/tmp/oneios/image`; `--phone-data`, default the VM's own store
 `/data/local/tmp/oneios-vmboot/data.img`). `OUT.adt` is the tree it gave the kernel; `OUT.disks` lists the pool's
-address, the store and crosvm's `--block` values for vm-boot. No display yet.
+address, the store and crosvm's `--block` values for vm-boot. The later options (`--display`, `--shared-ram`, `--gpu`, `--gpu-scanout`,
+`--gpu-intid`, `--audio`, `--wifi`, `--prime-list`) are in the tool's header comment and `docs/native.md`. The PCI
+functions' nodes carry no `droidvm,intid` (their lines are crosvm's PCI host's, not the board's), except the GPU's with
+`--gpu-intid N` (`xl_machine.gpu_intid`: crosvm routes 00:0c.0 to INTID 36, which `phone vm-boot` checks in crosvm's
+tree; `docs/native.md` "Flattening the power gap").
 
 ### 2.2 Memory
 

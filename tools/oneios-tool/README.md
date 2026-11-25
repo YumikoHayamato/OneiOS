@@ -1664,14 +1664,22 @@ DIR (`phone-vmboot`), prints the run's disk, store and pool lines and crosvm's l
   60 Hz (`native-frame-latency`), not the clocks: take12 (floors on) kept the perf cluster at ~3 GHz and never idled,
   ~8 °C hotter than take10 (governor), whose perf cluster sat at 1.37 GHz and idled 84% of the time for the same GPU
   work. Pass `--gpu-floor 607` / `--cpu-floor 60` to pin a floor for an A/B; a takeover still lifts Samsung's cap meanwhile.
+- The GPU's interrupt: an Image made with `xnuloader-crosvm --gpu-intid N` lists `gpu-intid N` (an SPI, 32 to 1019;
+  refused without the `gpu` line). Once crosvm's tree is whole, after the `drm2kgsl_host@` check and before the bridge,
+  the script reads `fdt.dtb` as hex words (`od -An -tx1 -v`, `tr`, `sed`, `grep -o -E`) and wants exactly one
+  `interrupt-map` entry for the GPU's device (child address `device << 11`, any pin and GIC phandle) naming SPI N-32
+  level-high: run.txt then says `gpu: the GPU's interrupt is intid N (crosvm's SPI N-32): its waits sleep on it`.
+  Another line, an edge line, no entry or two: a `gpu:` line with what crosvm gave, and the VM is stopped
+  (`stop.request`, result `refused pool`): a wrong line could be another device's level interrupt. The run's `gpu:`
+  lines are printed with the others at the end (`docs/native.md` "Flattening the power gap").
 
-16 unit tests (`vmboot::tests`: the pool's share of the RAM (`check_pool`); the label with and without the pool; the disks list's refusals; stop before kill, the
+17 unit tests (`vmboot::tests`: the pool's share of the RAM (`check_pool`); the label with and without the pool; the disks list's refusals; stop before kill, the
 stop request, THP written back; the disks' checks before crosvm and the pool check right after it; the `fb` line in the
 pool and its refusals; the bridge after the pool check and before the main wait, ended after the VM, absent without a
 screen; the touchscreen's lookup run by the PC's `sh` and `awk` on the S25's device list (`event8`) and its refusals
 (not direct, missing, on a side key's device), the forwarder listening before crosvm and crosvm's multi-touch device on
 its socket with glob expansion off, both ended after the VM, the test swipes only with `--swipe-test`, the volume-down reader after the bridge
-and ended after the VM; the clock floors off by default and opted in with `--gpu-floor`/`--cpu-floor`; the scripts parse under `bash --posix -n`, `sh -n` and `dash -n`). Boot 1 on the S25 (2026-11-23, 2 GiB, 1 vCPU, 90 s, no disk): the
+and ended after the VM; the clock floors off by default and opted in with `--gpu-floor`/`--cpu-floor`; the GPU interrupt's line parsed and refused without the GPU or outside 32-1019, its check after the arena's and before the bridge, run by the PC's `sh` on crosvm-shaped trees (the match passes; another SPI, an edge line, no entry and two entries stop the VM), absent without the line; the scripts parse under `bash --posix -n`, `sh -n` and `dash -n`). Boot 1 on the S25 (2026-11-23, 2 GiB, 1 vCPU, 90 s, no disk): the
 kernel's whole start up to the root device's wait, `crosvm stop` at 90 s, One UI on (`docs/native.md` "The native
 kernel in crosvm").
 
