@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Runs outside any app container, like the other owner helpers (ownervisor's manager). -->
+  <key>com.apple.private.security.no-container</key><true/>
+  <!-- Place app bundles and create data containers under /var/containers and /var/mobile. -->
+  <key>com.apple.private.security.storage.AppBundles</key><true/>
+  <key>com.apple.private.security.storage.AppDataContainers</key><true/>
+  <key>com.apple.private.security.storage.MobileInstallation</key><true/>
+  <!-- Register apps with LaunchServices and rebuild its database. -->
+  <key>com.apple.lsapplicationworkspace.rebuilddatabase</key><true/>
+  <key>com.apple.private.MobileInstallation.AllowedSPI</key><true/>
+  <!-- installd/MobileInstallation fallback path (register.m "open items"). -->
+  <key>com.apple.private.mobileinstall.allowedSPI</key>
+  <array><string>Install</string><string>Lookup</string><string>Browse</string></array>
+  <!-- These are honored because appinst itself is ad-hoc signed and its CDHash is in the owner trust cache,
+       exactly like the Metal plugin and the other helpers. -->
+</dict>
+</plist>
