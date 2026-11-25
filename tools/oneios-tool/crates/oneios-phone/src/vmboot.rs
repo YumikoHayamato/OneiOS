@@ -53,6 +53,8 @@
 //! context-types=drm,udmabuf=true,pci-address=...,pci-bar-size=0x10000000`: no host-visible window is needed, a guest
 //! blob is the guest's own pages, and the 8 GiB default does not fit that crosvm's 64-bit window) and drm2kgsl's host arena
 //! (`--pre-alloc drm-host-mb=N`); the tree's `drm2kgsl_host@PA` node is checked beside the shim's.
+//! With `gpu-intid N` (xnuloader-crosvm --gpu-intid) the kernel's GPU sleeps on INTID N, so the script also wants crosvm's
+//! `interrupt-map` to route the GPU's function to SPI N-32 level-high, or stops the VM (`gpu_intid_check`).
 //!
 //! The screen through the GPU's scanout (xnuloader-crosvm --gpu-scanout, FILE.disks `scanout WIDTH HEIGHT HZ`): crosvm's
 //! virtio-gpu gets that display (`displays=[[mode=windowed[W,H],refresh-rate=HZ]]`) and its Android display backend
