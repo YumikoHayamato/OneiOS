@@ -34,8 +34,11 @@
 //                              new pipeline draws is left out until it is made (NativeMetal 0010); OFF without it: every
 //                              creation waits for its compile, as Metal does. An A/B for the first-use compile stutters
 //   oneios-queue-priority=WORD backboardd alone, METAL2VULKAN_QUEUE_PRIORITY=WORD (low, medium, high, realtime): its queues'
-//                              global priority fixed as the device opens, take18's way (it set high); without it the base's
-//                              way alone, Core Animation's setGPUPriority: forwarded to Turnip (tu_darwin_set_priority)
+//                              global priority fixed as the device opens. "high" WITHOUT the argument, as take18's plug-in
+//                              (NativeMetal b0d6a07) set it and 935c468 no longer does: the compositor's ring priority and
+//                              its deadline queue on the host depend on it (see the constructor). oneios-queue-priority=base:
+//                              none set, 935c468 as it is (its setGPUPriority: forwarding finds no tu_darwin_set_priority in
+//                              the board's Turnip)
 //   oneios-msaa=1              NATIVE_METAL_SINGLE_SAMPLE=0 (the base's variable): a process's textures, passes and pipelines keep
 //                              the sample counts it asks; without it the base makes them all with one sample (no
 //                              multisampling in any process: less GPU work, no antialiased edges), which take18's stack did not
@@ -51,7 +54,7 @@
 // gpu-ycbcr-planes=0, diag=1, gpu-trace=1, log-gpu=1, tu-debug=..., tu-cb=1, metal-tile=1, wallpaper-freeze=1, ca-triple-buffer=1.
 //
 // What it logs (iOS's log, each process that loads the plug-in): "OneiOS metal switches: ..." with the switches the boot
-// arguments set, once; nothing when none is set.
+// arguments set, once; nothing when none is set (backboardd says its queue priority either way).
 #include <dlfcn.h>
 #include <os/log.h>
 #include <stdlib.h>
@@ -157,8 +160,17 @@ __attribute__((constructor)) static void apply() {
         }
     }
     // The render server alone: the opt-in bounded wait for pipelines being made (NativeMetal 0010), and its queues' global
-    // priority fixed as the device opens, as take18's plug-in set it (the board's metal2vulkan 0012 and Turnip's
-    // turnip-darwin-queue-priority read METAL2VULKAN_QUEUE_PRIORITY; the base forwards Core Animation's setGPUPriority: instead).
+    // priority, "high", fixed as the device opens.
+    // The priority: NativeMetal b0d6a07's plug-in set METAL2VULKAN_QUEUE_PRIORITY=high in the render server (the board's
+    // metal2vulkan 0012 then asks Vulkan for a high global priority; Turnip's turnip-darwin-queue-priority moves the process's
+    // ring to it, and turnip-darwin-deadline-queue asks the host to treat a queue made at high or realtime priority as the
+    // compositor's, with a deadline: the queue the host renderer's clock constraint follows, vm-boot --gpu-host-floors
+    // deadline). NativeMetal 935c468 no longer sets it (upstream 2dc12fb forwards Core Animation's setGPUPriority: to
+    // tu_darwin_set_priority instead), and the board's Turnip has no such function (it is in upstream's
+    // turnip-gmem-mutable-swap.patch, which the board's Mesa list does not take: llvm-nm of the built library shows only
+    // tu_darwin_bo_cache_stats and tu_darwin_bo_cache_trim_idle), so the render server's queue would be an app's. Set here
+    // again, without overwrite, as b0d6a07 did. oneios-queue-priority=low|medium|high|realtime: another;
+    // oneios-queue-priority=base: none (NativeMetal 935c468 as it is).
     if (!strcmp(getprogname(), "backboardd")) {
         char wait[16] = {};
         if (bootValue(args, "oneios-pipeline-wait-ms=", wait, sizeof wait)) {
@@ -172,14 +184,23 @@ __attribute__((constructor)) static void apply() {
                 note(said_wait);
             }
         }
-        char priority[16] = {};
-        if (bootValue(args, "oneios-queue-priority=", priority, sizeof priority) &&
-            (!strcmp(priority, "low") || !strcmp(priority, "medium") || !strcmp(priority, "high") || !strcmp(priority, "realtime"))) {
+        char priority[16] = "high";
+        const bool asked = bootValue(args, "oneios-queue-priority=", priority, sizeof priority);
+        if (!strcmp(priority, "low") || !strcmp(priority, "medium") || !strcmp(priority, "high") || !strcmp(priority, "realtime")) {
             setenv("METAL2VULKAN_QUEUE_PRIORITY", priority, 0);
-            char said_priority[48];
-            snprintf(said_priority, sizeof said_priority, "oneios-queue-priority=%s", priority);
-            note(said_priority);
+            if (asked) {
+                char said_priority[48];
+                snprintf(said_priority, sizeof said_priority, "oneios-queue-priority=%s", priority);
+                note(said_priority);
+            }
+        } else if (!strcmp(priority, "base")) {
+            note("oneios-queue-priority=base");
+        } else {
+            setenv("METAL2VULKAN_QUEUE_PRIORITY", "high", 0);
+            note("oneios-queue-priority=? (not low, medium, high, realtime or base: the default, high)");
         }
+        os_log(OS_LOG_DEFAULT, "OneiOS metal switches: backboardd's queue priority %{public}s",
+               getenv("METAL2VULKAN_QUEUE_PRIORITY") ? getenv("METAL2VULKAN_QUEUE_PRIORITY") : "left to the base (none set)");
     }
     // Read by the plug-in itself as the device opens (NativeMetal 0002); said here so the log has every switch of the boot.
     for (const char *word : {"oneios-ycbcr-planes=0", "oneios-compile-here=0"})

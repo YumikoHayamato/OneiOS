@@ -1315,15 +1315,20 @@ or the dispatch input `stack`, builds the other (run 46049251449, the branch's f
 - Two-plane YCbCr surface textures of `ShaderRead` usage alone are made over their planes in every process (take18: backboardd).
 - `setPurgeableState:` discards: idle Volatile or Empty textures, buffers and heaps go on memory pressure and after ten seconds
   (NativeMetalPurge.rs; `gpu-purge=0`).
-- The render server's queue priority is Core Animation's `setGPUPriority:` forwarded to Turnip (`tu_darwin_set_priority`), not
-  `METAL2VULKAN_QUEUE_PRIORITY=high` at the device's opening (`oneios-queue-priority=high` sets that again).
+- NOT changed, by OneiOS's own doing: the render server's queue priority. NativeMetal `935c468` no longer sets
+  `METAL2VULKAN_QUEUE_PRIORITY=high` in the render server (upstream `2dc12fb` forwards Core Animation's `setGPUPriority:` to
+  Turnip's `tu_darwin_set_priority`), and the board's Turnip has no such function (it is in `turnip-gmem-mutable-swap.patch`,
+  outside the board's Mesa list; `llvm-nm` of the built library shows it), so the compositor's ring would be an app's and the
+  host would see no deadline queue (`turnip-darwin-deadline-queue.patch` asks for one only for a queue made at high or
+  realtime priority). `Switches-555b13d.inc` sets `high` in backboardd again, as `b0d6a07`'s plug-in did
+  (`oneios-queue-priority=low|medium|high|realtime`, or `=base` for none). Found by checking the CI's Turnip for the symbol.
 - `METAL2VULKAN_KEEP_ROOM_MIB=8` stays OneiOS's default, measured on the older runtime only (`oneios-keep-room=0`: the runtime's).
 
 **Switches.** OneiOS's (boot arguments, `Switches-555b13d.inc` and `NativeMetal/0002`): `oneios-surface-use=video|all|life`,
 `oneios-idle-trim=0`, `oneios-sched-pace=0`, `oneios-read-wait=0`, `oneios-region-identity=0`, `oneios-bo-cache-idle=0`,
 `oneios-keep-room=MIB`, `oneios-dl-full=0`, `oneios-device-answers=0`, `oneios-drawable-release=1`,
 `oneios-client-cache=temp`, `oneios-prewarm=1` (`oneios-prewarm-max=N`), `oneios-ycbcr-planes=0`, `oneios-compile-here=0`,
-`oneios-pipeline-wait-ms=N`, `oneios-queue-priority=low|medium|high|realtime`, `oneios-msaa=1`, `oneios-screenrec=1`.
+`oneios-pipeline-wait-ms=N`, `oneios-queue-priority=low|medium|high|realtime|base`, `oneios-msaa=1`, `oneios-screenrec=1`.
 The base's own, read by the plug-in from the boot arguments as each process opens its device:
 
 | Boot argument | Default | Effect |
