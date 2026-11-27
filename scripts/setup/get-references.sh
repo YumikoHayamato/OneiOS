@@ -25,6 +25,14 @@ DEST=${REF_DIR:-$REPO/external}
 #                   scripts/data/gpu-metal-vulkan-inputs.json and adreno-compiler-inputs.json. userland/metal/build.sh
 #                   patches copies of them (patches/metal2vulkan, patches/mesa of Droid-VM-UniXNU); these stay as fetched.
 # NativeMobileDisplay  the IOMobileFramebuffer backend (GopFramebuffer fork), at the kernel base's drivers/GopFramebuffer.
+# NativeMetal-935c468, metal2vulkan-555b13d, Droid-VM-UniXNU-8789b8d  the Metal plug-in's stack 555b13d
+#                   (userland/metal/build.sh ONEIOS_METAL_STACK, its default; docs/gpu.md 7.2): the GPU stack Droid-VM booted
+#                   iPadOS 27 on (Droid-VM/UniXNU 421e982): NativeMetal's wip/hackintosh head, the translator its bridge
+#                   patches are made for, and the UniXNU checkout whose scripts, board patches (patches/metal2vulkan
+#                   carried to 555b13d) and Mesa list build them. Its drivers/Adreno740, drivers/GopFramebuffer and
+#                   kits/AdrenoPM4 are the same commits as the kernel base's, so NativeAdreno, NativeMobileDisplay and
+#                   AdrenoPM4 above serve both stacks. The kernel is NOT built from this UniXNU: kernel/pins.sh keeps 62d0b11.
+#                   The rows without a suffix (NativeMetal b0d6a07, metal2vulkan 624bab3) are the stack 624bab3, the fallback.
 # NativeHidInput    UniXNU/ShengHidInput at the commit UniXNU-droidvm's ipados27 build-droidvm-hid-input.py pins (its
 #                   arm64e source): touch, buttons, keyboard HID. kernel/patches/oneios-hosted/hid compiles it.
 # IOHIDFamily       Apple's source of the family at the OS profile's tag (IOHIDFamily-2238.120.5): the public
@@ -48,6 +56,9 @@ NativeMetal          https://github.com/Droid-VM/NativeMetal.git          b0d6a0
 metal2vulkan         https://github.com/steelbrain/metal2vulkan.git       624bab3918de5b978e1101517abca2b4fa426565 development
 mesa-droidvm         https://github.com/Droid-VM/mesa.git                 cecc0e96d7193c72356a31abb0cc589e4fc0415e droidvm
 NativeMobileDisplay  https://github.com/Droid-VM/NativeMobileDisplay.git  ed08bd437b93772d4c41d74633af12446918f18a wip/hackintosh
+NativeMetal-935c468  https://github.com/Droid-VM/NativeMetal.git          935c4686828baaed47d5bf7e987e2b5f9722ab6a wip/hackintosh
+metal2vulkan-555b13d https://github.com/steelbrain/metal2vulkan.git       555b13d57e09bff70996a88cff64f1275256d5cf development
+Droid-VM-UniXNU-8789b8d https://github.com/Droid-VM/UniXNU.git            8789b8d36e85a3fe543446b911ef338598319ebf wip/hackintosh
 NativeHidInput       https://github.com/UniXNU/ShengHidInput.git          24f1f3fbed6feff42e1ca02e2ce386a5c3c36da8 main
 IOHIDFamily          https://github.com/apple-oss-distributions/IOHIDFamily.git e31e90a24c27ad6cbe981650d12a1a4124065b03 main
 ownervisor           https://github.com/Droid-VM/ownervisor.git           65fc2c7037f494a238f4263f528a68ff21e87406 main

@@ -1,0 +1,118 @@
+OneiOS, stack 555b13d (NativeMetal 935c468), patches-555b13d/NativeMetal/0001: the render server counts a video surface in
+use only while a command buffer that reads it runs.
+Port of patches/NativeMetal/0003 (take18). The base has the count from a commit to its completion itself now (macOS-DroidVM
+4f77b11, NativeMetal 43f78ae: NBCommandBuffer's surfacesInUse), but only in macOS's WindowServer and in a process that reads
+4:2:0 planes in place (METAL2VULKAN_YCBCR_PLANES_ONLY, which the base's plug-in sets on macOS alone); iOS's render server keeps
+the life count of every surface (countUse). This adds iOS's rule on the base's own code: a commandUse texture
+(surfaceUseByCommand: two-plane YCbCr surfaces by default) takes no life count, and the base's commit counts it; the lines
+the base's build-adreno-metal-plugin.py looks for stay as they are.
+Switch: boot argument oneios-surface-use=video (default) | all | life (ONEIOS_SURFACE_USE, Switches-555b13d.inc).
+Removable: yes (ONEIOS_METAL_SKIP=surface-use-while-commands-read; 0007 is left out with it).
+Tested: applies; the bridge's cargo check is not involved (Objective-C++ only). First compiled by the CI. Not run on a phone.
+
+The header of the 624bab3 stack's patch (patches/NativeMetal/0003-surface-use-while-commands-read.patch), which says the what and the why:
+| OneiOS take18, userland/metal/patches/NativeMetal/0003: the render server counts a video surface in use only while a
+| command buffer that reads it runs.
+| Upstream: Droid-VM/macOS-DroidVM 4f77b11 (lateautumn233, 2026-11-13: compositor surface use from commit to GPU
+| completion) and Droid-VM/NativeMetal 43f78ae (HuJK, 2026-11-15: commandUse for 4:2:0 YCbCr surface textures in
+| WindowServer); 935c468 keeps the per-command-buffer count to macOS and in-place video. Adapted for iOS's render server.
+| What: in backboardd, a texture over a two-plane surface whose second plane's elements are twice the first's (two-plane
+| YCbCr, 8 or 10 bit, whatever format the texture reads it as) is commandUse: its surface is IOSurfaceIncrementUseCount'ed at
+| each commit of a command buffer that uses it (on the caller's thread) and decremented at that command buffer's completion
+| or local refusal, instead of counted for the texture's life. A view of such a texture is commandUse too. Every other
+| surface texture keeps the life count (an app's Core Animation draws into a backing store in place only while it is not in
+| use: Settings showed torn labels without it). The four interface and countUse lines the base's
+| build-adreno-metal-plugin.py writes are left as they are (it finds them applied); the property is a class extension.
+| Why: take17, YouTube at 1080p: backboardd's GPU blobs reached 1885 of its 2048 MiB with 9,399 "texture over surface
+| refused: OutOfMemory(Device)" and the picture went black. A decoder's or CAImageQueue's pool takes back only surfaces not
+| in use; counted for the texture's life, none came back while backboardd kept their textures, and VideoToolbox made more.
+| Switch: boot argument oneios-surface-use=video (default) | all (every surface texture of the render server, macOS-DroidVM
+| 4f77b11's rule, an A/B: it may bring the torn labels back) | life (as before) (ONEIOS_SURFACE_USE). Removable: yes
+| (ONEIOS_METAL_SKIP=surface-use-while-commands-read). Works with or without metal2vulkan 0001 (the planes alone).
+| iOS's log: "native-metal: surface texture WxH format F over a '420v' surface: in use while a command buffer reads it" (the
+| first four in backboardd).
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 537f1dd..fbddf09 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1590,6 +1590,43 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
+  }
+  return true;
+ }
++// OneiOS (patches-555b13d/NativeMetal/0001; the base counts every surface of a command buffer from its commit to its completion
++// only in macOS's WindowServer and where 4:2:0 planes are read in place, and iOS's render server keeps the life count, countUse): on
++// iOS a surface whose texture the render server keeps may be counted in use only while a command buffer that reads it runs
++// (commandUse), with the base's own count at the commit and its release at the completion, not for the texture's life.
++@interface NBTexture ()
++@property(nonatomic) BOOL commandUse;
++@end
++// Which surface textures of the render server count only while command buffers read them: ONEIOS_SURFACE_USE (the boot argument
++// oneios-surface-use=, userland/metal/Switches.inc). "video", the default: a surface of two planes whose second plane's elements are
++// twice its first's (4:2:0, 4:2:2 and 4:4:4 two-plane YCbCr, 8 and 10 bit: '420v', '420f', 'x420' ...), whatever format the texture
++// reads it as (a YCbCr format, or R8 and RG8 over each plane). Those are a video decoder's or a camera's pool (CAImageQueue, AVPlayer's
++// layers): counted for the textures' life, as before, none of them came back to the pool while the render server kept their textures,
++// so VideoToolbox made more, each with its runtime texture (take17, YouTube at 1080p: backboardd's GPU blobs at 1885 of its 2048 MiB,
++// 9,399 'texture over surface refused: OutOfMemory(Device)', the picture black). An app's own backing stores (BGRA, 'b3a8'
++// RGB10+A8: one plane, or a second plane of narrower elements) keep the life count: an app's Core Animation draws into a backing store
++// in place, or recycles it, only while it is not in use, and Settings showed torn labels without it. "all": every surface texture of
++// the render server (Droid-VM/macOS-DroidVM 4f77b11's macOS rule; an A/B, it may bring those labels back). "life": none, as before.
++static int surfaceUseMode() {
++ static const int mode=[]{
++  const char *v=getenv("ONEIOS_SURFACE_USE");
++  if(v && !strcmp(v,"life"))return 0;
++  if(v && !strcmp(v,"all"))return 2;
++  return 1;
++ }();
++ return mode;
++}
++static bool surfaceUseByCommand(IOSurfaceRef surface) {
++ if(!surface || !gCountsSurfaceUse)return false;
++ switch(surfaceUseMode()) {
++  case 0:return false;
++  case 2:return true;
++ }
++ if(IOSurfaceGetPlaneCount(surface)!=2)return false;
++ const size_t luma=IOSurfaceGetBytesPerElementOfPlane(surface,0),chroma=IOSurfaceGetBytesPerElementOfPlane(surface,1);
++ return (luma==1 || luma==2) && chroma==2*luma;
++}
++static std::atomic<uint64_t> gSurfacesByCommand;   // surface textures made commandUse (the first ones said in the log)
+ @implementation NBTexture {
+  uint8_t _purgeCounted;   // as NBBuffer's
+ }
+@@ -1640,7 +1677,8 @@ NB_RESOURCE_SPI
+  if(!handle){NBLOG(@"native-metal: texture view refused: %@",lastError());return nil;}
+  NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
+  view.parent=(id<MTLTexture>)self;view.buffer=_buffer;view.offset=_offset;view.rowBytes=_rowBytes;
+- if(_surface){view.surface=(IOSurfaceRef)CFRetain(_surface);[view countUse];}
++ if(_surface && _commandUse){view.surface=(IOSurfaceRef)CFRetain(_surface);view.commandUse=YES;}   // OneiOS: counted as its texture
++ else if(_surface){view.surface=(IOSurfaceRef)CFRetain(_surface);[view countUse];}
+  return (id<MTLTexture>)view;
+ }
+ - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
+@@ -4516,8 +4554,10 @@ static void noteSampleBuffers(id attachments,const char *what) {
+  // displayed slots while IOSurfaceIsInUse stays true, and the lock screen's video decoder pool grew to 44 surfaces (1.2 GB). Every
+  // compositor surface, and in-place video imports in other clients, is counted from commit until the GPU completed (failed
+  // submissions too), recorded on the caller's thread so queued work is covered before the encoding thread submits it.
+- if((kMacOS && isRenderServer()) || ycbcrPlanesInPlace())for(NBTexture *texture in _surfaces)
+-  if(texture.surface) {
++ // OneiOS: and, on iOS, the surfaces of the render server's commandUse textures (surfaceUseByCommand), which have no life count.
++ const bool everySurface=(kMacOS && isRenderServer()) || ycbcrPlanesInPlace();
++ for(NBTexture *texture in _surfaces)
++  if(texture.surface && (everySurface || texture.commandUse)) {
+    if(!_surfacesInUse)_surfacesInUse=[NSMutableArray array];
+    IOSurfaceIncrementUseCount(texture.surface);[_surfacesInUse addObject:texture];
+   }
+@@ -5633,6 +5673,12 @@ static void fillBaseLimits(id device);
+  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
+  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+  if(gLogTextures)logTexture("iosurface",d,surface,plane,base,start-(uintptr_t)base,row,texture!=nil);
++ if(surfaceUseByCommand(surface)) {   // OneiOS: in use while a command buffer reads it (surfaceUseMode)
++  if(gSurfacesByCommand++<4)NBLOG(@"native-metal: surface texture %lux%lu format %lu over a %c%c%c%c surface: in use while a command buffer reads it",
++   (unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat,(char)(IOSurfaceGetPixelFormat(surface)>>24),
++   (char)(IOSurfaceGetPixelFormat(surface)>>16),(char)(IOSurfaceGetPixelFormat(surface)>>8),(char)IOSurfaceGetPixelFormat(surface));
++  gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);texture.commandUse=YES;return (id<MTLTexture>)texture;
++ }
+  gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);[texture countUse];return (id<MTLTexture>)texture;
+ }
+ // One L line per library made (its source, size and function names), and with /private/var/ngpu/debug/dump-libraries each library made

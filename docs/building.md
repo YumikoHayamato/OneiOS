@@ -936,7 +936,10 @@ is a new seed: the phone's Data store starts over. The kernel needs AppleH9CamIn
 ### The Metal plug-in
 
 ```sh
-scripts/setup/get-references.sh         # NativeMetal, NativeAdreno, AdrenoPM4, metal2vulkan, mesa-droidvm, Droid-VM-UniXNU
+scripts/setup/get-references.sh         # NativeAdreno, AdrenoPM4, NativeMobileDisplay, mesa-droidvm, and the stack's three:
+                                        # NativeMetal-935c468, metal2vulkan-555b13d, Droid-VM-UniXNU-8789b8d (the default stack,
+                                        # 555b13d), or NativeMetal, metal2vulkan and kernel/fetch.sh Droid-VM-UniXNU
+                                        # (ONEIOS_METAL_STACK=624bab3, take18's); docs/gpu.md 7.2
 rustup toolchain install 1.98.0 && rustup +1.98.0 component add rust-src
 # macOS: brew install ninja glslang shaderc spirv-tools bison llvm; uv pip install --python "$(command -v python3)" meson mako pyyaml packaging
 scripts/bg.sh metal userland/metal/build.sh

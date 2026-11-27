@@ -1,0 +1,208 @@
+OneiOS, stack 555b13d (NativeMetal 935c468), patches-555b13d/NativeMetal/0004: patches/NativeMetal/0006 (take18) unchanged
+(it applies to 935c468 as it is; cargo check of the bridge on 555b13d: see docs/gpu.md 7.2).
+Switch: oneios-region-identity=0 (ONEIOS_REGION_IDENTITY=0). Removable: yes (ONEIOS_METAL_SKIP=pages-identity-latch).
+
+The header of the 624bab3 stack's patch (patches/NativeMetal/0006-pages-identity-latch.patch), which says the what and the why:
+| OneiOS take18, userland/metal/patches/NativeMetal/0006: a no-copy range's page identity without refused calls.
+| Upstream: none (OneiOS; upstream NativeMetal 935c468's pages_identity is b0d6a07's).
+| What: bridge/NativeMetalObjects.rs pages_identity asks mach_vm_region_recurse until a status other than KERN_SUCCESS or
+| KERN_INVALID_ADDRESS comes back (a sandbox's MIG filter); that refusal is latched and the call is not made again in the
+| process. The identity then comes from mach_vm_region: VM_REGION_TOP_INFO's object id and VM_REGION_BASIC_INFO_64's
+| offset, hashed as before. Neither flavor walks the entry's pages (xnu-12377 vm_map_region; proc_pidinfo's
+| PROC_PIDREGIONINFO would walk every page of the entry, fill_procregioninfo -> vm_map_region_walk). The top info's id is the
+| bottom object of the shadow chain (vm_map_region_top_walk), the recursion's the entry's own: they are the same object only
+| where the entry has no shadow and needs no copy, which the share mode says (not SM_COW, not SM_EMPTY); elsewhere, and for a
+| submap entry, the answer is None: a remap, the old (correct, costly) answer. A refusal of mach_vm_region is latched too.
+| Why: WebKit's GPU process may not call mach_vm_region_recurse (its kernel MIG filter allows mach_vm_region: WebKit's iOS
+| gpu-defines.sb lists mach_vm_region_recurse only for ASAN builds): take17's log has 20,018 "deny(1) syscall-mig 319"
+| (kobject index 319 = MIG 4815 mach_vm_region_recurse), two at every no-copy buffer, and each refusal made the range
+| "remapped": host_range_remapped and a new import of the pages for every no-copy buffer of the process.
+| Switch: boot argument oneios-region-identity=0 (ONEIOS_REGION_IDENTITY=0): no second source (every such range a remap, as
+| before, but without the refused calls). Removable: yes (ONEIOS_METAL_SKIP=pages-identity-latch). The telemetry row
+| "N no-copy ranges checked C remapped R" says the effect (R near C in the GPU process before).
+
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index 0eab884..67a6cc6 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -1639,8 +1639,66 @@ static NO_COPY_REMAPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::a
+ /// object's (hashed) id and the object offset at the range's first byte in it. A remap puts other objects there, and the object of
+ /// pages a live import pinned outlives the remap (the import holds it), so no new object takes its id while it lives. `None` where
+ /// a page has no object yet (memory never touched, so not what a live import pinned) or the range is not all mapped.
++///
++/// OneiOS: a process whose sandbox refuses the kernel's `mach_vm_region_recurse` (WebKit's GPU process: its kernel MIG filter
++/// allows `mach_vm_region` and not the recursion; take17's log has 20,018 'deny(1) syscall-mig 319', two at every no-copy
++/// buffer, each a violation report) got `None` for every range, so every no-copy buffer was reported remapped and imported
++/// anew. The first status other than an answer (`KERN_SUCCESS`) or the end of the map (`KERN_INVALID_ADDRESS`) is latched
++/// (`RECURSE_REFUSED`) and the call is not made again in the process; the identity then comes from `mach_vm_region`
++/// (`pages_identity_region`), whose answer is the same where it can be trusted, and is `None` (a remap, the old correct but
++/// costly answer) where it cannot or where that call is refused too (latched the same way). ONEIOS_REGION_IDENTITY=0 (the boot
++/// argument oneios-region-identity=0, userland/metal/Switches.inc) leaves the second source out.
++#[cfg(target_vendor = "apple")]
++static RECURSE_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++#[cfg(target_vendor = "apple")]
++static REGION_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++/// A Mach answer: KERN_SUCCESS (0) and KERN_INVALID_ADDRESS (1, no entry at or past the address) are the kernel's own answers;
++/// anything else (a sandbox's refusal of the MIG routine, MACH_SEND_* errors) says the routine is not this process's to call.
++#[cfg(target_vendor = "apple")]
++fn refused(status: i32) -> bool {
++    status != 0 && status != 1
++}
++
++#[cfg(target_vendor = "apple")]
++unsafe extern "C" {
++    static mach_task_self_: u32;
++    fn mach_vm_region_recurse(task: u32, address: *mut u64, size: *mut u64, depth: *mut u32, info: *mut i32, count: *mut u32) -> i32;
++    fn mach_vm_region(task: u32, address: *mut u64, size: *mut u64, flavor: i32, info: *mut i32, count: *mut u32,
++                      object_name: *mut u32) -> i32;
++}
++
+ #[cfg(target_vendor = "apple")]
+ fn pages_identity(start: u64, length: u64) -> Option<u64> {
++    use std::sync::atomic::Ordering::Relaxed;
++    if !RECURSE_REFUSED.load(Relaxed) {
++        match pages_identity_recurse(start, length) {
++            Ok(identity) => return identity,
++            Err(()) => RECURSE_REFUSED.store(true, Relaxed),
++        }
++    }
++    if REGION_REFUSED.load(Relaxed) || !region_identity_wanted() {
++        return None;
++    }
++    match pages_identity_region(start, length) {
++        Ok(identity) => identity,
++        Err(()) => {
++            REGION_REFUSED.store(true, Relaxed);
++            None
++        }
++    }
++}
++
++/// Whether the second source may be used (ONEIOS_REGION_IDENTITY, read once).
++#[cfg(target_vendor = "apple")]
++fn region_identity_wanted() -> bool {
++    static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *WANTED.get_or_init(|| std::env::var("ONEIOS_REGION_IDENTITY").map_or(true, |value| value.trim() != "0"))
++}
++
++/// The identity through `mach_vm_region_recurse` (the submap short info): `Err` where the call is refused.
++#[cfg(target_vendor = "apple")]
++fn pages_identity_recurse(start: u64, length: u64) -> Result<Option<u64>, ()> {
+     use std::hash::{Hash, Hasher};
+     // vm_region_submap_short_info_64 (mach/vm_region.h, packed to 4).
+     #[repr(C, packed(4))]
+@@ -1660,11 +1718,7 @@ fn pages_identity(start: u64, length: u64) -> Option<u64> {
+         object_id: u32,
+         user_wired_count: u16,
+     }
+-    unsafe extern "C" {
+-        static mach_task_self_: u32;
+-        fn mach_vm_region_recurse(task: u32, address: *mut u64, size: *mut u64, depth: *mut u32, info: *mut i32, count: *mut u32) -> i32;
+-    }
+-    let end = start.checked_add(length)?;
++    let Some(end) = start.checked_add(length) else { return Ok(None) };
+     let mut hash = std::collections::hash_map::DefaultHasher::new();
+     let mut at = start;
+     while at < end {
+@@ -1675,14 +1729,97 @@ fn pages_identity(start: u64, length: u64) -> Option<u64> {
+         let status = unsafe {
+             mach_vm_region_recurse(mach_task_self_, &mut address, &mut size, &mut depth, (&raw mut region).cast(), &mut count)
+         };
++        if refused(status) {
++            return Err(());
++        }
+         let (object, offset) = (region.object_id, region.offset);
+         if status != 0 || address > at || object == 0 {
+-            return None;
++            return Ok(None);
++        }
++        (at, object, offset + (at - address)).hash(&mut hash);
++        let Some(next) = address.checked_add(size) else { return Ok(None) };
++        at = next;
++    }
++    Ok(Some(hash.finish()))
++}
++
++/// The identity through `mach_vm_region` (OneiOS): for each map entry over the range, VM_REGION_TOP_INFO's object id and
++/// VM_REGION_BASIC_INFO_64's offset, hashed as `pages_identity_recurse` hashes them. Neither flavor walks the entry's pages
++/// (xnu-12377 osfmk/vm/vm_map.c vm_map_region: the top walk follows the shadow chain only), unlike proc_pidinfo's
++/// PROC_PIDREGIONINFO, which walks every page of the entry (fill_procregioninfo -> vm_map_region_walk). The top info's id is the
++/// bottom object of the entry's shadow chain (vm_map_region_top_walk), the recursion's the entry's own object: they are the same
++/// object only where the entry has no shadow and needs no copy, which the top info's share mode says (anything but SM_COW and
++/// SM_EMPTY); elsewhere, and for a submap entry (not descended here), the answer is `None`, a remap, as without the identity.
++/// `Err` where the call is refused.
++#[cfg(target_vendor = "apple")]
++fn pages_identity_region(start: u64, length: u64) -> Result<Option<u64>, ()> {
++    use std::hash::{Hash, Hasher};
++    const VM_REGION_BASIC_INFO_64: i32 = 9;
++    const VM_REGION_TOP_INFO: i32 = 12;
++    const SM_COW: u8 = 1;
++    const SM_EMPTY: u8 = 3;
++    // vm_region_top_info (mach/vm_region.h, packed to 4): 5 words.
++    #[repr(C, packed(4))]
++    #[derive(Default)]
++    struct Top {
++        obj_id: u32,
++        ref_count: u32,
++        private_pages_resident: u32,
++        shared_pages_resident: u32,
++        share_mode: u8,
++    }
++    // vm_region_basic_info_64 (mach/vm_region.h, packed to 4): 9 words.
++    #[repr(C, packed(4))]
++    #[derive(Default)]
++    struct Basic {
++        protection: i32,
++        max_protection: i32,
++        inheritance: u32,
++        shared: u32,
++        reserved: u32,
++        offset: u64,
++        behavior: i32,
++        user_wired_count: u16,
++    }
++    let Some(end) = start.checked_add(length) else { return Ok(None) };
++    let mut hash = std::collections::hash_map::DefaultHasher::new();
++    let mut at = start;
++    while at < end {
++        let (mut address, mut size, mut name) = (at, 0u64, 0u32);
++        let mut top = Top::default();
++        let mut count = (std::mem::size_of::<Top>() / 4) as u32;
++        // SAFETY: the out-parameters are this frame's, `count` words of `top`; the call reads no memory of the range.
++        let status = unsafe {
++            mach_vm_region(mach_task_self_, &mut address, &mut size, VM_REGION_TOP_INFO, (&raw mut top).cast(), &mut count, &mut name)
++        };
++        if refused(status) {
++            return Err(());
++        }
++        let (object, mode) = (top.obj_id, top.share_mode);
++        if status != 0 || address > at || object == 0 || mode == SM_COW || mode == SM_EMPTY {
++            return Ok(None);
++        }
++        let (mut again, mut again_size, mut again_name) = (at, 0u64, 0u32);
++        let mut basic = Basic::default();
++        let mut count = (std::mem::size_of::<Basic>() / 4) as u32;
++        // SAFETY: as above, `count` words of `basic`.
++        let status = unsafe {
++            mach_vm_region(mach_task_self_, &mut again, &mut again_size, VM_REGION_BASIC_INFO_64, (&raw mut basic).cast(), &mut count,
++                           &mut again_name)
++        };
++        if refused(status) {
++            return Err(());
++        }
++        // The same entry both times (the map may change between the two calls), or no answer.
++        if status != 0 || again != address || again_size != size {
++            return Ok(None);
+         }
++        let offset = basic.offset;
+         (at, object, offset + (at - address)).hash(&mut hash);
+-        at = address.checked_add(size)?;
++        let Some(next) = address.checked_add(size) else { return Ok(None) };
++        at = next;
+     }
+-    Some(hash.finish())
++    Ok(Some(hash.finish()))
+ }
+ 
+ #[cfg(not(target_vendor = "apple"))]

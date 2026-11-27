@@ -10,20 +10,26 @@
 name: metal plug-in and helpers (macOS)
 # workflow_dispatch needs the file on the default branch; a push to ci/metal-plugin runs it from any branch:
 #   git push -f origin HEAD:ci/metal-plugin
-# The plug-in carries OneiOS's patches (userland/metal/patches, docs/gpu.md 7.1); the step "Metal plug-in" prints the ones
-# taken. A push builds them all; "[metal-skip: NAME ...]" in the pushed commit's message, or the dispatch input skip,
-# leaves some out (ONEIOS_METAL_SKIP of userland/metal/build.sh).
+# The plug-in carries OneiOS's patches (userland/metal/patches*, docs/gpu.md 7.1 and 7.2); the step "Metal plug-in" prints the
+# ones taken. A push builds them all; "[metal-skip: NAME ...]" in the pushed commit's message, or the dispatch input skip,
+# leaves some out (ONEIOS_METAL_SKIP of userland/metal/build.sh; the word screenrec leaves ScreenRecord.inc out).
+# The stack (ONEIOS_METAL_STACK, docs/gpu.md 7.2): 555b13d unless the dispatch input stack or "[metal-stack: 624bab3]" in the
+# pushed commit's message asks for take18's (NativeMetal b0d6a07, metal2vulkan 624bab3), the fallback.
+#   git push origin HEAD:ci/metal-upgrade      (the branch of the 555b13d stack; no force needed while it only grows)
 on:
   push:
-    branches: ['ci/metal-plugin']
+    branches: ['ci/metal-plugin', 'ci/metal-upgrade']
   workflow_dispatch:
     inputs:
       xcode:
         description: 'Xcode on the runner (the Mac build host of 2026-11-12 used 27.2)'
         default: '27.2'
       skip:
-        description: 'OneiOS patches to leave out (ONEIOS_METAL_SKIP: names of userland/metal/patches, blank-separated)'
+        description: 'OneiOS patches to leave out (ONEIOS_METAL_SKIP: names of userland/metal/patches*, blank-separated)'
         default: ''
+      stack:
+        description: 'The Metal stack (ONEIOS_METAL_STACK): 555b13d, or 624bab3 (take18, the fallback)'
+        default: '555b13d'
 permissions:
   contents: read
 defaults:
@@ -49,9 +55,25 @@ jobs:
           brew install ninja glslang shaderc spirv-tools bison llvm rsync zstd uv
           uv pip install --system --break-system-packages --python "$(command -v python3)" meson mako pyyaml packaging
           rustup toolchain install 1.98.0 --profile minimal --component rust-src
+      - name: The Metal stack
+        env:
+          STACK_INPUT: ${{ inputs.stack || '' }}
+          HEAD_MESSAGE: ${{ github.event.head_commit.message || '' }}
+        run: |
+          # the dispatch input, else "[metal-stack: NAME]" in the pushed commit's message, else build.sh's default
+          stack=$STACK_INPUT
+          if [ -z "$stack" ]; then
+            stack=$(printf '%s\n' "$HEAD_MESSAGE" | sed -n 's/.*\[metal-stack: *\([0-9a-f]*\)\].*/\1/p' | head -1)
+          fi
+          echo "ONEIOS_METAL_STACK=${stack:-555b13d}" >> "$GITHUB_ENV"
+          echo "ONEIOS_METAL_STACK=${stack:-555b13d}"
       - name: Sources (pinned references, the kernel base)
         run: |
-          scripts/setup/get-references.sh NativeMetal NativeAdreno NativeMobileDisplay AdrenoPM4 metal2vulkan mesa-droidvm
+          scripts/setup/get-references.sh NativeAdreno NativeMobileDisplay AdrenoPM4 mesa-droidvm
+          case "$ONEIOS_METAL_STACK" in
+            624bab3) scripts/setup/get-references.sh NativeMetal metal2vulkan ;;
+            *) scripts/setup/get-references.sh NativeMetal-935c468 metal2vulkan-555b13d Droid-VM-UniXNU-8789b8d ;;
+          esac
           kernel/fetch.sh Droid-VM-UniXNU
       - name: SystemOS from Apple (only that member), the iOS 27 stubs
         run: |
@@ -80,11 +102,11 @@ jobs:
           echo "ONEIOS_METAL_SKIP=${ONEIOS_METAL_SKIP:-(none)}"
           userland/metal/build.sh
           ls -la out/userland
-          python3 -c 'import json; r = json.load(open("out/userland/NativeAdrenoMetal.build.json")); print("OneiOS patches taken:", *r["oneios_patches"], sep="\n  "); print("left out:", " ".join(r["oneios_metal_skip"]) or "none")'
+          python3 -c 'import json; r = json.load(open("out/userland/NativeAdrenoMetal.build.json")); print("stack:", r["stack"]); print("sources:", *[k + " " + v[:12] for k, v in r["sources"].items()], sep="\n  "); print("OneiOS patches taken:", *r["oneios_patches"], sep="\n  "); print("left out:", " ".join(r["oneios_metal_skip"]) or "none"); print("CDHashes:", *r["cdhashes"], sep="\n  ")'
       - name: The build's own logs (on a failure)
         if: failure()
         run: |
-          for f in out/metal/root/.cache/*.log out/metal/root/build/*.log; do
+          for f in out/metal*/root/.cache/*.log out/metal*/root/build/*.log out/metal*/root/build/adreno-metal-bridge/*.log; do
             [ -f "$f" ] && { echo "::group::$f"; tail -60 "$f"; echo "::endgroup::"; }
           done
           true
