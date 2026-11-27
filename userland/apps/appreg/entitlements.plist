@@ -7,6 +7,8 @@
   <key>com.apple.private.security.no-sandbox</key><true/>
   <!-- register bundles with LaunchServices (the entitlements uicache carries) -->
   <key>com.apple.lsapplicationworkspace.rebuilddatabase</key><true/>
+  <!-- the name uicache carries for _LSPrivateRebuildApplicationDatabasesForSystemApps (the line above was a guess) -->
+  <key>com.apple.lsapplicationworkspace.rebuildappdatabases</key><true/>
   <key>com.apple.private.coreservices.canmaplsdatabase</key><true/>
   <key>com.apple.private.MobileContainerManager.allowed</key><true/>
   <key>com.apple.private.security.storage.AppBundles</key><true/>
