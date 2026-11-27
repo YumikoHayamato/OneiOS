@@ -13,9 +13,12 @@ name: metal plug-in and helpers (macOS)
 # The plug-in carries OneiOS's patches (userland/metal/patches, docs/gpu.md 7.1); the step "Metal plug-in" prints the ones
 # taken. A push builds them all; "[metal-skip: NAME ...]" in the pushed commit's message, or the dispatch input skip,
 # leaves some out (ONEIOS_METAL_SKIP of userland/metal/build.sh).
+# OneiOS's own apps (userland/apps: 2048, OneiOS Bench, the registrar) are built on every run into the separate artifact
+# oneios-apps (encrypted the same way). On ci/apps the Metal plug-in is left out unless the pushed commit's message
+# says "[with-metal]"; "[apps-only]" leaves it out on any branch.
 on:
   push:
-    branches: ['ci/metal-plugin']
+    branches: ['ci/metal-plugin', 'ci/apps']
   workflow_dispatch:
     inputs:
       xcode:
@@ -49,7 +52,18 @@ jobs:
           brew install ninja glslang shaderc spirv-tools bison llvm rsync zstd uv
           uv pip install --system --break-system-packages --python "$(command -v python3)" meson mako pyyaml packaging
           rustup toolchain install 1.98.0 --profile minimal --component rust-src
+      - name: Plan (Metal plug-in or not)
+        id: plan
+        env:
+          HEAD_MESSAGE: ${{ github.event.head_commit.message || '' }}
+          REF: ${{ github.ref_name }}
+        run: |
+          metal=true
+          case "$HEAD_MESSAGE" in *'[helpers-only]'*|*'[apps-only]'*) metal=false ;; esac
+          if [ "$REF" = ci/apps ]; then case "$HEAD_MESSAGE" in *'[with-metal]'*) ;; *) metal=false ;; esac; fi
+          echo "metal=$metal" | tee -a "$GITHUB_OUTPUT"
       - name: Sources (pinned references, the kernel base)
+        if: ${{ steps.plan.outputs.metal == 'true' }}
         run: |
           scripts/setup/get-references.sh NativeMetal NativeAdreno NativeMobileDisplay AdrenoPM4 metal2vulkan mesa-droidvm
           kernel/fetch.sh Droid-VM-UniXNU
@@ -63,9 +77,14 @@ jobs:
         run: |
           userland/helpers/build.sh
           cat out/userland/helpers/cdhashes.txt
+      - name: Apps (userland/apps)
+        run: |
+          python3 -I userland/apps/test_appsaddon.py
+          userland/apps/build.sh
+          ls -la out/userland/apps out/userland/apps/*.app
       - name: Metal plug-in
-        # "[helpers-only]" in the pushed commit's message skips it (about 30 minutes)
-        if: ${{ !contains(github.event.head_commit.message, '[helpers-only]') }}
+        # "[helpers-only]" or "[apps-only]" in the pushed commit's message skips it (about 30 minutes); so does ci/apps
+        if: ${{ steps.plan.outputs.metal == 'true' }}
         env:
           SKIP_INPUT: ${{ inputs.skip || '' }}
           HEAD_MESSAGE: ${{ github.event.head_commit.message || '' }}
@@ -99,6 +118,21 @@ jobs:
             | zstd -19 -q \
             | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:KEY -out ship/metal-plugin.tar.zst.enc
           shasum -a 256 ship/metal-plugin.tar.zst.enc
+      - name: Pack and encrypt the apps
+        env:
+          KEY: ${{ secrets.METAL_ARTIFACT_KEY }}
+        run: |
+          mkdir -p ship
+          tar -C out/userland -cf - apps \
+            | zstd -19 -q \
+            | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:KEY -out ship/oneios-apps.tar.zst.enc
+          shasum -a 256 ship/oneios-apps.tar.zst.enc
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: oneios-apps
+          path: ship/oneios-apps.tar.zst.enc
+          retention-days: 1
+          if-no-files-found: error
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: metal-plugin

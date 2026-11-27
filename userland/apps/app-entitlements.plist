@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>application-identifier</key><string>@BUNDLE_ID@</string>
+  <!-- no container and no sandbox: the bundle is not installd's, and a sandbox profile may refuse the Metal device
+       (droidvm-gpu-clients "*" opens the accelerator to every process, the sandbox decides first) -->
+  <key>com.apple.private.security.no-container</key><true/>
+  <key>com.apple.private.security.no-sandbox</key><true/>
+</dict>
+</plist>
