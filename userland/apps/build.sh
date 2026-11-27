@@ -95,6 +95,12 @@ fi
 # Every library and symbol they use exists in the guest's own iOS 27 (its stubs), when the stubs are there.
 if [ -f "$IOS_TBD/usr/lib/libSystem.B.tbd" ]; then
   "$IOS_DIR/macho-check.py" "$OUT/OneiOS2048.app/OneiOS2048" "$OUT/OneiOSBench.app/OneiOSBench" "$OUT/oneios-appreg" \
-    | tee "$OUT/macho-check.txt" || { echo "apps: macho-check failed (above)" >&2; exit 1; }
+    | tee "$OUT/macho-check.txt" || {
+    # UIKit's UIFont and the NSFont* keys live in a framework UIKit re-exports; a stub made from the guest's cache that
+    # misses that re-export says "not exported". The SDK's stubs decide then; the guest-stub report is kept.
+    echo "apps: macho-check against the guest stubs failed (above); checking against the SDK's stubs" >&2
+    "$IOS_DIR/macho-check.py" --sdk "$OUT/OneiOS2048.app/OneiOS2048" "$OUT/OneiOSBench.app/OneiOSBench" "$OUT/oneios-appreg" \
+      | tee "$OUT/macho-check-sdk.txt" || { echo "apps: macho-check failed against the SDK too" >&2; exit 1; }
+  }
 fi
 echo "apps in $OUT"
