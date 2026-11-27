@@ -1734,7 +1734,7 @@ static double pct_of(double *v, int n, double p) {
 // ---- image decode ---------------------------------------------------------------------------------------------------------
 static CGImageRef make_photo(int w, int h, int seed) {
   CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-  CGContextRef c = CGBitmapContextCreate(NULL, w, h, 8, w * 4, cs, kCGImageAlphaPremultipliedLast);
+  CGContextRef c = CGBitmapContextCreate(NULL, w, h, 8, w * 4, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
   uint32_t *px = CGBitmapContextGetData(c);
   uint32_t s = 2463534242u + seed;
   for (int y = 0; y < h; y++)
@@ -1780,7 +1780,7 @@ static double decode_loop(NSData *data, double seconds, int *count, size_t *pixe
       if (img) {
         // draw it once into a small bitmap as well: a decode the cache flag skipped still happens here
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-        CGContextRef c = CGBitmapContextCreate(NULL, 64, 64, 8, 256, cs, kCGImageAlphaPremultipliedLast);
+        CGContextRef c = CGBitmapContextCreate(NULL, 64, 64, 8, 256, cs, (CGBitmapInfo)kCGImageAlphaPremultipliedLast);
         CGContextDrawImage(c, CGRectMake(0, 0, 64, 64), img);
         CGContextRelease(c);
         CGColorSpaceRelease(cs);

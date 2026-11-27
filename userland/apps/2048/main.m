@@ -317,7 +317,7 @@ static int cmpd(const void *a, const void *b) {
   return NO;
 }
 
-- (void)move:(UISwipeGestureRecognizerDirection)d {
+- (void)slide:(UISwipeGestureRecognizerDirection)d {
   if (_animating) return;
   int dr = 0, dc = 0;
   if (d == UISwipeGestureRecognizerDirectionLeft) dc = -1;
@@ -328,7 +328,7 @@ static int cmpd(const void *a, const void *b) {
 }
 
 - (void)swiped:(UISwipeGestureRecognizer *)g {
-  [self move:g.direction];
+  [self slide:g.direction];
 }
 
 - (void)toggleAuto {
@@ -351,7 +351,7 @@ static int cmpd(const void *a, const void *b) {
     UISwipeGestureRecognizerDirection seq[4] = {a, b, c, order[3]};
     for (int i = 0; i < 4; i++) {
       int before = s->_moves;
-      [s move:seq[i]];
+      [s slide:seq[i]];
       if (s->_moves != before) break;
     }
   }];
