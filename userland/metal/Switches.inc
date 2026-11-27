@@ -28,6 +28,18 @@
 //                              Not a patch: this default is the whole change. The A/B file /private/var/ngpu/debug/
 //                              keep-room-mib, read when the device opens, and a process's own setting still win
 //   (oneios-dl-full=0 is read by NativeMetal 0014's own constructor: every display link keeps the rate it asks)
+//   oneios-device-answers=0    ONEIOS_DEVICE_ANSWERS=0: the five private device queries NativeMetal 0015 answers (maxVertex-
+//                              AmplificationCount, maxComputeThreadgroupMemory, isLargeMRTSupported and two flags) unanswered
+//                              again, the base class's 0 and NO; answered without it
+//   oneios-drawable-release=1  ONEIOS_DRAWABLE_RELEASE=1: backboardd counts an app's CAMetalLayer drawable in use only while a
+//                              command buffer reads it (NativeMetal 0016, which needs 0003); OFF without it
+//   oneios-client-cache=temp   ONEIOS_CLIENT_CACHE=temp: a client whose temporary directory the boot empties (SpringBoard, the
+//                              mobile daemons) keeps its pipeline cache there again, compiled anew at each boot, instead of in
+//                              its home's Library/Caches (NativeMetal 0017, take20); kept across boots without it
+//   oneios-prewarm=1           ONEIOS_PREWARM=1: the render server keeps its render pipeline states (an equal descriptor's
+//                              creation returns the kept one at once) and makes its earlier boots' descriptors again 20 s after
+//                              its first pipeline (NativeMetal 0018, take20); OFF without it. oneios-prewarm-max=N
+//                              (ONEIOS_PREWARM_MAX): at most N states kept (1024)
 //
 // What it logs (iOS's log, each process that loads the plug-in): "OneiOS metal switches: ..." with the switches the boot
 // arguments set, once; nothing when none is set (backboardd says its YCbCr planes either way).
@@ -81,6 +93,10 @@ __attribute__((constructor)) static void apply() {
         {"oneios-pool-cut=0", "METAL2VULKAN_POOL_USE_WINDOW_S", "0"},
         {"oneios-idle-spares=0", "METAL2VULKAN_IDLE_SPARES", "0"},
         {"oneios-compile-here=1", "METAL2VULKAN_COMPILE_ON_ASKING_THREAD", "1"},
+        {"oneios-device-answers=0", "ONEIOS_DEVICE_ANSWERS", "0"},
+        {"oneios-drawable-release=1", "ONEIOS_DRAWABLE_RELEASE", "1"},
+        {"oneios-client-cache=temp", "ONEIOS_CLIENT_CACHE", "temp"},
+        {"oneios-prewarm=1", "ONEIOS_PREWARM", "1"},
     };
     for (const Flag &flag : flags)
         if (bootWord(args, flag.word)) {
@@ -106,6 +122,19 @@ __attribute__((constructor)) static void apply() {
         if (end != text && !*end && mib > 0 && mib <= 4096) {
             snprintf(text, sizeof text, "%lu", mib);
             setenv("METAL2VULKAN_KEEP_ROOM_MIB", text, 0);
+        }
+    }
+    {   // NativeMetal 0018's bound (take20): a number of kept render pipeline states
+        char most[16] = {};
+        if (bootValue(args, "oneios-prewarm-max=", most, sizeof most)) {
+            char *end = nullptr;
+            const unsigned long n = strtoul(most, &end, 10);
+            if (end != most && !*end && n > 0 && n < 16384) {
+                setenv("ONEIOS_PREWARM_MAX", most, 1);
+                char said_most[40];
+                snprintf(said_most, sizeof said_most, "oneios-prewarm-max=%lu", n);
+                note(said_most);
+            }
         }
     }
     char mode[16] = {};

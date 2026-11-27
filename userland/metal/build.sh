@@ -25,7 +25,8 @@
 # siblings. On macOS ios-clang is Xcode's clang and ld, and xcrun's other answers are Xcode's; on Linux the cross toolchain.
 # The staged copies differ from upstream in the few lines `stage` prints. Before the compile, the plug-in's shared
 # cache addresses are replaced with this guest's (hooks/<product>-<build>.json) and two OneiOS files are appended for
-# backboardd (drivers/brightness/BacklightMode.inc; DisplayWide.inc: half floats with oneios-display-wide=1), and for every
+# backboardd (drivers/brightness/BacklightMode.inc; DisplayWide.inc: half floats with oneios-display-wide=1; ScreenRecord.inc:
+# a CPU scaler for screen recording with oneios-screenrec=1), and for every
 # process Switches.inc (the boot arguments of the patches below); `finish` then marks the bundle with
 # `oneios-target`, which is what lets userland/roottweak place it.
 #
@@ -300,6 +301,11 @@ EOF
   # display-format=rgba16f) backboardd's framebuffer is half floats ('RGhA'), which the display path then keeps whole.
   cat "$HERE/DisplayWide.inc" >> "$R/drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm"
   say "staged NativeAdrenoMetalPlugin.mm: userland/metal/DisplayWide.inc appended (backboardd: CA_FORCE_FP16_FRAMEBUFFER with oneios-display-wide=1)"
+  # userland/metal/ScreenRecord.inc (owner: display): screen recording. backboardd's clone of the screen into replayd's
+  # buffers fails on the GPU way; with no scaler service there is no other. A CPU IOSurfaceAccelerator in backboardd and
+  # the scaler way opened while a display is a clone. Opt-in experiment: oneios-screenrec=1 (nothing happens without it).
+  cat "$HERE/ScreenRecord.inc" >> "$R/drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm"
+  say "staged NativeAdrenoMetalPlugin.mm: userland/metal/ScreenRecord.inc appended (backboardd: CPU scaler for screen recording with oneios-screenrec=1)"
   # userland/metal/Switches.inc: the boot arguments of OneiOS's patches (oneios-surface-use=, oneios-idle-trim=0, ...),
   # as environment variables before the process opens its device; the idle tick of Turnip's BO cache trim.
   cat "$HERE/Switches.inc" >> "$R/drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm"
