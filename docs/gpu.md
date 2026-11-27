@@ -1272,8 +1272,9 @@ scripts/setup/get-references.sh NativeMetal-935c468 metal2vulkan-555b13d Droid-V
 The kernel is not built from `Droid-VM-UniXNU-8789b8d` (`kernel/pins.sh` keeps `62d0b11`); its `drivers/Adreno740`,
 `drivers/GopFramebuffer` and `kits/AdrenoPM4` are the commits the kernel base has, so the plug-in speaks to the same kernel
 interface (the read wait's method `0x7200+11` and its "ReadWait" answer included). The CI (`.github/workflows/metal-plugin.yml`)
-builds the stack on a push to `ci/metal-upgrade`; `[metal-stack: 624bab3]` in the pushed commit's message, or the dispatch
-input `stack`, builds the other.
+builds the stack on a push to `ci/metal-upgrade`; `[metal-stack: 624bab3]` in the first line of the pushed commit's message,
+or the dispatch input `stack`, builds the other (run 46049251449, the branch's first, built the stack 624bab3 with
+`ScreenRecord.inc` that way by mistake: its commit's body named the tag, which was then looked for in the whole message).
 
 **OneiOS's patches on this stack** (`userland/metal/patches-555b13d`; each header says what changed in the port):
 

@@ -2,6 +2,10 @@
 
 Survey date: 2026-11-10. Owner of this file: the references agent. Fetch the pinned repos with
 `scripts/setup/get-references.sh` (`-l` lists them and their state; `external/` is git-ignored).
+How old each pin is: `scripts/pin-ages.sh` (POSIX sh and `gh`, read only) reads this checkout's pins
+(`get-references.sh`, `kernel/pins.sh`, the phone's `scripts/droidvm` and `scripts/hugepage` scripts) and prints each one's
+date, the head of the branch it comes from and Droid-VM's own pin of the component (Droid-VM/UniXNU `wip/hackintosh`: its
+submodules and `scripts/data/*.json`) with the commits between them.
 
 Scope: the Galaxy S24 Ultra (SM8650 "pineapple", Cortex-X4/A720/A520 with PAC, Adreno 750, GKI 6.1) running
 iOS 27.0.1 (iPhone18,2, 24A446) under xnuhost. xnuhost is a process on One UI's kernel that gives XNU a

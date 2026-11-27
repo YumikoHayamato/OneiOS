@@ -13,8 +13,9 @@ name: metal plug-in and helpers (macOS)
 # The plug-in carries OneiOS's patches (userland/metal/patches*, docs/gpu.md 7.1 and 7.2); the step "Metal plug-in" prints the
 # ones taken. A push builds them all; "[metal-skip: NAME ...]" in the pushed commit's message, or the dispatch input skip,
 # leaves some out (ONEIOS_METAL_SKIP of userland/metal/build.sh; the word screenrec leaves ScreenRecord.inc out).
-# The stack (ONEIOS_METAL_STACK, docs/gpu.md 7.2): 555b13d unless the dispatch input stack or "[metal-stack: 624bab3]" in the
-# pushed commit's message asks for take18's (NativeMetal b0d6a07, metal2vulkan 624bab3), the fallback.
+# The stack (ONEIOS_METAL_STACK, docs/gpu.md 7.2): 555b13d unless the dispatch input stack, or "[metal-stack: 624bab3]" in the
+# FIRST LINE of the pushed commit's message, asks for take18's (NativeMetal b0d6a07, metal2vulkan 624bab3), the fallback.
+# (The first line only: run 46049251449 built the fallback because its commit's body explained this very tag.)
 #   git push origin HEAD:ci/metal-upgrade      (the branch of the 555b13d stack; no force needed while it only grows)
 on:
   push:
@@ -60,10 +61,10 @@ jobs:
           STACK_INPUT: ${{ inputs.stack || '' }}
           HEAD_MESSAGE: ${{ github.event.head_commit.message || '' }}
         run: |
-          # the dispatch input, else "[metal-stack: NAME]" in the pushed commit's message, else build.sh's default
+          # the dispatch input, else "[metal-stack: NAME]" in the first line of the pushed commit's message, else build.sh's default
           stack=$STACK_INPUT
           if [ -z "$stack" ]; then
-            stack=$(printf '%s\n' "$HEAD_MESSAGE" | sed -n 's/.*\[metal-stack: *\([0-9a-f]*\)\].*/\1/p' | head -1)
+            stack=$(printf '%s\n' "$HEAD_MESSAGE" | head -1 | sed -n 's/.*\[metal-stack: *\([0-9a-f]*\)\].*/\1/p')
           fi
           echo "ONEIOS_METAL_STACK=${stack:-555b13d}" >> "$GITHUB_ENV"
           echo "ONEIOS_METAL_STACK=${stack:-555b13d}"
