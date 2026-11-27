@@ -737,6 +737,29 @@ plug-in's `Info.plist` visible too. `oneios-gpu-open` is one line per open of an
 plug-in's progress markers arrive the same way, as open types `0x4147xxxx` answered unsupported by design: `0x6800` entered,
 `0x6801` Turnip found, `0x6802` device made, `0x6803` handed to Metal's discovery, `0x68f1` no Turnip, `0x68f2` no device.
 
+**The stages of a submission (native-perf, 2026-11-26).** `oneios-gpu-report`'s "frames" is one time for the host's part
+of a fenced submission, the time until a guest thread looked at the used ring, and the time until the client's waiter
+took it. `oneios-gpu-stages`, `-look`, `-ahead`, `-waits`, `-doorbell` and `-legs` (same thread, same rounds;
+off by default: `oneios-gpu-stages=1` in the Image turns them on, and then the 3D half reads each backboardd submission's stamps under the transport's lock) split it and print the transport's own counters, which nothing printed: the
+lines, what each is for and how they were tested are in [native.md](native.md), "Frame pacing"; the arithmetic is
+`gpu/frame_stages.h`, the hooks `staged/gpu.rs` `TRANSPORT_STAGES` and `GPU3D_STAGES`. Compiled, not in a kernel image yet.
+
+**A context's GPU addresses in the native VM, and lines written as things happen (take17, 2026-11-26).** The native
+VM's renderer is Droid-VM's prebuilt, not section 2.3's: it cuts its one range into equal slices, 64 of 2 GiB on the
+phone (`VA slices: 64 x 2GB over VBO 0x2000000000`), the render server's like any other, and tells each context's
+Turnip its slice by GET_PARAM in the context's ring. With 1080p video backboardd's blobs reached 2028 of those 2048
+MiB in take16 (1906 and 1987 in take14 and take15) and were let go and made again five times while the picture went
+black ([native.md](native.md), "What take16's lines say"). The kernel cannot read the slice (it sees the DRM capset,
+which names the whole range: `staged/gpu.rs` `GPU3D_ROOM` hands it to `OneiOSAdreno.cpp`), so `watch::room` takes
+2048 MiB (`oneios-gpu-room-mib=N`) and the report says each client's blobs against it: `oneios-gpu-room:` when a
+client passes 90 % and when it lets go of an eighth or more, and each 10 s for every client at a tenth or more.
+The same sampler thread writes `oneios-hitch:` (a gap of 150 ms to 5 s between two swaps, with the processes that
+had the CPUs in it and the GPU clients' submissions: the hook is `staged/display.rs` SCANOUT's
+`oneios_gpu_swap_gap`), `oneios-pressure:` (the memory pressure level as it changes, kernel patch 0087) and
+`oneios-video:` (each second a video decoder locks surfaces). Their forms: `kernel/patches/oneios-hosted/README.md`,
+"0087"; the arithmetic is `gpu/watch.h`, host-tested (`test_watch`). Built into the native kernel and booted on the
+PC's bench, where no client has a GPU context, so the room and video lines have not been seen with a client yet.
+
 **Is CoreAnimation drawing on the GPU?** (`gpu/OneiOSAdreno.cpp`, `report`). `oneios-iouc` cannot say: it prints the first
 call of each class and selector only, stops at 600 lines, and every Turnip op goes through one selector with the op in the
 payload. The tunnel's own counters (`DroidVMVirtioGpu3D.cpp`) are printed instead, every `oneios-gpu-report` seconds
@@ -1149,3 +1172,73 @@ re-signed by both: the same bytes).
 showed it to iOS (section 5.1), and that patch has compiled but not run. Whether dyld and AMFI of this guest accept the binaries, whether the
 writes above have the effect they have on the iPad, and whether MetalCheck passes are all open.
 
+
+### 7.1 OneiOS's patches of the Metal stack (take18, 2026-11-27)
+
+`userland/metal/patches/{NativeMetal,metal2vulkan,mesa}/NNNN-<name>.patch`: upstream fixes ported onto the pinned stack
+(NativeMetal `b0d6a07`, metal2vulkan `624bab3` with the base's lists, Mesa `cecc0e9`), and a few of OneiOS's own. Each
+file's header gives its upstream commit, what it changes, why, its switch and whether it is removable. `build.sh stage`
+applies the NativeMetal ones to the staged `drivers/AdrenoMetal`, lists the metal2vulkan ones after the board's `0038` in
+the staged `build-adreno-metal-bridge.py` and the Mesa ones after the recorded list in the staged
+`adreno-compiler-inputs.json`, so the base's scripts apply and check them as their own. Before any compile it checks that
+`build-adreno-metal-plugin.py` finds every line it edits, that the staged Mesa is the pin with its whole list, and that the
+bridge script applies its list to the pin (`--manifest-only`).
+
+```sh
+ONEIOS_METAL_SKIP="display-links-at-panel-rate mesa/0002" userland/metal/build.sh   # leave patches out (name, number-name, folder/...)
+```
+
+A word that names no patch stops the build. Each patch applies with or without any other, except
+`NativeMetal/0010`, whose header says `Applies only after: 0008-... 0009-...`: it is left out with either (said on stderr).
+`out/userland/NativeAdrenoMetal.build.json` lists the patches taken (`oneios_patches`) and the skip (`oneios_metal_skip`).
+
+| Patch | Upstream | What | Switch (boot argument) |
+|---|---|---|---|
+| NativeMetal 0001 | NativeMetal 3c46b5e | a compute pipeline rebuilt with zero constants keeps its function until its reflection is read (cameracaptured's crash) | none |
+| NativeMetal 0002 | 46fdc91 / 935c468 | the 2 s idle trim's dispatch timer lives (held by a local under ARC it never fired) | `oneios-idle-trim=0` |
+| NativeMetal 0003 | macOS-DroidVM 4f77b11, NativeMetal 43f78ae | backboardd counts a video surface in use only while a command buffer reads it | `oneios-surface-use=video` (default), `all`, `life` |
+| NativeMetal 0004 | NativeMetal 0e7550a | at most 3 uncompleted command buffers ahead; backboardd's reads of other processes' surfaces wait for their writers | `oneios-sched-pace=0`, `oneios-read-wait=0` |
+| NativeMetal 0005 | none | thread CPU samples (`thread_info`, refused in WebKit's GPU process) only where the trace or journal reads them | none |
+| NativeMetal 0006 | none | `pages_identity` stops calling a refused `mach_vm_region_recurse` and asks `mach_vm_region` | `oneios-region-identity=0` |
+| NativeMetal 0007 | c6fb605 | a render pipeline refused for an unset constant is made again with the rest zero | none |
+| NativeMetal 0008 | 36514d3 + 438a7c5 | `functionConstantsDictionary`, one per unspecialized function of a library | none |
+| NativeMetal 0009 | 56044ae | reflection bindings conform to `MTLBufferBinding`, `MTLTextureBinding`, `MTLThreadgroupBinding` | none |
+| NativeMetal 0010 | 2fc55d5 | `newArgumentEncoderWithBufferBinding:` | none |
+| NativeMetal 0011 | 689d937 | Swift's `await commandBuffer.completed()` resumes (it never did) | none |
+| NativeMetal 0012 | c35508d | IOSurface read-only texture row alignment 16, not 128 (WebKit layers drew nothing) | none |
+| NativeMetal 0013 | none | with `oneios-compile-here=1`, the thread pipelines are asked on, once a process | none |
+| NativeMetal 0014 | upstream OneiOS e84a46e | UIKit's in-process animation links at the panel's rate | `oneios-dl-full=0` |
+| metal2vulkan 0001 | UniXNU d48df9c (0039) | backboardd's two-plane YCbCr textures over their planes alone where read in place | `oneios-ycbcr-planes=0` |
+| metal2vulkan 0002-0004 | macOS-DroidVM a80044a, fec8a28, 3d247c4 (UniXNU 0040-0042) | rate-map buffer and opaque indirect pointer reflection, identity swizzle | none |
+| metal2vulkan 0005 | upstream OneiOS 50873fe | spare command pools follow their recent use | `oneios-pool-cut=0` |
+| metal2vulkan 0006 | upstream OneiOS cb32176 | the idle trim frees parked images and buffers and spare image blocks | `oneios-idle-spares=0` |
+| metal2vulkan 0007 | NativeMetal 4411df9 (0034) | at a memory pressure rise every parked image and buffer goes first | none |
+| metal2vulkan 0008 | NativeMetal c135133 (0041) | driver pipelines made on the asking thread where its stack holds 2 MiB | `oneios-compile-here=1` (off by default) |
+| mesa 0001 | Mesa 78fd465c (UniXNU ac97948) | unused SP_xS base registers cleared | none |
+| mesa 0002 | UniXNU fb9fb47 | Turnip's kernel submissions end only where a command buffer begins (GPU hang at a compositor's start) | none |
+| mesa 0003 | upstream OneiOS cb32176 | the idle trim of Turnip's freed-BO cache, once a minute | `oneios-bo-cache-idle=0` |
+
+`userland/metal/Switches.inc` (appended to the plug-in, every process) turns these boot arguments into the variables the
+patches read, and sets `METAL2VULKAN_KEEP_ROOM_MIB=8` (upstream OneiOS e84a46e's KeepRoom.inc: the room each pool keeps in
+one piece; `oneios-keep-room=MIB`, `0` the runtime's half block). It logs `OneiOS metal switches: ...` once where a boot
+argument set one, and backboardd's YCbCr line. Add them with `boot-args-add=` in the image set's `xnuhost.conf`
+([booter.md](booter.md) section 1).
+
+**Tested on the PC (2026-11-27):** every series applies in order on the staged trees, and so does every series that
+leaves one or two patches out; `build.sh stage` with a stand-in SDK (an empty `usr/include/stdio.h`, a stand-in `ld`)
+runs its checks with all 25 and with skips; `cargo check` of the bridge with every patch for `aarch64-apple-darwin` and
+`arm64e-apple-ios` (`-Z build-std`), and for `aarch64-apple-darwin` with each patch that shares a Rust file with another
+left out in turn; the edited frontend and plug-in have no selector defined twice in one `@implementation`. **Not tested:** no Objective-C++ file was compiled (no iPhoneOS SDK
+here), nothing ran on the phone. The CI (`.github/workflows/metal-plugin.yml`) is the first compile.
+
+**CI.** A push to `ci/metal-plugin` builds the plug-in from the pushed commit (the owner approves every push). Commit
+with a pathspec (`git commit -- userland/metal .github/workflows/metal-plugin.yml docs/gpu.md`), then
+`git push -f origin HEAD:ci/metal-plugin`. "[metal-skip: NAME ...]" in the pushed commit's message, or the dispatch input
+`skip`, leaves patches out. The step "Metal plug-in" prints a `metal: staged drivers/AdrenoMetal: patches/NativeMetal/...`
+line per NativeMetal patch, the three `metal: checked:` lines, and at its end `OneiOS patches taken:` with the list.
+
+**On the phone (iOS's log):** `OneiOS metal switches:` (the boot arguments taken), `OneiOS display links: hooked`, and
+for the opt-in `oneios-compile-here=1`, once a process, `native-metal: pipelines asked on thread 'NAME' (..., QoS 0x..,
+N KiB of stack): the runtime makes them on it | on a thread of its own still (under 2 MiB of stack)`. backboardd's line
+answers whether metal2vulkan 0008 changes anything there: under 2 MiB it does not, and the useful change is then a relay
+thread with the asking thread's priority instead (not made).

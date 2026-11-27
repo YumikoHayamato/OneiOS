@@ -1,0 +1,63 @@
+OneiOS take18, userland/metal/patches/NativeMetal/0013: with oneios-compile-here=1, the thread pipelines are asked on is said
+once per process.
+Upstream: none (OneiOS). The check upstream c135133 (metal2vulkan 0008 here) needs before it can be turned on.
+What: the first pipeline creation of a process (render or compute) logs, only while METAL2VULKAN_COMPILE_ON_ASKING_THREAD=1,
+  native-metal: pipelines asked on thread 'NAME' (main|secondary, QoS 0xNN+R, N KiB of stack): the runtime makes them ...
+from the thread's own pthread fields (no call a sandbox filters). metal2vulkan 0008 makes a driver pipeline on the asking
+thread only where its stack holds 2 MiB or more; under that the line says the relay stays.
+Why: whether the switch changes anything in backboardd is not known (iOS gives a secondary thread 512 KiB of stack): one
+boot with the switch on answers it in iOS's own log (docs/gpu.md 7.1).
+Switch: none of its own; it logs only with oneios-compile-here=1. Removable: yes (ONEIOS_METAL_SKIP=asking-thread-line).
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 75c22af..1501c66 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -4049,6 +4049,23 @@ static std::string quartzCoreCallers() {
+  }
+  return out;
+ }
++// OneiOS (metal2vulkan 0008, boot argument oneios-compile-here=1, docs/gpu.md 7.1): with METAL2VULKAN_COMPILE_ON_ASKING_THREAD=1 the
++// runtime makes a driver pipeline on the thread that asks for it only where that thread's stack holds 2 MiB or more, and hands it to a
++// thread of its own at the user-initiated class otherwise (as without the switch: device/compiles.rs at_user_initiated). Said once per
++// process, with the switch on: the asking thread's name, QoS class and stack, which tell whether the switch changes anything there.
++// Only reads of the thread's own pthread fields: no call a sandbox filters.
++static void noteAskingThread() {
++ static const bool on=[]{const char *value=getenv("METAL2VULKAN_COMPILE_ON_ASKING_THREAD");return value && !strcmp(value,"1");}();
++ static std::atomic<bool> said{false};
++ if(!on || said.exchange(true))return;
++ qos_class_t qos=QOS_CLASS_UNSPECIFIED;int relative=0;
++ pthread_get_qos_class_np(pthread_self(),&qos,&relative);
++ const size_t stack=pthread_get_stacksize_np(pthread_self());
++ char name[64]={};pthread_getname_np(pthread_self(),name,sizeof name);
++ NBLOG(@"native-metal: pipelines asked on thread '%s' (%s, QoS %#x%+d, %zu KiB of stack): the runtime makes them %s",name,
++       pthread_main_np()?"main":"secondary",(unsigned)qos,relative,stack>>10,
++       stack>=((size_t)2<<20)?"on it (oneios-compile-here=1)":"on a thread of its own still (under 2 MiB of stack)");
++}
+ // What a creation cost beyond its wall time (int-156: a translation the host does in 6 ms took 665 ms on the tablet, whose single core is
+ // as fast): this thread's CPU time (user and system, microseconds) and the task's page faults, page-ins and context switches. A creation
+ // whose CPU time is near its wall time computed; one whose faults are many paid the 4 KiB fault path; one far below it waited.
+@@ -5063,6 +5080,7 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
+ }
+ - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options
+                                                          reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
++ noteAskingThread();
+  if(reflection)*reflection=nil;
+  if(![(id)function isKindOfClass:[NBFunction class]] || ![(NBFunction *)function handle]) {
+   computeRefused(function,[(id)function isKindOfClass:[NBFunction class]]?@"a function with no runtime handle (a Core Image kernel, only stitched)":@"foreign function");
+@@ -5090,6 +5108,7 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
+ }
+ - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
+                                                        reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
++ noteAskingThread();
+  if(reflection)*reflection=nil;
+  NmbComputePipelineDescriptor p={};std::vector<NmbFunction *> linked,privateLinked;std::vector<NmbDynamicLibrary *> preloaded;
+  if(!computeDescriptor(d,&p,linked,privateLinked,error,&preloaded)){computeRefused(d.computeFunction,error && *error?(*error).localizedDescription:@"descriptor");return nil;}
+@@ -5131,6 +5150,7 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
+ }
+ - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)options
+                                                         reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection error:(NSError **)error {
++ noteAskingThread();
+  if(reflection)*reflection=nil;
+  auto *p=new NBRenderDescriptor();
+  if(!renderDescriptor(d,p,error)) {

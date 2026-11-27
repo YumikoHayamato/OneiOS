@@ -1,0 +1,37 @@
+OneiOS take18, userland/metal/patches/metal2vulkan/0002: the opaque rasterization rate map buffer is reflected.
+Upstream: Droid-VM/macOS-DroidVM a80044a (lateautumn233, 2026-11-13: patches/metal2vulkan-macos/0003), the same change as
+Droid-VM/UniXNU wip/hackintosh patches/metal2vulkan/0040-rate-map-buffer-reflection.patch (on 555b13d5); its two hunks apply
+to this stack unchanged.
+What: a pipeline argument of type metal::rasterization_rate_map_data (no member layout in AIR) is reflected as a struct of
+the runtime's parameter data size and alignment (RasterizationRateMap::PARAMETER_DATA_SIZE/_ALIGNMENT) instead of refusing
+the whole pipeline's reflection.
+Why: a client that asks reflection of such a pipeline got none (the pipeline refused with it).
+Switch: none (a reflection answer that was a refusal). Removable: yes (ONEIOS_METAL_SKIP=rate-map-buffer-reflection).
+
+diff --git a/crates/metal2vulkan/src/reflection/derive.rs b/crates/metal2vulkan/src/reflection/derive.rs
+index ebd79bd..5ffdd2c 100644
+--- a/crates/metal2vulkan/src/reflection/derive.rs
++++ b/crates/metal2vulkan/src/reflection/derive.rs
+@@ -280,6 +280,10 @@ impl Cx<'_> {
+ 
+     /// The size and alignment of a pointee.
+     fn size_align(&self, param: u32, ty: &ArgTypeInfo) -> Result<(u64, u64), Error> {
++        if ty.name.as_ref().is_some_and(|name| name.to_string() == "metal::rasterization_rate_map_data") {
++            return Ok((crate::bind::RasterizationRateMap::PARAMETER_DATA_SIZE,
++                       crate::bind::RasterizationRateMap::PARAMETER_DATA_ALIGNMENT));
++        }
+         match (ty.size, ty.align) {
+             (Some(size), Some(align)) => Ok((u64::from(size), u64::from(align))),
+             _ => Err(self.gap(Some(param), ty.name.as_ref())),
+@@ -472,6 +476,11 @@ impl Cx<'_> {
+         layout: Option<StructRef>,
+         argument_buffer: bool,
+     ) -> Result<(DataType, TypeDetail), Error> {
++        // The decoder's parameter data is opaque in AIR: it has no public member layout.
++        // Preserve the buffer binding instead of refusing the entire pipeline's reflection.
++        if ty.name.as_ref().is_some_and(|name| name.to_string() == "metal::rasterization_rate_map_data") {
++            return Ok((DataType::Struct, TypeDetail::Struct(StructType::new(Vec::new()))));
++        }
+         match layout {
+             Some(r) => Ok((
+                 DataType::Struct,

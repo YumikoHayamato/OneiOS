@@ -1,0 +1,144 @@
+OneiOS take18, userland/metal/patches/NativeMetal/0008: MTLFunction.functionConstantsDictionary, one dictionary per
+unspecialized function of a library.
+Upstream: Droid-VM/NativeMetal 36514d3 (2026-11-13) and 438a7c5 (2026-11-15), both wip/hackintosh, lateautumn233, in one
+patch: 36514d3 alone would rebuild the dictionary from the runtime's reflection JSON at every call (VFX asks for fresh
+function objects every frame), which 438a7c5 then caches. 438a7c5 keys its cache on 8c1ea13's NBFunction.sourceName,
+which b0d6a07 has not: here it keys on NBFunction.name, the name the function was looked up by in its library (b0d6a07
+keeps no aliases, so the two are the same name). Otherwise verbatim (README hunks left out).
+What: NBFunction answers functionConstantsDictionary with an NBFunctionConstant (name, type, index, required) per
+function constant of the runtime's reflection (nmb_function_constants, new in NativeMetalObjects.h/.rs, over the
+runtime's Function::function_constants_dictionary). A specialized function (made with constant values, the zero-rest
+rebuilds of 0007 included) answers an empty dictionary; an unspecialized one of a library shares its library's entry; a
+function made with no library (shader priming's zero-constant variants) builds its own.
+Why: correctness. b0d6a07 answered nil through its missing-selector fallback: a client that reads the constants to fill
+MTLFunctionConstantValues (VFX, Swift code) set none, and its specialized functions were refused or wrong.
+Switch: none (correctness fix). Removable: yes (ONEIOS_METAL_SKIP=function-constants-dictionary); 0010 is left out with it.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index dbcae47..15e0357 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1567,6 +1567,7 @@ static id<MTLArgumentEncoder> argumentEncoder(NmbArgumentEncoder *handle,const c
+ @property(nonatomic,strong) id storage;          // what keeps the metallib's bytes mapped: its functions' bitcode, for stitching
+ @property(nonatomic) const uint8_t *bytes;
+ @property(nonatomic) size_t length;
++@property(nonatomic,strong) NSMutableDictionary<NSString *,NSDictionary *> *functionConstants;
+ - (id<MTLFunction>)nb_newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values zeroRest:(BOOL)zeroRest
+                                     error:(NSError **)error;
+ @end
+@@ -1578,7 +1579,30 @@ static id<MTLArgumentEncoder> argumentEncoder(NmbArgumentEncoder *handle,const c
+ @property(nonatomic,strong) NBLibrary *library;      // where it came from (stitching reads its bitcode), and the values it was
+ @property(nonatomic,strong) NSData *bitCodeHashData;
+ @property(nonatomic,strong) MTLFunctionConstantValues *constantValues;   // specialized with (nil: none), for the zero-rest rebuild of a refused pipeline
++@property(nonatomic,strong) NSDictionary *constantsDictionary;
+ @end
++static NSDictionary *reflectionJSON(NmbReflection *reflection,const char *what);
++@interface NBFunctionConstant : MTLFunctionConstant
++@property(nonatomic,copy) NSString *name;
++@property(nonatomic) MTLDataType type;
++@property(nonatomic) NSUInteger index;
++@property(nonatomic) BOOL required;
++@end
++@implementation NBFunctionConstant
++@synthesize name=_name,type=_type,index=_index,required=_required;
++@end
++static NSDictionary *functionConstantsDictionary(NmbFunction *handle) {
++ NSDictionary *json=reflectionJSON(nmb_function_constants(handle),"function constants");
++ if(!json)return nil;
++ NSMutableDictionary *constants=[NSMutableDictionary new];
++ for(NSDictionary *item in json[@"constants"]) {
++  NBFunctionConstant *constant=[NBFunctionConstant new];
++  constant.name=item[@"name"];constant.type=(MTLDataType)[item[@"type"] unsignedIntegerValue];
++  constant.index=[item[@"index"] unsignedIntegerValue];constant.required=[item[@"required"] boolValue];
++  constants[constant.name]=constant;
++ }
++ return [constants copy];
++}
+ // MTLDynamicLibrary: iPadOS 27's Core Image keeps its kernel language's standard library as one (CoreImage.framework/CoreImage.metallib,
+ // every function exported) and its kernels import from it by install name; the runtime loads it (newDynamicLibraryWithURL:error:) and a
+ // pipeline stage searches it (preloadedLibraries), or loads it by the install name its library imports from when the pipeline is made.
+@@ -1595,6 +1619,32 @@ static id<MTLArgumentEncoder> argumentEncoder(NmbArgumentEncoder *handle,const c
+ @end
+ @implementation NBFunction
+ - (void)dealloc {if(_handle)nmb_function_release(_handle);}
++- (NSDictionary<NSString *,MTLFunctionConstant *> *)functionConstantsDictionary {
++ @synchronized(self) {
++  if(!_constantsDictionary) {
++   if(!_handle)return @{};
++   // Unspecialized functions of one library share immutable metadata. VFX makes fresh
++   // function objects while preparing cached shaders; do not rebuild their JSON each frame.
++   if(_constantValues) {
++    _constantsDictionary=@{};
++   } else if(_library) {
++    @synchronized(_library) {
++     _constantsDictionary=_library.functionConstants[_name];
++     if(!_constantsDictionary) {
++      _constantsDictionary=functionConstantsDictionary(_handle);
++      if(_constantsDictionary) {
++       if(!_library.functionConstants)_library.functionConstants=[NSMutableDictionary new];
++       _library.functionConstants[_name]=_constantsDictionary;
++      }
++     }
++    }
++   } else {
++    _constantsDictionary=functionConstantsDictionary(_handle);
++   }
++  }
++  return _constantsDictionary;
++ }
++}
+ // _MTLFunction's bitCodeHash (32 bytes), read by the stitched-library path (createStitchingScriptHash): a digest naming this function
+ // object, its name and a serial no other function in the process has.
+ - (const void *)bitCodeHash {
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
+index fc01785..76f2293 100644
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -255,6 +255,8 @@ void nmb_render_pipeline_release(NmbRenderPipeline *);
+ // A pipeline's reflection, as its creation's `reflection:` answers it, in JSON: {"vertex":[...],"fragment":[...]} for a render pipeline,
+ // {"bindings":[...]} for a compute pipeline; each binding has Metal's raw values and a buffer's nested struct/array/pointer types. Null: refused.
+ typedef struct NmbReflection NmbReflection;
++/* MTLFunction.functionConstantsDictionary: name, type, index and required for each constant. */
++NmbReflection *nmb_function_constants(const NmbFunction *);
+ NmbReflection *nmb_render_pipeline_reflection(const struct NmbRenderPipelineDescriptor *);
+ NmbReflection *nmb_compute_pipeline_reflection(const struct NmbComputePipelineDescriptor *);
+ const char *nmb_reflection_json(const NmbReflection *);
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index 694cf1f..67ce842 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -2123,7 +2123,7 @@ mod reflection_json {
+     use metal2vulkan::reflection::{ArrayType, Binding, PointerType, StructType, TextureReferenceType};
+     use std::fmt::Write;
+ 
+-    fn string(out: &mut String, s: &str) {
++    pub(super) fn string(out: &mut String, s: &str) {
+         out.push('"');
+         for c in s.chars() {
+             match c {
+@@ -2254,6 +2254,25 @@ fn reflection_handle(json: String) -> Result<*mut NmbReflection, String> {
+     Ok(boxed(NmbReflection(std::ffi::CString::new(json).map_err(|_| "a NUL in the reflection".to_string())?)))
+ }
+ 
++/// The generic function's constants; specialized functions answer an empty dictionary as Metal does.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_function_constants(function: *const NmbFunction) -> *mut NmbReflection {
++    guard(std::ptr::null_mut(), || {
++        use std::fmt::Write;
++        let constants = get(function)?.0.function_constants_dictionary().map_err(e("function constants"))?;
++        let mut json = String::from("{\"constants\":[");
++        for (i, (name, constant)) in constants.iter().enumerate() {
++            if i != 0 { json.push(','); }
++            json.push_str("{\"name\":");
++            reflection_json::string(&mut json, name);
++            let _ = write!(json, ",\"type\":{},\"index\":{},\"required\":{}}}",
++                constant.data_type().as_raw(), constant.index(), constant.is_required());
++        }
++        json.push_str("]}");
++        reflection_handle(json)
++    })
++}
++
+ /// The reflection of the render pipeline `descriptor` describes: `{"vertex":[...],"fragment":[...]}`.
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_render_pipeline_reflection(descriptor: *const NmbRenderPipelineDescriptor) -> *mut NmbReflection {

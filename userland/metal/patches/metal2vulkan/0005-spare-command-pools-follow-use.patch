@@ -1,0 +1,378 @@
+OneiOS take18, userland/metal/patches/metal2vulkan/0005: spare command pools follow their recent use.
+Upstream: upstream OneiOS (akshaynexus/OneiOS) 50873fe, userland/metal/m2v-spare-command-pools.patch (2026-11-23), made
+for this same stack; applies unchanged (contexts made again here). Its census (m2v_command_pool_census) is exported; no
+row of ours reads it yet.
+What: a command pool given back counts the most command buffers one command buffer used of it in a window of 10 s
+(METAL2VULKAN_POOL_USE_WINDOW_S, 1-3600; 0: off); at the first give-back past the window, a pool that holds more than that
+plus 8 is released (its command buffers and their command stream BOs: to Turnip's freed-BO cache, past its budget to the
+host) instead of kept. A pool that serves the same command buffers each frame is never released.
+Why: the pools in rotation (the newest, taken each frame, and the 8 kept) each kept the command buffers of the largest
+command buffer they ever served, each with its last command stream BO: upstream's render server held 2,600-3,400 blobs
+under 1 MiB, growing by 200-600 per 10 s an app opened. The board's 0022 trims only pools that stay spare (20 s).
+Switch: boot argument oneios-pool-cut=0 (upstream's name; METAL2VULKAN_POOL_USE_WINDOW_S=0). Removable: yes
+(ONEIOS_METAL_SKIP=spare-command-pools-follow-use).
+
+diff --git a/crates/metal2vulkan-runtime/src/spares.rs b/crates/metal2vulkan-runtime/src/spares.rs
+index 6a0072c..134ef58 100644
+--- a/crates/metal2vulkan-runtime/src/spares.rs
++++ b/crates/metal2vulkan-runtime/src/spares.rs
+@@ -107,6 +107,20 @@
+ //!   blobs, 32, 16 and 8 KiB command stream BOs most of them (390 MiB of wired guest memory), never
+ //!   given back. A taker takes the newest spare of its family, so the older ones are those idle.
+ //!   Turnip's `vkDestroyCommandPool` returns (unlike the NVIDIA driver's above).
++//! - **On this board, a pool in use follows its recent use too** (OneiOS, [`USE_WINDOW`]). The
++//!   trim above reaches only pools that stay spare: the pools in the rotation (the newest, taken
++//!   again each frame, and the 8 it always keeps) each kept the command buffers of the largest
++//!   command buffer they ever served, every one with the last command stream BO of each of its
++//!   streams (Turnip's reset keeps it, `tu_cs_reset`; the reset flags are not read). The iOS 27
++//!   guest's render server (2026-11-23) held 2,600-3,400 blobs under 1 MiB, 1,400 of them under
++//!   16 KiB, growing by 200-600 in each 10 s an app opened and given back only on a memory
++//!   pressure rise (500-660 at once, the trim's floor of 2), never at idle. A pool given back now
++//!   counts the most command buffers any command buffer used of it in a window of [`USE_WINDOW`];
++//!   at the first give-back past the window, a pool that holds more than that plus [`USE_SLACK`]
++//!   is released instead of kept (its command buffers and their BOs go: to Turnip's cache of
++//!   freed BOs, and past its budget to the host), and the next taker makes a pool again. A pool
++//!   that serves the same command buffers each frame is never released. Counted for the
++//!   board's report ([`m2v_command_pool_census`]).
+ 
+ use super::descriptor_arena::{Room, SetNeeds};
+ use super::device::{lock, DeviceShared};
+@@ -115,9 +129,79 @@ use super::exit_guard::{self, Call};
+ use super::release::{self, Released};
+ use ash::vk;
+ use std::collections::VecDeque;
++use std::sync::atomic::{AtomicU64, Ordering};
+ use std::sync::Mutex;
+ use std::time::{Duration, Instant};
+ 
++/// How long a command pool's use is followed before a give-back may release it for holding more
++/// than that use (OneiOS, the module docs).
++pub(super) const USE_WINDOW: Duration = Duration::from_secs(10);
++
++/// The window in this process: [`USE_WINDOW`], or `METAL2VULKAN_POOL_USE_WINDOW_S` seconds where the process
++/// sets it (1 to 3600); 0 turns the release off, the pools kept as before (the board's switch: the
++/// plug-in sets 0 for the boot argument `oneios-pool-cut=0`).
++pub(super) fn use_window() -> Option<Duration> {
++    static WINDOW: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
++    *WINDOW.get_or_init(|| {
++        match std::env::var("METAL2VULKAN_POOL_USE_WINDOW_S")
++            .ok()
++            .and_then(|text| text.trim().parse::<u64>().ok())
++        {
++            Some(0) => None,
++            Some(seconds) if seconds <= 3600 => Some(Duration::from_secs(seconds)),
++            _ => Some(USE_WINDOW),
++        }
++    })
++}
++
++/// The command buffers a pool may hold past the most one command buffer used of it in a
++/// [`USE_WINDOW`] before it is released (OneiOS).
++pub(super) const USE_SLACK: usize = 8;
++
++/// The process's command pools and their command buffers, for the board's report (OneiOS,
++/// [`m2v_command_pool_census`]): live pools, the command buffers made from them, pools released
++/// for holding past their use and their command buffers, pools released idle (the trim) and theirs.
++static CENSUS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
++const LIVE_POOLS: usize = 0;
++const LIVE_BUFFERS: usize = 1;
++const CUT_POOLS: usize = 2;
++const CUT_BUFFERS: usize = 3;
++const TRIMMED_POOLS: usize = 4;
++const TRIMMED_BUFFERS: usize = 5;
++
++fn census_add(at: usize, count: usize) {
++    CENSUS[at].fetch_add(count as u64, Ordering::Relaxed);
++}
++
++fn census_sub(at: usize, count: usize) {
++    // Saturating: a pool made before a count began (none here) never takes it below zero.
++    let _ = CENSUS[at].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |now| {
++        Some(now.saturating_sub(count as u64))
++    });
++}
++
++/// Whether a pool holding `held` command buffers, of which one command buffer used at most `peak`
++/// in the window, holds past its use (the module docs).
++pub(super) fn past_use(held: usize, peak: usize) -> bool {
++    held > peak.saturating_add(USE_SLACK)
++}
++
++/// OneiOS: the process's command pools, into `out` (`count` words, at most 6): live pools, the
++/// command buffers made from them, pools released for holding past their recent use and their
++/// command buffers, pools released idle and theirs. The words written.
++#[unsafe(no_mangle)]
++pub extern "C" fn m2v_command_pool_census(out: *mut u64, count: usize) -> usize {
++    if out.is_null() {
++        return 0;
++    }
++    let n = count.min(CENSUS.len());
++    for (at, word) in CENSUS.iter().take(n).enumerate() {
++        // SAFETY: the caller's `count` words at `out`.
++        unsafe { *out.add(at) = word.load(Ordering::Relaxed) };
++    }
++    n
++}
++
+ /// The most spare descriptor pools a device keeps (of each list, a command buffer's arenas' and
+ /// the fitted arenas'): a few frames' worth of a window server's (the module docs).
+ pub(super) const DESCRIPTOR_POOLS: usize = 256;
+@@ -147,11 +231,16 @@ pub(super) struct CommandPool {
+     pub(super) recording: bool,
+     /// When it was last kept a spare ([`keep_command_pool`]), for [`Spares::trim_command_pools`].
+     kept: Option<Instant>,
++    /// The most command buffers one command buffer used of it since `window` began (OneiOS,
++    /// [`USE_WINDOW`]).
++    peak: usize,
++    window: Option<Instant>,
+ }
+ 
+ impl CommandPool {
+     /// A new pool, made for queue family `family`, of no command buffer yet.
+     pub(super) fn new(raw: vk::CommandPool, family: u32) -> CommandPool {
++        census_add(LIVE_POOLS, 1);
+         CommandPool {
+             raw,
+             family,
+@@ -160,6 +249,47 @@ impl CommandPool {
+             begun: None,
+             recording: false,
+             kept: None,
++            peak: 0,
++            window: None,
++        }
++    }
++
++    /// The command buffers made from it, the one begun ahead included.
++    pub(super) fn held(&self) -> usize {
++        self.made[0].len() + self.made[1].len() + usize::from(self.begun.is_some())
++    }
++
++    /// The pool is given back at `now` by a command buffer that used [`handed_out`](Self::handed_out)
++    /// of its command buffers: whether it holds past its use and goes (the module docs). Starts a
++    /// new window where one ended.
++    pub(super) fn holds_past_use(&mut self, now: Instant, window: Duration) -> bool {
++        self.peak = self.peak.max(self.handed_out());
++        let began = *self.window.get_or_insert(now);
++        if now.saturating_duration_since(began) < window {
++            return false;
++        }
++        let past = past_use(self.held(), self.peak);
++        self.peak = 0;
++        self.window = Some(now);
++        past
++    }
++
++    /// The census as the pool goes, `cut` where it held past its use, else trimmed idle (or released with
++    /// its device).
++    fn counted_out(&self, cut: Option<bool>) {
++        let held = self.held();
++        census_sub(LIVE_POOLS, 1);
++        census_sub(LIVE_BUFFERS, held);
++        match cut {
++            Some(true) => {
++                census_add(CUT_POOLS, 1);
++                census_add(CUT_BUFFERS, held);
++            }
++            Some(false) => {
++                census_add(TRIMMED_POOLS, 1);
++                census_add(TRIMMED_BUFFERS, held);
++            }
++            None => {}
+         }
+     }
+ 
+@@ -193,6 +323,7 @@ impl CommandPool {
+         let at = level_index(level);
+         self.made[at].push(buffer);
+         self.handed[at] = self.made[at].len();
++        census_add(LIVE_BUFFERS, 1);
+     }
+ 
+     /// A command buffer took the pool, reset where it was [`recording`](Self::recording): none of
+@@ -218,6 +349,7 @@ impl CommandPool {
+     /// command buffer that takes the pool hands it out first.
+     pub(super) fn stock_secondary(&mut self, buffer: vk::CommandBuffer) {
+         self.made[level_index(vk::CommandBufferLevel::SECONDARY)].push(buffer);
++        census_add(LIVE_BUFFERS, 1);
+     }
+ 
+     /// Make the pool a secondary command buffer where it [`wants_secondary`](Self::wants_secondary)
+@@ -267,7 +399,10 @@ impl CommandPool {
+                     .level(vk::CommandBufferLevel::PRIMARY)
+                     .command_buffer_count(1);
+                 match device.allocate_command_buffers(&info) {
+-                    Ok(made) if !made.is_empty() => made[0],
++                    Ok(made) if !made.is_empty() => {
++                        census_add(LIVE_BUFFERS, 1);
++                        made[0]
++                    }
+                     _ => return false,
+                 }
+             }
+@@ -333,6 +468,7 @@ impl Spares {
+                     .reset_command_pool(pool.raw, vk::CommandPoolResetFlags::empty())
+             };
+             if let Err(error) = reset {
++                pool.counted_out(None);
+                 // SAFETY: as above.
+                 unsafe { release_in_section(device, pool.raw) };
+                 return Err(vulkan(error));
+@@ -348,7 +484,7 @@ impl Spares {
+     /// submitted: nothing of it is pending, and nothing else holds it; `settled` where the
+     /// command buffer completed and ended every command buffer of it handed out, so none is
+     /// recording (the module docs). A pool that made no secondary command buffer makes one
+-    /// first. Never released here.
++    /// first. Released here only where it holds past its recent use (OneiOS, [`USE_WINDOW`]).
+     pub(super) fn give_command_pool(
+         &self,
+         device: &DeviceShared,
+@@ -356,6 +492,13 @@ impl Spares {
+         settled: bool,
+     ) {
+         pool.recording = !settled;
++        if use_window().is_some_and(|window| pool.holds_past_use(Instant::now(), window)) {
++            pool.counted_out(Some(true));
++            // SAFETY: nothing of the pool is pending (the caller's), and nothing else holds it: it
++            // is in no spare list, so no command buffer takes it and no begin ahead finds it.
++            unsafe { release_in_section(device, pool.raw) };
++            return;
++        }
+         pool.stock(device);
+         keep_command_pool(&mut lock(&self.command_pools), pool);
+     }
+@@ -451,6 +594,7 @@ impl Spares {
+         };
+         let count = stale.len();
+         for pool in stale {
++            pool.counted_out(Some(false));
+             // SAFETY: a spare's command buffers are none of them pending (`give_command_pool`), and
+             // it is out of the spares, so no command buffer takes it.
+             unsafe { release_in_section(device, pool.raw) };
+@@ -461,6 +605,7 @@ impl Spares {
+     /// Release every spare of `device`: its teardown, when no command buffer is left.
+     pub(super) fn release(&self, device: &DeviceShared) {
+         for pool in lock(&self.command_pools).drain(..) {
++            pool.counted_out(None);
+             // SAFETY: no command buffer is left, so nothing of the pool is pending.
+             unsafe { release_in_section(device, pool.raw) };
+         }
+diff --git a/crates/metal2vulkan-runtime/src/tests/spares.rs b/crates/metal2vulkan-runtime/src/tests/spares.rs
+index b318ee7..676a48c 100644
+--- a/crates/metal2vulkan-runtime/src/tests/spares.rs
++++ b/crates/metal2vulkan-runtime/src/tests/spares.rs
+@@ -3,11 +3,13 @@
+ 
+ use crate::descriptor_arena::{Room, SetNeeds};
+ use crate::spares::{
+-    keep_command_pool, keep_descriptor_pool, take_command_pool, take_descriptor_pool,
+-    take_to_begin, CommandPool, DescriptorPool, DESCRIPTORS, DESCRIPTOR_POOLS,
++    keep_command_pool, keep_descriptor_pool, m2v_command_pool_census, past_use, take_command_pool,
++    take_descriptor_pool, take_to_begin, CommandPool, DescriptorPool, DESCRIPTORS,
++    DESCRIPTOR_POOLS, USE_SLACK, USE_WINDOW,
+ };
+ use ash::vk::{self, Handle};
+ use std::collections::VecDeque;
++use std::time::{Duration, Instant};
+ 
+ /// Needs of `count` storage buffers, with `flags`.
+ fn storage(count: u32, flags: vk::DescriptorPoolCreateFlags) -> SetNeeds {
+@@ -284,3 +286,98 @@ fn a_spare_command_pool_begins_ahead_out_of_the_spares() {
+     assert!(take_to_begin(&mut pools, vk::CommandPool::from_raw(3)).is_none());
+     assert_eq!(pools.len(), 2, "a pool that may not begin one stays");
+ }
++
++/// A pool holds past its use when it holds more than the most one command buffer used of it in
++/// the window plus the slack (OneiOS).
++#[test]
++fn a_pool_holds_past_its_use_beyond_the_slack() {
++    assert!(!past_use(0, 0));
++    assert!(!past_use(USE_SLACK, 0));
++    assert!(past_use(USE_SLACK + 1, 0));
++    assert!(!past_use(40 + USE_SLACK, 40));
++    assert!(past_use(41 + USE_SLACK, 40));
++    assert!(!past_use(usize::MAX, usize::MAX), "no overflow");
++}
++
++/// A pool given back is followed for a window: inside it never goes; at the first give-back past
++/// it, it goes only where it holds more than the window's most used plus the slack, and a new
++/// window begins either way (OneiOS).
++#[test]
++fn a_pool_goes_only_past_the_window_and_past_its_use() {
++    let primary = vk::CommandBufferLevel::PRIMARY;
++    let secondary = vk::CommandBufferLevel::SECONDARY;
++    let start = Instant::now();
++    // A command buffer of 1 primary and 40 secondaries made the pool (an app's opening).
++    let mut pool = CommandPool::new(vk::CommandPool::from_raw(1), 0);
++    pool.made(primary, vk::CommandBuffer::from_raw(1));
++    for n in 0..40 {
++        pool.made(secondary, vk::CommandBuffer::from_raw(100 + n));
++    }
++    assert_eq!(pool.held(), 41);
++    assert!(!pool.holds_past_use(start, USE_WINDOW), "the window begins");
++    // Then frames of 1 primary and 2 secondaries.
++    let frame = |pool: &mut CommandPool| {
++        pool.taken();
++        assert!(pool.reuse(primary).is_some());
++        assert!(pool.reuse(secondary).is_some());
++        assert!(pool.reuse(secondary).is_some());
++    };
++    frame(&mut pool);
++    assert!(
++        !pool.holds_past_use(start + USE_WINDOW / 2, USE_WINDOW),
++        "inside the window, whatever it holds"
++    );
++    frame(&mut pool);
++    assert!(
++        !pool.holds_past_use(start + USE_WINDOW, USE_WINDOW),
++        "the window's most used was the 41 of its making"
++    );
++    frame(&mut pool);
++    assert!(
++        pool.holds_past_use(start + USE_WINDOW * 2, USE_WINDOW),
++        "41 held against 3 used in the window, past the slack"
++    );
++}
++
++/// A pool that serves the same command buffers frame after frame never goes (OneiOS).
++#[test]
++fn a_pool_in_steady_use_stays() {
++    let primary = vk::CommandBufferLevel::PRIMARY;
++    let secondary = vk::CommandBufferLevel::SECONDARY;
++    let start = Instant::now();
++    let mut pool = CommandPool::new(vk::CommandPool::from_raw(1), 0);
++    pool.made(primary, vk::CommandBuffer::from_raw(1));
++    for n in 0..30 {
++        pool.made(secondary, vk::CommandBuffer::from_raw(100 + n));
++    }
++    for second in 0..60u64 {
++        if second > 0 {
++            pool.taken();
++            assert!(pool.reuse(primary).is_some());
++            for _ in 0..30 {
++                assert!(pool.reuse(secondary).is_some());
++            }
++        }
++        assert!(!pool.holds_past_use(start + Duration::from_secs(second), USE_WINDOW));
++    }
++}
++
++/// The census counts the command buffers made from live pools (OneiOS; other tests make pools too,
++/// so only the growth is checked).
++#[test]
++fn the_census_counts_made_command_buffers() {
++    let mut before = [0u64; 6];
++    assert_eq!(m2v_command_pool_census(before.as_mut_ptr(), 6), 6);
++    let mut pool = CommandPool::new(vk::CommandPool::from_raw(1), 0);
++    pool.made(
++        vk::CommandBufferLevel::PRIMARY,
++        vk::CommandBuffer::from_raw(1),
++    );
++    pool.stock_secondary(vk::CommandBuffer::from_raw(2));
++    let mut after = [0u64; 6];
++    assert_eq!(m2v_command_pool_census(after.as_mut_ptr(), 6), 6);
++    assert!(after[0] >= 1 && after[1] >= 2, "{before:?} -> {after:?}");
++    assert_eq!(m2v_command_pool_census(std::ptr::null_mut(), 6), 0);
++    let mut two = [0u64; 2];
++    assert_eq!(m2v_command_pool_census(two.as_mut_ptr(), 2), 2);
++}

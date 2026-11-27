@@ -10,6 +10,9 @@
 name: metal plug-in and helpers (macOS)
 # workflow_dispatch needs the file on the default branch; a push to ci/metal-plugin runs it from any branch:
 #   git push -f origin HEAD:ci/metal-plugin
+# The plug-in carries OneiOS's patches (userland/metal/patches, docs/gpu.md 7.1); the step "Metal plug-in" prints the ones
+# taken. A push builds them all; "[metal-skip: NAME ...]" in the pushed commit's message, or the dispatch input skip,
+# leaves some out (ONEIOS_METAL_SKIP of userland/metal/build.sh).
 on:
   push:
     branches: ['ci/metal-plugin']
@@ -18,6 +21,9 @@ on:
       xcode:
         description: 'Xcode on the runner (the Mac build host of 2026-11-12 used 27.2)'
         default: '27.2'
+      skip:
+        description: 'OneiOS patches to leave out (ONEIOS_METAL_SKIP: names of userland/metal/patches, blank-separated)'
+        default: ''
 permissions:
   contents: read
 defaults:
@@ -60,10 +66,21 @@ jobs:
       - name: Metal plug-in
         # "[helpers-only]" in the pushed commit's message skips it (about 30 minutes)
         if: ${{ !contains(github.event.head_commit.message, '[helpers-only]') }}
+        env:
+          SKIP_INPUT: ${{ inputs.skip || '' }}
+          HEAD_MESSAGE: ${{ github.event.head_commit.message || '' }}
         run: |
           export PATH="$(brew --prefix bison)/bin:$PATH"
+          # ONEIOS_METAL_SKIP: the dispatch input, else "[metal-skip: NAME ...]" in the pushed commit's message
+          ONEIOS_METAL_SKIP=$SKIP_INPUT
+          if [ -z "$ONEIOS_METAL_SKIP" ]; then
+            ONEIOS_METAL_SKIP=$(printf '%s\n' "$HEAD_MESSAGE" | sed -n 's/.*\[metal-skip: *\([^]]*\)\].*/\1/p' | head -1)
+          fi
+          export ONEIOS_METAL_SKIP
+          echo "ONEIOS_METAL_SKIP=${ONEIOS_METAL_SKIP:-(none)}"
           userland/metal/build.sh
           ls -la out/userland
+          python3 -c 'import json; r = json.load(open("out/userland/NativeAdrenoMetal.build.json")); print("OneiOS patches taken:", *r["oneios_patches"], sep="\n  "); print("left out:", " ".join(r["oneios_metal_skip"]) or "none")'
       - name: The build's own logs (on a failure)
         if: failure()
         run: |

@@ -1,0 +1,38 @@
+OneiOS take18, userland/metal/patches/metal2vulkan/0003: an indirect pointer without pointee metadata is reflected as
+Metal does.
+Upstream: Droid-VM/macOS-DroidVM fec8a28 (lateautumn233, 2026-11-13: patches/metal2vulkan-macos/0004), as Droid-VM/UniXNU
+wip/hackintosh patches/metal2vulkan/0041-opaque-indirect-pointer-reflection.patch; applies here with a 9-line offset
+(contexts made again).
+What: a buffer argument that is no argument buffer and has no layout, size or alignment in AIR is reflected as a pointer
+to None with zero size and alignment (Metal's own representation) instead of refusing the pipeline's whole reflection.
+Why: macOS-DroidVM: Weather made its pipelines without the reflection refusals after it ("foreground Weather creates its
+pipelines without the previous reflection refusals").
+Switch: none. Removable: yes (ONEIOS_METAL_SKIP=opaque-indirect-pointer-reflection).
+
+diff --git a/crates/metal2vulkan/src/reflection/derive.rs b/crates/metal2vulkan/src/reflection/derive.rs
+index ebd79bd..15b64e1 100644
+--- a/crates/metal2vulkan/src/reflection/derive.rs
++++ b/crates/metal2vulkan/src/reflection/derive.rs
+@@ -589,8 +589,20 @@ impl Cx<'_> {
+                     ParamRole::Sampler { .. } => (DataType::Sampler, TypeDetail::Plain),
+                     ParamRole::Buffer(b) | ParamRole::ArgumentBuffer(b) => {
+                         let nested = matches!(ia.role, ParamRole::ArgumentBuffer(_));
+-                        let (size, align) = self.size_align(arg, &ia.ty)?;
+-                        let (pointee, detail) = self.pointee(arg, &ia.ty, b.layout, nested)?;
++                        // AIR may retain an indirect pointer without any pointee metadata.
++                        // Metal reflects it as None with zero size/alignment and no struct,
++                        // while preserving the other argument-buffer members.
++                        let (size, align, pointee, detail) = if !nested
++                            && b.layout.is_none()
++                            && ia.ty.size.is_none()
++                            && ia.ty.align.is_none()
++                        {
++                            (0, 0, DataType::None, TypeDetail::Plain)
++                        } else {
++                            let (size, align) = self.size_align(arg, &ia.ty)?;
++                            let (pointee, detail) = self.pointee(arg, &ia.ty, b.layout, nested)?;
++                            (size, align, pointee, detail)
++                        };
+                         let pointer = PointerType::new(
+                             pointee,
+                             binding_access(b.access),

@@ -1,0 +1,60 @@
+OneiOS take18, userland/metal/patches/metal2vulkan/0008: driver pipelines made on the asking thread where its stack has
+room (opt-in).
+Upstream: Droid-VM/NativeMetal c135133 (UniXNU line, 2026-11-12), bridge/patches/0041-compile-on-the-asking-thread.patch,
+verbatim. Its plug-in line (setenv for every process) is not taken: here the boot argument sets the variable
+(userland/metal/Switches.inc), default off.
+What: every vkCreateGraphicsPipelines / vkCreateComputePipelines made on a thread below the user-initiated QoS class is
+handed to a "metal2vulkan-compile" thread started for the call, at user-initiated, while the asking thread waits
+(device/compiles.rs at_user_initiated; the relay serves a driver whose compiler service takes the caller's class).
+Turnip compiles inside the call. With METAL2VULKAN_COMPILE_ON_ASKING_THREAD=1 a thread with 2 MiB of stack or more makes
+the call itself; a smaller stack keeps the handover (Turnip's compiler runs deep).
+Why: upstream, macOS WindowServer's main thread with cached pipelines: 42 creations 755 ms of wall time (the longest
+168 ms) before, 17 creations 34 ms (the longest 8 ms) after. backboardd's pipelines are made on CoreAnimation's own
+thread (the frontend creates them synchronously on the caller's thread), which waited for a QoS-37 thread.
+Not known (the reason it is off): the QoS class and stack size of the thread that makes backboardd's pipelines. iOS
+gives a secondary thread 512 KiB of stack by default, the main thread 1 MiB: under the 2 MiB rule this may change
+nothing. With the switch on, NativeMetal 0013 logs both once per process; see docs/gpu.md 7.1 for the check.
+Switch: boot argument oneios-compile-here=1 (METAL2VULKAN_COMPILE_ON_ASKING_THREAD=1); off without it. Removable: yes
+(ONEIOS_METAL_SKIP=compile-on-asking-thread).
+
+diff --git a/crates/metal2vulkan-runtime/src/device/compiles.rs b/crates/metal2vulkan-runtime/src/device/compiles.rs
+index 9950148..bf2297d 100644
+--- a/crates/metal2vulkan-runtime/src/device/compiles.rs
++++ b/crates/metal2vulkan-runtime/src/device/compiles.rs
+@@ -290,12 +290,35 @@ pub(crate) fn holding<R>(call: impl FnOnce() -> R) -> (R, Vec<(MessageSink, Debu
+     (made, messages)
+ }
+ 
++/// Whether a call that may compile is made on this thread whatever its class: the host says its
++/// driver compiles inside the call, on the calling thread (`METAL2VULKAN_COMPILE_ON_ASKING_THREAD=1`),
++/// so there is no compiler service whose class would follow the asking thread's, and a thread
++/// started for the call only makes the asking thread wait for one of a lower priority than its
++/// own (a render server's main thread, which has no class, waited 40 to 170 ms for it on a busy
++/// system). A thread with less than 2 MiB of stack still hands the call over: the driver's
++/// compiler runs deep, and the runtime's thread has the room.
++#[cfg(any(target_os = "macos", target_os = "ios"))]
++fn compiles_here() -> bool {
++    static HOST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    let host = *HOST.get_or_init(|| {
++        std::env::var_os("METAL2VULKAN_COMPILE_ON_ASKING_THREAD").is_some_and(|value| value == "1")
++    });
++    // SAFETY: the calling thread's own handle.
++    host && unsafe { libc::pthread_get_stacksize_np(libc::pthread_self()) } >= 2 << 20
++}
++
++/// Never: no class here, so every call is made on the asking thread already.
++#[cfg(not(any(target_os = "macos", target_os = "ios")))]
++fn compiles_here() -> bool {
++    false
++}
++
+ /// Run `call`, one Vulkan call that may compile, at the user-initiated quality of service or
+ /// above (the module docs). It runs here where this thread is at that class, and otherwise on a
+ /// thread of the runtime's own at it while this thread waits. It runs here too where no thread
+ /// starts or the process is exiting.
+ pub(super) fn at_user_initiated<R: Send>(call: impl FnOnce() -> R + Send) -> R {
+-    if exit_guard::at_least_user_initiated() {
++    if exit_guard::at_least_user_initiated() || compiles_here() {
+         return call();
+     }
+     // The driver diagnostics this thread's call is measured to report: the driver reports them

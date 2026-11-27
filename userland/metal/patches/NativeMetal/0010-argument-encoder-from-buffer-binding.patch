@@ -1,0 +1,232 @@
+OneiOS take18, userland/metal/patches/NativeMetal/0010: newArgumentEncoderWithBufferBinding: from a reflected buffer binding.
+Upstream: Droid-VM/NativeMetal 2fc55d5 (wip/hackintosh, lateautumn233, 2026-11-13), verbatim (README hunk left out).
+Applies only after: 0008-function-constants-dictionary.patch 0009-reflection-binding-protocols.patch
+What: a reflected buffer binding keeps the runtime's BufferBinding it came from (nmb_reflection_buffer_binding, released
+with nmb_buffer_binding_release); the device's newArgumentEncoderWithBufferBinding: makes the encoder from it
+(nmb_buffer_binding_argument_encoder over the runtime's Device::new_argument_encoder_with_buffer_binding). The three are
+new in NativeMetalObjects.h/.rs.
+Why: correctness. b0d6a07 had no such method: a client that encodes argument buffers from pipeline reflection (the
+binding API that replaced MTLArgument) got no encoder.
+Needs: 0008 and 0009 (its context and their types), so build.sh leaves it out when either is left out.
+Switch: none (correctness fix). Removable: yes (ONEIOS_METAL_SKIP=argument-encoder-from-buffer-binding).
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 589a826..1993206 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1581,7 +1581,7 @@ static id<MTLArgumentEncoder> argumentEncoder(NmbArgumentEncoder *handle,const c
+ @property(nonatomic,strong) MTLFunctionConstantValues *constantValues;   // specialized with (nil: none), for the zero-rest rebuild of a refused pipeline
+ @property(nonatomic,strong) NSDictionary *constantsDictionary;
+ @end
+-static NSDictionary *reflectionJSON(NmbReflection *reflection,const char *what);
++static NSDictionary *reflectionJSON(NmbReflection *reflection,const char *what,bool release=true);
+ @interface NBFunctionConstant : MTLFunctionConstant
+ @property(nonatomic,copy) NSString *name;
+ @property(nonatomic) MTLDataType type;
+@@ -4311,8 +4311,10 @@ static NBTextureReferenceType *reflectionTexture(NSDictionary *json) {
+ // Swift clients cast bindings to their resource protocol before walking type information.
+ // Keep protocol conformance specific to the binding kind.
+ @interface NBBufferArgument : NBArgument <MTLBufferBinding>
++@property(nonatomic) NmbBufferBinding *binding;
+ @end
+ @implementation NBBufferArgument
++- (void)dealloc {nmb_buffer_binding_release(_binding);}
+ @end
+ @interface NBTextureArgument : NBArgument <MTLTextureBinding>
+ @end
+@@ -4343,16 +4345,16 @@ static NBTextureReferenceType *reflectionTexture(NSDictionary *json) {
+ - (NSArray *)bindings {return _argumentList;}
+ @end
+ // The runtime's JSON as objects (nil, with the reason logged, for a refusal).
+-static NSDictionary *reflectionJSON(NmbReflection *reflection,const char *what) {
++static NSDictionary *reflectionJSON(NmbReflection *reflection,const char *what,bool release) {
+  if(!reflection){NBLOG(@"native-metal: %s reflection refused: %@",what,lastError());return nil;}
+  const char *text=nmb_reflection_json(reflection);
+  NSData *data=text?[NSData dataWithBytes:text length:strlen(text)]:nil;
+  NSDictionary *json=data?[NSJSONSerialization JSONObjectWithData:data options:0 error:nil]:nil;
+- nmb_reflection_release(reflection);
++ if(release)nmb_reflection_release(reflection);
+  if(![json isKindOfClass:[NSDictionary class]]){NBLOG(@"native-metal: %s reflection is not JSON",what);return nil;}
+  return json;
+ }
+-static NSArray *reflectionArguments(NSArray *bindings) {
++static NSArray *reflectionArguments(NSArray *bindings,NmbReflection *source,uint32_t stage) {
+  NSMutableArray *arguments=[NSMutableArray array];
+  for(NSDictionary *b in bindings)if([b isKindOfClass:[NSDictionary class]]) {
+   Class kind=[NBArgument class];
+@@ -4362,23 +4364,30 @@ static NSArray *reflectionArguments(NSArray *bindings) {
+    case MTLBindingTypeThreadgroupMemory:kind=[NBThreadgroupArgument class];break;
+    default:break;
+   }
+-  NBArgument *argument=[kind new];argument.json=b;[arguments addObject:argument];
++  NBArgument *argument=[kind new];argument.json=b;
++  if(kind==[NBBufferArgument class])
++   ((NBBufferArgument *)argument).binding=nmb_reflection_buffer_binding(source,stage,(uint32_t)argument.index);
++  [arguments addObject:argument];
+  }
+  return arguments;
+ }
+ // Metal answers a reflection where the options ask for argument or buffer type information.
+ static bool wantsReflection(MTLPipelineOption options) {return options&(MTLPipelineOptionArgumentInfo|MTLPipelineOptionBufferTypeInfo);}
+ static id renderReflection(const NmbRenderPipelineDescriptor *p) {
+- NSDictionary *json=reflectionJSON(nmb_render_pipeline_reflection(p),"render pipeline");
+- if(!json)return nil;
++ NmbReflection *source=nmb_render_pipeline_reflection(p);
++ NSDictionary *json=reflectionJSON(source,"render pipeline",false);
++ if(!json){nmb_reflection_release(source);return nil;}
+  NBRenderPipelineReflection *reflection=[NBRenderPipelineReflection new];
+- reflection.vertexList=reflectionArguments(json[@"vertex"]);reflection.fragmentList=reflectionArguments(json[@"fragment"]);
++ reflection.vertexList=reflectionArguments(json[@"vertex"],source,1);reflection.fragmentList=reflectionArguments(json[@"fragment"],source,2);
++ nmb_reflection_release(source);
+  return reflection;
+ }
+ static id computeReflection(const NmbComputePipelineDescriptor *p) {
+- NSDictionary *json=reflectionJSON(nmb_compute_pipeline_reflection(p),"compute pipeline");
+- if(!json)return nil;
+- NBComputePipelineReflection *reflection=[NBComputePipelineReflection new];reflection.argumentList=reflectionArguments(json[@"bindings"]);
++ NmbReflection *source=nmb_compute_pipeline_reflection(p);
++ NSDictionary *json=reflectionJSON(source,"compute pipeline",false);
++ if(!json){nmb_reflection_release(source);return nil;}
++ NBComputePipelineReflection *reflection=[NBComputePipelineReflection new];reflection.argumentList=reflectionArguments(json[@"bindings"],source,0);
++ nmb_reflection_release(source);
+  return reflection;
+ }
+ 
+@@ -5223,6 +5232,12 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
+   raw.push_back({(uint32_t)a.dataType,(uint32_t)a.index,(uint32_t)a.arrayLength,(uint32_t)a.access,(uint32_t)a.textureType,(uint32_t)a.constantBlockAlignment});
+  return argumentEncoder(nmb_argument_encoder_new(gDevice,raw.data(),raw.size()),"newArgumentEncoderWithArguments");
+ }
++- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferBinding:(id<MTLBufferBinding>)binding {
++ if(![(id)binding isKindOfClass:[NBBufferArgument class]]) {
++  NBLOG(@"native-metal: newArgumentEncoderWithBufferBinding: a foreign binding");return nil;
++ }
++ return argumentEncoder(nmb_buffer_binding_argument_encoder(gDevice,[(NBBufferArgument *)binding binding]),"newArgumentEncoderWithBufferBinding");
++}
+ - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)d {
+  NmbSamplerDescriptor s={(uint64_t)d.minFilter,(uint64_t)d.magFilter,(uint64_t)d.mipFilter,(uint64_t)d.sAddressMode,(uint64_t)d.tAddressMode,(uint64_t)d.rAddressMode,
+      (uint64_t)d.borderColor,(uint64_t)d.normalizedCoordinates,d.maxAnisotropy,(uint64_t)d.compareFunction,(uint64_t)d.lodAverage,d.lodMinClamp,d.lodMaxClamp};
+diff --git a/bridge/NativeMetalObjects.h b/bridge/NativeMetalObjects.h
+index 76f2293..1ea6ae7 100644
+--- a/bridge/NativeMetalObjects.h
++++ b/bridge/NativeMetalObjects.h
+@@ -91,6 +91,9 @@ size_t nmb_device_family_blockers(const NmbDevice *, int64_t family, char *out,
+ 
+ /* Argument encoders (MTLArgumentEncoder): each argument is 8 bytes, written through the argument buffer's mapping at once. */
+ typedef struct NmbArgumentEncoder NmbArgumentEncoder;
++typedef struct NmbBufferBinding NmbBufferBinding;
++NmbArgumentEncoder *nmb_buffer_binding_argument_encoder(const NmbDevice *, const NmbBufferBinding *);
++void nmb_buffer_binding_release(NmbBufferBinding *);
+ typedef struct {
+     uint32_t data_type, index, array_length, access, texture_type, constant_block_alignment;   /* raw Metal values */
+ } NmbArgumentDescriptor;
+@@ -260,6 +263,7 @@ NmbReflection *nmb_function_constants(const NmbFunction *);
+ NmbReflection *nmb_render_pipeline_reflection(const struct NmbRenderPipelineDescriptor *);
+ NmbReflection *nmb_compute_pipeline_reflection(const struct NmbComputePipelineDescriptor *);
+ const char *nmb_reflection_json(const NmbReflection *);
++NmbBufferBinding *nmb_reflection_buffer_binding(const NmbReflection *, uint32_t stage, uint32_t index);
+ void nmb_reflection_release(NmbReflection *);
+ 
+ struct NmbSamplerDescriptor {
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index 67ce842..edf3dce 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -2117,7 +2117,13 @@ pub extern "C" fn nmb_render_pipeline_release(pipeline: *mut NmbRenderPipeline)
+ /// A pipeline's reflection, as the `reflection:` out-parameter of a pipeline's creation answers it, in JSON for the frontend's
+ /// MTLArgument/MTLBinding objects: Metal's raw enumeration values, and a buffer's struct, array, pointer and texture reference types
+ /// nested as Metal nests them. GFXBench's NGL engine (Aztec Ruins) finds every uniform's buffer offset and every texture's index in it.
+-pub struct NmbReflection(std::ffi::CString);
++pub struct NmbReflection {
++    json: std::ffi::CString,
++    buffers: Vec<(u32, u32, metal2vulkan::reflection::BufferBinding)>,
++}
++
++/// A reflected buffer type retained independently of its pipeline reflection.
++pub struct NmbBufferBinding(metal2vulkan::reflection::BufferBinding);
+ 
+ mod reflection_json {
+     use metal2vulkan::reflection::{ArrayType, Binding, PointerType, StructType, TextureReferenceType};
+@@ -2250,8 +2256,14 @@ mod reflection_json {
+     }
+ }
+ 
+-fn reflection_handle(json: String) -> Result<*mut NmbReflection, String> {
+-    Ok(boxed(NmbReflection(std::ffi::CString::new(json).map_err(|_| "a NUL in the reflection".to_string())?)))
++fn reflection_handle(json: String, stages: &[(u32, &[metal2vulkan::reflection::Binding])]) -> Result<*mut NmbReflection, String> {
++    let buffers = stages.iter().flat_map(|(stage, bindings)| {
++        bindings.iter().filter_map(move |b| b.buffer().map(|buffer| (*stage, b.index(), buffer.clone())))
++    }).collect();
++    Ok(boxed(NmbReflection {
++        json: std::ffi::CString::new(json).map_err(|_| "a NUL in the reflection".to_string())?,
++        buffers,
++    }))
+ }
+ 
+ /// The generic function's constants; specialized functions answer an empty dictionary as Metal does.
+@@ -2269,7 +2281,7 @@ pub extern "C" fn nmb_function_constants(function: *const NmbFunction) -> *mut N
+                 constant.data_type().as_raw(), constant.index(), constant.is_required());
+         }
+         json.push_str("]}");
+-        reflection_handle(json)
++        reflection_handle(json, &[])
+     })
+ }
+ 
+@@ -2284,7 +2296,7 @@ pub extern "C" fn nmb_render_pipeline_reflection(descriptor: *const NmbRenderPip
+         json.push(',');
+         reflection_json::stage(&mut json, "fragment", reflection.fragment_bindings());
+         json.push('}');
+-        reflection_handle(json)
++        reflection_handle(json, &[(1, reflection.vertex_bindings()), (2, reflection.fragment_bindings())])
+     })
+ }
+ 
+@@ -2297,14 +2309,29 @@ pub extern "C" fn nmb_compute_pipeline_reflection(descriptor: *const NmbComputeP
+         let mut json = String::from("{");
+         reflection_json::stage(&mut json, "bindings", reflection.bindings());
+         json.push('}');
+-        reflection_handle(json)
++        reflection_handle(json, &[(0, reflection.bindings())])
+     })
+ }
+ 
+ /// The reflection's JSON, valid until its release.
+ #[unsafe(no_mangle)]
+ pub extern "C" fn nmb_reflection_json(reflection: *const NmbReflection) -> *const c_char {
+-    guard(std::ptr::null(), || Ok(get(reflection)?.0.as_ptr()))
++    guard(std::ptr::null(), || Ok(get(reflection)?.json.as_ptr()))
++}
++
++/// Copy a buffer binding for a frontend object that may outlive the reflection.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_reflection_buffer_binding(reflection: *const NmbReflection, stage: u32, index: u32) -> *mut NmbBufferBinding {
++    guard(std::ptr::null_mut(), || {
++        let (_, _, binding) = get(reflection)?.buffers.iter().find(|(s, i, _)| *s == stage && *i == index)
++            .ok_or_else(|| "reflection has no buffer binding at this stage and index".to_string())?;
++        Ok(boxed(NmbBufferBinding(binding.clone())))
++    })
++}
++
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_buffer_binding_release(binding: *mut NmbBufferBinding) {
++    release(binding)
+ }
+ 
+ #[unsafe(no_mangle)]
+@@ -2755,6 +2782,16 @@ pub extern "C" fn nmb_encoder_wait_fence(encoder: *mut NmbEncoder, fence: *mut N
+ /// object's resource ID) through the argument buffer's mapping at once.
+ pub struct NmbArgumentEncoder(ArgumentEncoder);
+ 
++/// `newArgumentEncoderWithBufferBinding:` uses the reflected layout, not descriptor repacking.
++#[unsafe(no_mangle)]
++pub extern "C" fn nmb_buffer_binding_argument_encoder(device: *const NmbDevice, binding: *const NmbBufferBinding) -> *mut NmbArgumentEncoder {
++    guard(std::ptr::null_mut(), || {
++        let encoder = get(device)?.0.new_argument_encoder_with_buffer_binding(&get(binding)?.0)
++            .map_err(e("buffer binding argument encoder"))?;
++        Ok(boxed(NmbArgumentEncoder(encoder)))
++    })
++}
++
+ /// One `MTLArgumentDescriptor`, its raw Metal values.
+ #[repr(C)]
+ pub struct NmbArgumentDescriptor {

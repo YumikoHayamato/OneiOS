@@ -1,0 +1,48 @@
+OneiOS take18, userland/metal/patches/NativeMetal/0011: Swift's asynchronous completion waits resume.
+Upstream: Droid-VM/NativeMetal 689d937 (wip/hackintosh, lateautumn233, 2026-11-13). Its completion hunk is placed after
+b0d6a07's own completed-handler loop (upstream's sits in UniXNU's traced form of that loop); otherwise verbatim (README
+hunk left out).
+What: NBCommandBuffer implements __waitUntilCompletedAsync: (what Swift's `await commandBuffer.completed()` calls): the
+waiter is kept and run after the ordinary completed handlers, or at once when the command buffer already completed.
+Why: correctness (a hang). b0d6a07 answered the selector through its missing-selector fallback, so such a wait never
+resumed: the Swift task waiting on the GPU stayed suspended for good.
+Switch: none (hang fix). Removable: yes (ONEIOS_METAL_SKIP=async-completion-waiters).
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 1993206..476f249 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -2182,4 +2182,6 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
+ @property(nonatomic) uint64_t committedUs;
+ @property(nonatomic) uint32_t commitIndex;
+ @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
++@property(nonatomic,strong) NSMutableArray *completionWaiters;
++@property(nonatomic) BOOL completionDelivered;   // protected with completionWaiters by @synchronized(self)
+ @property(nonatomic,strong) NSMutableSet *surfaces;
+@@ -3716,6 +3718,16 @@ static void noteSampleBuffers(id attachments,const char *what) {
+ }
+ - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
+ - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
++// Swift's async wait resumes after actual completion and the ordinary completed handlers, including registration after completion.
++- (void)__waitUntilCompletedAsync:(MTLCommandBufferHandler)block {
++ @synchronized(self){
++  if(!_completionDelivered){
++   if(!_completionWaiters)_completionWaiters=[NSMutableArray array];
++   [_completionWaiters addObject:[block copy]];return;
++  }
++ }
++ block((id<MTLCommandBuffer>)self);
++}
+ // A drawable (RenderBox's CAMetalLayer path) is presented once the GPU has written it: this runtime's scheduling comes before completion.
+ - (void)presentDrawable:(id<MTLDrawable>)drawable {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable present];}];}
+ - (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];}
+@@ -3796,6 +3808,9 @@ static void noteSampleBuffers(id attachments,const char *what) {
+  const bool lost=!self.failedLocally && nmb_command_buffer_metal_error_code(_handle)==11;
+  void (^run)(void)=^{
+   for(MTLCommandBufferHandler block in completedHandlers)block((id<MTLCommandBuffer>)self);
++  NSArray *waiters;
++  @synchronized(self){self->_completionDelivered=YES;waiters=self->_completionWaiters;self->_completionWaiters=nil;}
++  for(MTLCommandBufferHandler block in waiters)block((id<MTLCommandBuffer>)self);
+   dispatch_group_leave(self->_handlers);
+   if(lost)endRenderServerAfterGpuLoss();
+  };

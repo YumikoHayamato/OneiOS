@@ -1,0 +1,50 @@
+OneiOS take18, userland/metal/patches/NativeMetal/0007: a render pipeline refused for an unset function constant is made
+again with the rest of its constants zero.
+Upstream: Droid-VM/NativeMetal c6fb605 (wip/hackintosh, lateautumn233, 2026-11-13), verbatim.
+What: newRenderPipelineStateWithDescriptor: rebuilds the vertex and fragment functions with their unset constants zero
+(nb_newFunctionWithName:constantValues:zeroRest:) and asks once more when the runtime refused the pipeline for an unset
+function constant, as the compute path already does (computeRefused).
+Why: correctness. A client that left a constant unset got no pipeline at all and drew nothing with it.
+Switch: none (correctness fix). Removable: yes (ONEIOS_METAL_SKIP=render-pipeline-zero-rest-retry).
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 6f51ca5..dbcae47 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -4520,8 +4520,7 @@ static bool linkedHandles(NSArray<id<MTLFunction>> *functions,std::vector<NmbFun
+ // A refused pipeline's function again with every constant it declares and was not given set to zero (nil: not the reason, or no
+ // library). Counted in gZeroRest.
+ static unsigned gZeroRest;
+-static NBFunction *zeroRestFunction(NBFunction *f) {
+- NSString *why=lastError();
++static NBFunction *zeroRestFunction(NBFunction *f,NSString *why=lastError()) {
+  if(!f.library || ![why containsString:@"FunctionConstant"])return nil;
+  NBFunction *rebuilt=(NBFunction *)[f.library nb_newFunctionWithName:f.name constantValues:f.constantValues zeroRest:YES error:nil];
+  if(rebuilt)gZeroRest++;
+@@ -5052,6 +5051,25 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
+  uint64_t cacheBefore[10]={};if(!gJournalPath.empty())nmb_device_work_stats(gDevice,cacheBefore);
+  uint32_t programVs=0,programFs=0;nbLastProgram(&programVs,&programFs);   // clear what an earlier creation on this thread left
+- NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);gTimePipeline.add(pipelineBegan);
++ NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);
++ __attribute__((objc_precise_lifetime)) MTLRenderPipelineDescriptor *retry=nil;
++ if(!handle && [lastError() containsString:@"FunctionConstant"]) {
++  // As for compute pipelines, preserve explicit constants and supply zero for the remaining reads.
++  // Keep the original error for both stages: rebuilding the vertex function changes lastError().
++  NSString *why=lastError();
++  NBFunction *vertex=zeroRestFunction((NBFunction *)d.vertexFunction,why);
++  NBFunction *fragment=zeroRestFunction((NBFunction *)d.fragmentFunction,why);
++  if(vertex || fragment) {
++   retry=[d copy];
++   if(vertex)retry.vertexFunction=(id<MTLFunction>)vertex;
++   if(fragment)retry.fragmentFunction=(id<MTLFunction>)fragment;
++   auto *rebuilt=new NBRenderDescriptor();
++   if(renderDescriptor(retry,rebuilt,error)) {
++    delete p;p=rebuilt;
++    handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);
++   } else delete rebuilt;
++  }
++ }
++ gTimePipeline.add(pipelineBegan);
+  nbLastProgram(&programVs,&programFs);
+  if(handle && reflection && wantsReflection(options))*reflection=(MTLRenderPipelineReflection *)renderReflection(p);
+  delete p;
