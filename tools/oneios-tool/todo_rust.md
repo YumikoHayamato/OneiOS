@@ -567,7 +567,9 @@ Python that is left, and why:
 - `scripts/ios/{ios-sign,macho-check,make-tbds}.py`: group 3's rest, **not ported yet**
   (`ios-sign.py` writes Apple's ad-hoc signature byte for byte and `macho-check.py` reads `.tbd` stubs with PyYAML:
   each needs its own comparison on a Mac and on Linux).
-- Group 4 (above).
+- Group 4 (above), and since 2026-11-27 `userland/jetsam_derive.py` with `userland/tests/test_jetsam_derive.py`: new
+  Python, written as Python on the task's own words (a plist generator for `--jetsam-product V54O`, docs/native.md),
+  against the rule above. Its port is an `oneios-tool image` command with the same rules; the tests' cases are its goldens.
 - `kernel/patches/oneios-hosted/display/display-capture.py`: a viewer for a PC boot, Linux only (section 8).
 - `tests/phone/sparsewrite.py`: the frozen original `phone sparse-write` is compared against.
 - Older rounds' test helpers: `tests/image/parity.py`, `tests/ioslog/{filters,mkapfs}.py`, `tests/sym/make-log.py`,

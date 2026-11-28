@@ -22,6 +22,7 @@ pub mod sparse;
 pub mod udmabuf;
 pub mod haltpoll;
 pub mod vmboot;
+pub mod vmperf;
 pub mod vmprobe;
 
 use adb::Adb;
@@ -153,6 +154,14 @@ pub enum Command {
         /// What to show of its options
         #[arg(long, value_name = "REGEX", default_value = "pseudo-unprotected|--gpu |--pre-alloc|virtio-mmio")]
         grep: String,
+        /// The host renderer crosvm loads: `prebuilt` (the package's own), or a libvirglrenderer.so to push in its place
+        /// (scripts/droidvm/build-virgl.sh). crosvm links it, so a renderer the phone cannot load fails here
+        #[arg(long, value_name = "FILE|prebuilt", default_value = "prebuilt")]
+        virgl: String,
+        /// crosvm itself: `prebuilt` (the package's own), or a crosvm to push in its place (take18b: Droid-VM/crosvm
+        /// wip/hackintosh built from source, artifacts/crosvm); its own links are checked by the same `run --help`
+        #[arg(long, value_name = "FILE|prebuilt", default_value = "prebuilt")]
+        crosvm: String,
     },
     /// The native kernel (an Image of runtime/loader's xnuloader-crosvm) booted in a protected VM of AVF's crosvm under
     /// Gunyah, its console followed live; the VM's RAM and vCPUs from the Image's label. --stop ends a running one.
@@ -186,29 +195,95 @@ pub enum Command {
         /// hackintosh line's by default, whose crosvm takes the kernel's scanout (`fetch-crosvm.sh DIR hackintosh`)
         #[arg(long, value_name = "DIR", default_value = "/mnt/tkg-build/oneios/dl/droidvm-prebuilt/f7c6ce8")]
         droidvm: String,
-        /// The GPU's lowest clock while an Image with the GPU runs (MHz; the level at or above it), put back at the end;
-        /// 0 leaves the clocks to the governor
+        /// The GPU's lowest clock while an Image with the GPU runs (MHz; the level at or above it), put back at the end.
+        /// Default 0: the governor scales freely (saves power; the stutter was the panel, not the clock). Try `607` to A/B.
         #[arg(long, value_name = "MHZ", default_value_t = vmboot::GPU_FLOOR_MHZ)]
         gpu_floor: u32,
-        /// The CPUs' lowest clocks while the VM runs, percent of each cluster's top clock (Android's cap stays), put back at the
-        /// end; 0 leaves the clocks to the governor
+        /// The CPUs' lowest clocks while the VM runs, percent of each cluster's top clock (Android's cap stays), put back at
+        /// the end. It comes 30 s after crosvm starts: until then the clocks to put back are read (the lowest seen).
+        /// Default 0: the governor scales freely (saves power). Try `60` to A/B.
         #[arg(long, value_name = "PERCENT", default_value_t = vmboot::CPU_FLOOR_PERCENT)]
         cpu_floor: u32,
+        /// How long the GPU stays awake after its last work while the VM runs (KGSL's idle_timer, ms; Android's is 80), put back
+        /// at the end. Default 0: left alone. Apart from the clocks: try `400` alone, or with --touch-boost, to A/B
+        #[arg(long, value_name = "MS", default_value_t = 0)]
+        gpu_idle_timer: u32,
+        /// While fingers move (and 1.5 s after), the GPU's lowest clock is 607 MHz and the CPU clusters' 40% of their top; put
+        /// back by the touch forwarder, or by the script when that was killed. Not with --gpu-floor or --cpu-floor
+        #[arg(long)]
+        touch_boost: bool,
         /// One UI's framework stopped while the VM runs (as hugepool grow stops it: Samsung's watchdog fed, the way back armed
         /// first) and started again when the VM ends, however it ends; the CPUs' caps lifted meanwhile
         #[arg(long)]
         takeover: bool,
+        /// With --takeover: Samsung's GPU max cap (/sys/kernel/gpu/gpu_max_clock, KGSL's max_gpuclk: One UI's SSRM sets 500 to
+        /// 832 MHz when warm, and with One UI down nothing moves it) lifted to the GPU's top while the VM runs and written back at
+        /// the end, as the cpufreq_limit is. The default with --takeover since take18 (take17's whole session ran at a cap of 607
+        /// MHz, the lock screen's frames GPU-bound at it); this flag is kept for old command lines
+        #[arg(long)]
+        gpu_cap_lift: bool,
+        /// With --takeover: leave Samsung's GPU max cap as One UI left it (the way before take18; an A/B of the cap)
+        #[arg(long)]
+        keep_gpu_cap: bool,
+        /// With --takeover: leave the media volume as it is (default: set to its maximum before One UI stops)
+        #[arg(long)]
+        no_max_volume: bool,
         /// With --pin: vCPU i on core N+i, the cores below N left to the host (crosvm's device threads, surfaceflinger)
         #[arg(long, value_name = "N", default_value_t = 0)]
         pin_first: u32,
         /// thermal.txt: once a second the CPU clusters', the GPU's, the board's and the battery's temperatures, the clocks and
-        /// the GPU's load, while the VM runs (read only)
+        /// the GPU's load, USB's and the battery's current and voltage, the CPUs online and the cooling devices' states, while
+        /// the VM runs (read only)
         #[arg(long)]
         thermal_log: bool,
+        /// Each touch frame goes to the VM with the time the touchscreen's driver stamped it with (displayctl touch
+        /// --scan-time): iOS then gets every touch at the time the finger was there, not 0 to 4 ms later (the guest polls).
+        /// touch.txt says how many frames went with it; the guest's `oneios-hid: touch latency:` line whether it took them
+        #[arg(long)]
+        touch_time: bool,
+        /// The VM's refresh tick on the panel's own vsync (runtime/pace's pacectl asks surfaceflinger and writes its grid into
+        /// the VM's frame sequence page; the kernel's tick follows it: display/vsync_lock.h). For a shared-RAM Image with the
+        /// screen. Without the kernel's part nothing changes; pace.txt says what the kernel did
+        #[arg(long)]
+        vsync_lock: bool,
+        /// With --vsync-lock: the kernel's tick this many microseconds after surfaceflinger's deadline for a frame (negative:
+        /// before). While the VM runs, the number in the VM folder's vsync.phase replaces it
+        #[arg(long, value_name = "US", default_value_t = 0, allow_hyphen_values = true)]
+        vsync_phase_us: i32,
+        /// pacectl for the phone (runtime/pace: make), pushed with --vsync-lock
+        #[arg(long, value_name = "FILE", default_value = "runtime/pace/build/android/pacectl")]
+        pacectl: String,
+        /// perf.txt: what the host knows of a frame's road (read only): the GPU's limits and its time at each clock, every
+        /// thread of crosvm (its CPUs, class, CPU time and wait for a CPU) 25 s in, each minute and at the stop,
+        /// surfaceflinger's vsync model and its TimeStats of the VM's layer, and logcat's lines of crosvm's display client and
+        /// drm2kgsl (dropped flips, KGSL_DIAG)
+        #[arg(long)]
+        perf_log: bool,
+        /// crosvm's device workers (touch, disks, network, sound: every thread but the vCPUs') on the process's CPUs. With
+        /// --pin this prebuilt holds each to the core of the vCPU that started its device (fixed in Droid-VM's crosvm after
+        /// it); each one moved is a line of perf.txt with the CPUs it had
+        #[arg(long)]
+        unpin_workers: bool,
         /// With an Image that has the sound card (xnuloader-crosvm --audio): crosvm's AAudio backend in its own process under
         /// this uid (crosvm's uid=; Droid-VM's crosvm: a stream of uid 0 is silenced while One UI runs). Default: in crosvm's
         #[arg(long, value_name = "UID")]
         audio_uid: Option<u32>,
+        /// With an Image that has the sound card and the microphone on (boot argument oneios-audio-mic=1): crosvm's card
+        /// with `capture=true` in place of `capture=false`. Droid-VM's crosvm says "capture=(false,true) - Disable/enable audio
+        /// capture. Default is false"; with `capture=false` its AAudio backend still opened the phone's input at the guest's
+        /// PREPARE (take16: crosvm.log), so what the key changes there is not known: for a session whose microphone gives
+        /// silence (`ONEIOS AUDIO: mic self-test ... largest sample 0`). Not run on the phone
+        #[arg(long)]
+        mic_capture: bool,
+        /// With an Image made with xnuloader-crosvm --media: crosvm's virtio-media decoder (`--virtio-media
+        /// kind=decoder,uid=UID`, the phone's MediaCodec in a helper process), so that iOS's VideoToolbox decodes H.264 and
+        /// HEVC on the phone's hardware (the kernel's codec archive). Without it such an Image still gets the decoder's pool
+        /// (its layout has it) and no device: iOS decodes in software, as before. Not run on the phone
+        #[arg(long)]
+        video_decoder: bool,
+        /// The uid of crosvm's decoder helper (crosvm's uid=, which its virtio-media needs)
+        #[arg(long, value_name = "UID", default_value_t = vmboot::VIDEO_DECODER_UID)]
+        video_decoder_uid: u32,
         /// The Wi-Fi's bridge for the phone, for an Image made with --wifi, used in a takeover (runtime/bridges: make)
         #[arg(long, value_name = "FILE", default_value = "runtime/bridges/build/android/wifictl")]
         wifictl: String,
@@ -219,6 +294,50 @@ pub enum Command {
         /// With such an Image: the battery alone, no haptics (`bridgectl serve --no-haptics`: iOS then has no actuator, as before)
         #[arg(long)]
         no_haptics: bool,
+        /// The host renderer crosvm loads (its GPU's drm2kgsl, RUNPATH $ORIGIN): take18's build of Droid-VM/virglrenderer
+        /// 2529a9f (scripts/droidvm/build-virgl.sh: 32 GPU address slices of 4-6 GiB instead of 64 of 2, the Adreno 830's
+        /// 82-IB submit limit, the fault count, freed BOs unbound, KGSL timestamps, the power floors), or `prebuilt`: the
+        /// package's own (virglrenderer cd71ea4 of 2026-09-01, take17's). Pushed in place of the package's file
+        #[arg(long, value_name = "FILE|prebuilt", default_value = droidvm::VIRGL_TAKE18)]
+        virgl: String,
+        /// crosvm itself (take18b): `prebuilt`, the package's own (DroidVM-Prebuilt-Root f7c6ce8, the default), or a crosvm
+        /// built from source to push in its place (Droid-VM/crosvm wip/hackintosh da647254c + samfor12 e7c1316:
+        /// /mnt/giochi/Linux/oneios/take18/upstream/artifacts/crosvm). Opt-in: never run on the phone
+        #[arg(long, value_name = "FILE|prebuilt", default_value = "prebuilt")]
+        crosvm: String,
+        /// With take18's renderer: its GPU power floors. `deadline` (take19's default): the compositor's deadline queue at
+        /// the GPU's top level and the vCPUs' uclamp.min 1024 while it animates, without the process-wide rate floor
+        /// (crosvm gets NCTX_PWR_CONSTRAINT=0; take18 had the GPU at 1200 MHz in 72 % of its samples, 31 % of the session
+        /// from that floor alone). `on`: all three, as take18's session. `off`: none (NCTX_PWR_CONSTRAINT=0
+        /// DRM2KGSL_PWR_CONSTRAINT=0 DRM2KGSL_VCPU_UCLAMP_MIN=0: the governors alone, as take17). The prebuilt renderer
+        /// has none of them
+        #[arg(long, value_name = "deadline|on|off", default_value = "deadline", value_parser = ["deadline", "on", "off"])]
+        gpu_host_floors: String,
+        /// NAME=VALUE in crosvm's environment, repeatable: the host renderer's A/B switches (NCTX_*, DRM2KGSL_*, e.g.
+        /// DRM2KGSL_PRIORITIES=2, DRM2KGSL_NONCOHERENT=2; all off unless given). NAME of A-Z 0-9 _, VALUE of A-Z a-z 0-9 _ . : / -
+        #[arg(long, value_name = "NAME=VALUE")]
+        crosvm_env: Vec<String>,
+        /// With --takeover: no zram compaction after One UI's stop (take18 compacts each zram device after the cache drop,
+        /// before the pool's top-up, and says what MemAvailable did: upstream OneiOS 2894806's takeover-reclaim)
+        #[arg(long)]
+        no_takeover_reclaim: bool,
+        /// With --takeover: vm.swappiness for the session (0-200), One UI's value written back at the end however it ends
+        /// (upstream's takeover-swappiness). Default: kept
+        #[arg(long, value_name = "N")]
+        takeover_swappiness: Option<u32>,
+        /// With --takeover: no KEYCODE_WAKEUP right before One UI's stop (take18 sends one, from YMGPwcca's bounded
+        /// lock-screen wake: One UI's keyguard darkens the panel seconds after the last wake, and with the framework
+        /// down nothing wakes it; the display helper then holds the panel on itself)
+        #[arg(long)]
+        no_takeover_wake: bool,
+        /// take19, with --takeover, --touch-boost and the GPU's scanout: the panel's rate free from HZ up to its top (the S25
+        /// Ultra's panel is LTPO, 1 to 120 Hz): surfaceflinger lowers it when the VM's screen is still and raises it for the
+        /// layer's 120 Hz vote when frames come; it is held at the top while a touch is recent (displayctl touch's boost.state:
+        /// the last touch under 1.5 s ago), since with One UI down nothing tells surfaceflinger of a touch. 0 (the default):
+        /// held at the top the whole session, as take13-take18. display.txt: `the panel's rate is free from N to 120 Hz` and,
+        /// at the end, how often and how long it was held
+        #[arg(long, value_name = "HZ", default_value_t = 0)]
+        panel_rate_min: u32,
     },
     /// One run of runtime/vmprobe's payload as a protected VM under Gunyah with AVF's crosvm: 1 vCPU, no device but
     /// the serial port; it powers off by itself, else crosvm stop after SECONDS. Refused during a session
@@ -350,6 +469,12 @@ pub enum HugepoolCommand {
         /// Where the preflight's files go (btf.vmlinux, kapi_check.txt, load.txt)
         #[arg(long, value_name = "DIR", default_value = "phone-hugepool")]
         out: String,
+        /// take18's alternative module instead of ours (scripts/hugepage/build.sh WORK samfor12, hugepool::KO_SAMFOR12):
+        /// samfor12/gh-hugepage-reserve-temp-root-support 361d499, our pin 00c8a03 plus six commits (pool pages held with
+        /// PG_reserved, cleared before every free and before a page is served; a dead VM's death grace 3 -> 13 s). The same
+        /// module name, parameters and preflight. Off unless named; `unload`, then `load` without it, goes back
+        #[arg(long, conflicts_with = "ko")]
+        samfor12: bool,
     },
     /// One UI's framework stopped (as the switch stops it), the file cache dropped, the pool's want raised to N and its
     /// acquire pressed, One UI started again (as the return starts it): a script on the phone, detached, with a
@@ -542,7 +667,9 @@ pub fn main(cli: Cli) -> i32 {
         Command::Hugeblocks { free } => Adb::connect(serial).and_then(|adb| vmprobe::hugeblocks(&adb, free)),
         Command::Hugepool { command } => Adb::connect(serial).and_then(|adb| match command {
             HugepoolCommand::Status => hugepool::status(&adb),
-            HugepoolCommand::Load { ko, kapi_check, want, out } => hugepool::load(&adb, &ko, &kapi_check, want, &out),
+            HugepoolCommand::Load { ko, kapi_check, want, out, samfor12 } => {
+                hugepool::load(&adb, if samfor12 { hugepool::KO_SAMFOR12 } else { &ko }, &kapi_check, want, &out)
+            }
             HugepoolCommand::Grow { want, mode, limit, out } => hugepool::grow(&adb, want, mode, limit, &out),
             HugepoolCommand::Acquire { want, mode, seconds } => hugepool::acquire(&adb, want, mode, seconds),
             HugepoolCommand::Unload => hugepool::unload(&adb),
@@ -552,7 +679,7 @@ pub fn main(cli: Cli) -> i32 {
             HostshareCommand::Load { ko, out } => hostshare::load(&adb, &ko, &out),
             HostshareCommand::Unload => hostshare::unload(&adb),
         }),
-        Command::DroidvmCrosvm { dir, grep } => Adb::connect(serial).and_then(|adb| droidvm::crosvm(&adb, &dir, &grep)),
+        Command::DroidvmCrosvm { dir, grep, virgl, crosvm } => Adb::connect(serial).and_then(|adb| droidvm::crosvm(&adb, &dir, &grep, &virgl, &crosvm)),
         Command::Udmabuf { command } => Adb::connect(serial).and_then(|adb| match command {
             UdmabufCommand::Status => udmabuf::status(&adb),
             UdmabufCommand::Load { ko, out } => udmabuf::load(&adb, &ko, &out),
@@ -563,8 +690,8 @@ pub fn main(cli: Cli) -> i32 {
             HaltpollCommand::Load { ko, out } => haltpoll::load(&adb, &ko, &out),
             HaltpollCommand::Unload => haltpoll::unload(&adb),
         }),
-        Command::VmBoot { image, seconds, thp, out, stop, bridge, swipe_test, pin, droidvm, gpu_floor, cpu_floor, takeover, pin_first, thermal_log, audio_uid, wifictl, bridgectl, no_haptics } => Adb::connect(serial).and_then(|adb| {
-            if stop { vmboot::stop(&adb) } else { vmboot::vm_boot(&adb, &image, &out, &vmboot::Options { seconds, thp, bridge, swipe_test, pin, droidvm, gpu_floor_mhz: gpu_floor, cpu_floor_percent: cpu_floor, takeover, pin_first, thermal_log, audio_uid, wifictl, bridgectl, haptics: !no_haptics }) }
+        Command::VmBoot { image, seconds, thp, out, stop, bridge, swipe_test, pin, droidvm, gpu_floor, cpu_floor, gpu_idle_timer, touch_boost, takeover, gpu_cap_lift, keep_gpu_cap, no_max_volume, pin_first, thermal_log, touch_time, vsync_lock, vsync_phase_us, pacectl, perf_log, unpin_workers, audio_uid, mic_capture, video_decoder, video_decoder_uid, wifictl, bridgectl, no_haptics, virgl, crosvm, gpu_host_floors, crosvm_env, no_takeover_reclaim, takeover_swappiness, no_takeover_wake, panel_rate_min } => Adb::connect(serial).and_then(|adb| {
+            if stop { vmboot::stop(&adb) } else { vmboot::vm_boot(&adb, &image, &out, &vmboot::Options { seconds, thp, bridge, swipe_test, pin, droidvm, gpu_floor_mhz: gpu_floor, cpu_floor_percent: cpu_floor, gpu_idle_ms: gpu_idle_timer, touch_boost, takeover, gpu_cap_lift: vmboot::gpu_cap_lift(takeover, gpu_cap_lift, keep_gpu_cap), max_volume: !no_max_volume, pin_first, thermal_log, touch_time, vsync: vsync_lock.then_some(vsync_phase_us), pacectl, perf: vmperf::Perf { log: perf_log, unpin: unpin_workers }, audio_uid, mic_capture, video_decoder: video_decoder.then_some(video_decoder_uid), wifictl, bridgectl, haptics: !no_haptics, virgl, crosvm, gpu_host_floors: vmboot::Floors::parse(&gpu_host_floors)?, crosvm_env, takeover_reclaim: !no_takeover_reclaim, takeover_swappiness, takeover_wake: !no_takeover_wake, panel_rate_min }) }
         }),
         Command::VmProbe { payload, mem, timeout, out, thp, droidvm, shared_ram, thp_shmem } => Adb::connect(serial).and_then(|adb| {
             let crosvm = match droidvm.as_deref() {
@@ -672,5 +799,39 @@ pub fn app_main(cli: AppCli) -> i32 {
             eprintln!("oneios-tool app: {e:#}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct T {
+        #[command(subcommand)]
+        c: Command,
+    }
+
+    #[test]
+    fn hugepool_load_takes_the_alternative_module_by_name_only() {
+        let t = T::try_parse_from(["t", "hugepool", "load", "--samfor12", "--want", "64"]).unwrap();
+        assert!(matches!(t.c, Command::Hugepool { command: HugepoolCommand::Load { samfor12: true, .. } }));
+        let t = T::try_parse_from(["t", "hugepool", "load"]).unwrap();
+        assert!(matches!(t.c, Command::Hugepool { command: HugepoolCommand::Load { samfor12: false, .. } }));
+        assert!(T::try_parse_from(["t", "hugepool", "load", "--samfor12", "--ko", "/x.ko"]).is_err());
+    }
+
+    #[test]
+    fn vm_boot_takes_the_new_renderer_by_default() {
+        let t = T::try_parse_from(["t", "vm-boot"]).unwrap();
+        let Command::VmBoot { virgl, gpu_host_floors, crosvm_env, .. } = t.c else { panic!() };
+        assert_eq!(virgl, droidvm::VIRGL_TAKE18);
+        assert_eq!(gpu_host_floors, "deadline");
+        assert!(crosvm_env.is_empty());
+        let t = T::try_parse_from(["t", "vm-boot", "--virgl", "prebuilt", "--gpu-host-floors", "off", "--crosvm-env", "A=1", "--crosvm-env", "B=2"]).unwrap();
+        let Command::VmBoot { virgl, gpu_host_floors, crosvm_env, .. } = t.c else { panic!() };
+        assert_eq!((virgl.as_str(), gpu_host_floors.as_str(), crosvm_env.len()), ("prebuilt", "off", 2));
+        assert!(T::try_parse_from(["t", "vm-boot", "--gpu-host-floors", "maybe"]).is_err());
     }
 }

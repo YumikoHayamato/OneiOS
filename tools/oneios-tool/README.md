@@ -1277,7 +1277,7 @@ oneios-tool phone vm-boot [--image F] [--seconds S] [--thp] [--out DIR] [--bridg
                                               #   the native kernel (xnuloader-crosvm's Image) in such a VM, its console
                                               #   live, its screen on a layer when the Image has one; vm-boot --stop ends it
 oneios-tool phone hostshare status|load|unload  # gunyah_host_share (/dev/gunyah_share), after a preflight of the kernel
-oneios-tool phone droidvm-crosvm [--dir DIR] [--grep RE]   # Droid-VM's crosvm package to the phone, then its options
+oneios-tool phone droidvm-crosvm [--dir DIR] [--grep RE] [--virgl FILE|prebuilt] [--crosvm FILE|prebuilt]   # Droid-VM's crosvm package to the phone, then its options
 oneios-tool phone dmesg [--grep RE] [--tail N]  # the kernel's log, filtered on the PC (read only)
 oneios-tool phone hugeblocks [--free]        # free memory in 2 MiB blocks; --free: drop the file cache and compact first
 oneios-tool phone hugepool status|load|grow|unload  # gh_hugepage_reserve: load [--want N]; grow --want N stops One UI and starts it again
@@ -1670,14 +1670,138 @@ DIR (`phone-vmboot`), prints the run's disk, store and pool lines and crosvm's l
 - The pool: a VM above 480 MiB is refused when more than 384 MiB of its RAM would lie outside gh_hugepage_reserve's free
   pages (`check_pool`: Gunyah's heap maps no more than about 470 MiB of 4 KiB pages; boot 4b's first start ended 48 s in
   with the pool at 198 pages). `phone hugepool acquire` refills the pool beside One UI.
+- The clocks: `--gpu-floor MHZ` and `--cpu-floor PERCENT` both default to 0 (off) — the governor scales the GPU and the
+  CPU clusters freely while the VM runs, the low-power default. They once pinned the GPU at 607 MHz and each cluster at
+  60% of its top for the whole session to hide a swipe's first-frame stutter, but that stutter was the panel held at
+  60 Hz (`native-frame-latency`), not the clocks: take12 (floors on) kept the perf cluster at ~3 GHz and never idled,
+  ~8 °C hotter than take10 (governor), whose perf cluster sat at 1.37 GHz and idled 84% of the time for the same GPU
+  work. Pass `--gpu-floor 607` / `--cpu-floor 60` to pin a floor for an A/B; a takeover still lifts Samsung's cap meanwhile.
+- take18: the GPU cap lift is the default with `--takeover` (`--keep-gpu-cap` leaves the cap as One UI left it; `--gpu-cap-lift`
+  is still accepted). take17's whole session ran at Samsung's cap of 607 MHz (`thermal.txt`: `cap 607000000 pwr 8 gmax 607`
+  in every sample; take16 832 MHz), with the lock screen's frames GPU-bound at it (`docs/native.md`, "What take17's lines
+  say"); with One UI down nothing moves that cap. The kernel's cooling devices are left alone as before.
+- take15 additions (host side; unit-tested with fake sysfs and fake `cmd`, not run on the phone): `--gpu-cap-lift` (with
+  `--takeover`, opt-in until take18) saves Samsung's GPU cap nodes (`/sys/kernel/gpu/gpu_max_clock` in MHz, KGSL's `max_gpuclk` in Hz),
+  writes each the top of its own table only when it is below it, and writes the saved values back in `caps_restore` (every
+  end, like the cpufreq_limit lift); `thermal_pwrlevel` and the cooling devices are never written. `--thermal-log` now has
+  `cap` (max_gpuclk), `pwr` (thermal_pwrlevel) and `gmax` (gpu_max_clock, `-` when absent) after the GPU's busy column. A
+  takeover sets the media stream's volume to its maximum before One UI stops (`cmd media_session volume --stream 3 --get`
+  for the range, `--set MAX`, the old `media volume` as the second try; the `audio:` line of run.txt says what it read and
+  what it reads after; not put back); `--no-max-volume` leaves it alone.
+- The CPUs' floor comes 30 s after crosvm starts: until then each policy's minimum is only read, and the lowest seen is put
+  back (through `boost.state` as well) when crosvm or boot.sh ends.
+- The GPU's sleep: `--gpu-idle-timer MS` (KGSL's `idle_timer`, put back at the end; default 0: left alone), apart from the
+  floor, which no longer sets it (`--gpu-floor` used to set 30000 ms too): the two are tried one at a time.
+- The touch boost: `--touch-boost` (an Image with the touch, a displayctl that has `--boost`, not with the floors; default
+  off). While fingers move and 1.5 s after, the GPU's lowest clock is 607 MHz and each CPU cluster's 40% of its top (the
+  table's clock at or above); none before 30 s of the session. The forwarder puts them back (`runtime/display/README.md`),
+  `boost_restore` ends it after crosvm and at the script's end (a signal alone leaves the touch to a running VM), and what a killed one left comes back from
+  `boost.state` then, or first thing at the next start in the same boot, refused or not (the file stays until every write
+  worked). The original is never a minimum read at the start.
+- take19, a variable panel rate: `--panel-rate-min HZ` (1-119; with `--takeover`, `--touch-boost` and the GPU's scanout;
+  default 0 = held at the top as before). The display helper asks for the native mode with the range [HZ, top] instead of
+  [top, top] and holds [top, top] while `boost.state` exists (a touch in the last 1.5 s), looked at every 10 ms
+  (`OneiOSDisplay --rate-min HZ --rate-hold-file $D/boost.state`). display.txt says when the range is freed, the first
+  three holds, and at the end how often and how long the top was held. Start with 24 or 30: an animation that starts
+  without a touch waits for the low rate's next vsync. `vmboot::tests::the_panel_rate_is_free_only_when_asked_and_its_facts_are_read_before_the_stop`.
+- take19, the panel's facts: every takeover writes, before One UI stops, `panel:` lines to run.txt from `dumpsys display`
+  (the rounded corners' radii and centres in panel pixels, the cutout, the modes): the S25 Ultra's corner radius for
+  `xnuloader-crosvm --display-corner-radius` (points = radius / 4 at 720x1560@2x on the 1440x3120 panel).
+- The thermal log: `--thermal-log` (thermal.txt; an older session's is removed at the start). After the old columns: `usb
+  ONLINE uA uV batt uA uV online CPUS cool N=STATE...` (`-`: no such file; `cool -`: nothing limits), the cooling devices'
+  types and highest states in `# cool` header lines.
+- The touch's time: `--touch-time` (an Image with the touch, a displayctl that has `--scan-time`): the forwarder sends each
+  frame with the time the touchscreen's driver stamped it with (`runtime/display/src/scantime.h`); the kernel that ran take14
+  already uses it as the report's time. touch.txt ends with how many frames went with it.
+- The panel's vsync: `--vsync-lock` (a shared-RAM Image with the screen; `--pacectl FILE`, default
+  `runtime/pace/build/android/pacectl`, pushed as `pacectl`), `--vsync-phase-us N` (-100000 to 100000; the VM folder's
+  `vsync.phase` replaces it while the VM runs). boot.sh starts `pacectl vsync --pid $pid --page-offset N` once crosvm's tree
+  was accepted (N: the pool's place in the memfd plus the Image's `fb ... SEQ`) and ends it after the VM, outside every
+  restore; pace.txt is read back and its last line goes to run.txt as `vsync:`. pacectl writes only once the guest has claimed the page (`OFSQ`, waiting as long as crosvm lives). A kernel without
+  `vsync_lock.h`'s half, or an Image without `oneios-vsync-lock=1` (the kernel's default is 0), ignores the records
+  (`runtime/pace/README.md`).
+- The microphone's capture: `--mic-capture` (take17): crosvm's sound card line is `--virtio-snd
+  backend=aaudio,capture=true` in place of `capture=false` (crosvm f7c6ce8's help: "capture=(false,true) -
+  Disable/enable audio capture. Default is false"). Off by default, so a session without it is as before. For a boot
+  whose `ONEIOS AUDIO: mic self-test` lines say digital silence (`largest sample 0`: `docs/hardware.md` section 6,
+  "The native VM's microphone"); in take16 crosvm opened the phone's input with `capture=false`, so what the switch
+  changes on the phone is not known.
+- The host renderer (take18): `--virgl FILE|prebuilt` (default `/mnt/tkg-build/oneios/dl/droidvm-prebuilt/virgl-2529a9f/
+  libvirglrenderer.so`, made by `scripts/droidvm/build-virgl.sh`: Droid-VM/virglrenderer 2529a9f, wip/hackintosh, built
+  with the NDK). It goes to `/data/local/tmp/oneios-droidvm/libvirglrenderer.so` in place of the package's (crosvm loads it
+  from beside itself, RUNPATH `$ORIGIN`); `--virgl prebuilt` pushes the package's own again (virglrenderer cd71ea4 of
+  2026-09-01, take17's). Only what differs is pushed, so switching back and forth costs one push of 3-4 MB. Its public API
+  (`virglrenderer.h`) is cd71ea4's, and the build checks that it exports every `virgl_*` function the prebuilt crosvm
+  imports. `--gpu-host-floors deadline|on|off` picks the new renderer's power floors (the process-wide rate floor above
+  130 submissions a second, the deadline queues' constraint and the vCPUs' uclamp.min while a compositor animates).
+  `deadline` (take19's default) gives crosvm `NCTX_PWR_CONSTRAINT=0`: the compositor's deadline constraint and the clamp
+  stay, the process-wide floor goes (take18's thermal.txt: the GPU at 1200 MHz in 72 % of 1295 samples, 407 of them under
+  20 % busy; that floor alone held it for 511 s of 1638, on every app's contexts). `on` is take18's session (all three);
+  `off` gives `NCTX_PWR_CONSTRAINT=0 DRM2KGSL_PWR_CONSTRAINT=0 DRM2KGSL_VCPU_UCLAMP_MIN=0`, the governors alone as in
+  take17. `--crosvm-env NAME=VALUE` (repeatable) puts the renderer's other A/B switches in crosvm's environment
+  (`DRM2KGSL_PRIORITIES=2`, `DRM2KGSL_NONCOHERENT=2`, `NCTX_*`: all off unless given); names of `A-Z 0-9 _`, values of
+  `A-Z a-z 0-9 _ . : / -` (the words go into boot.sh unquoted), `LD_*`, `PATH` and the display's Vulkan library refused.
+  `vmboot::tests::the_host_renderers_switches_go_before_crosvm`, `droidvm::tests::the_renderer_comes_from_virgl_when_named`.
+  Not run on the phone: `phone droidvm-crosvm --virgl FILE` is the first check there (crosvm links the renderer, so one
+  the phone cannot load fails at `crosvm run --help`, before any VM).
+- crosvm from source (take18b, opt-in): `--crosvm FILE|prebuilt` (default `prebuilt`, the package's own f7c6ce8) on
+  `vm-boot` and `phone droidvm-crosvm` pushes FILE as `/data/local/tmp/oneios-droidvm/crosvm` in place of the package's
+  (take18b's build: `/mnt/giochi/Linux/oneios/take18/upstream/artifacts/crosvm/crosvm`, Droid-VM/crosvm wip/hackintosh
+  da647254c + samfor12 e7c1316; docs/native.md "take18b: crosvm from source"). The package's libraries stay beside it, and
+  only what differs is pushed, so `--crosvm prebuilt` puts the package's back with one push. A named file must be an arm64
+  ELF (64-bit, EM_AARCH64), else nothing is pushed; the run prints its SHA-256 (`droidvm: crosvm from FILE (sha256 ...)`).
+  Independent of `--virgl`. `droidvm::tests::crosvm_comes_from_the_named_build_only_when_named`. Not run on the phone.
+- The takeover's memory (take18, from upstream OneiOS 2894806 "takeover-ram"): after One UI's stop and the cache drop
+  (`sync`, `drop_caches` 3, as before), each zram device is compacted (`/sys/block/zram*/compact`) before the pool's
+  top-up, and run.txt says `takeover: caches dropped, zram compacted on N device(s); MemAvailable A -> B MiB; zram
+  orig/compressed/RAM MiB: zram0 O/C/R`. `--no-takeover-reclaim` leaves the compaction out (take17's steps).
+  `--takeover-swappiness N` (0-200, with `--takeover`; default: kept) sets `vm.swappiness` for the session, One UI's value
+  saved first and written back by `caps_restore`, which both the trap and the end run (`takeover: vm.swappiness A -> N`,
+  `vm.swappiness back: A`). `vmboot::tests::the_takeovers_memory_steps_compact_zram_and_put_swappiness_back` (also
+  `sh -n` of the whole boot script). Not run on the phone.
+- The sound card's line (take18): an Image of `xnuloader-crosvm --audio-intid N,SLOT` has `audio-intid N SLOT` in its
+  .disks; boot.sh then checks crosvm's interrupt-map routes 00:SLOT.0 to SPI N-32 level-high (`audio: the sound card's line
+  is intid N ...`) and stops the VM otherwise, as for `gpu-intid` (`vmboot::tests::the_sound_cards_line_is_checked_against_crosvms_map`,
+  which runs the check with sh on take17's map bytes). The kernel uses the line only with `oneios-audio-irq=1`.
+- The panel at a takeover's start (take18, from YMGPwcca's bounded lock-screen wake): one `KEYCODE_WAKEUP` right before
+  One UI's stop, while it is up (`--no-takeover-wake` leaves it out); the display helper then puts the panel on itself
+  (runtime/display/README.md, "take18: the panel on at a takeover's start").
+- The hardware video decoder: `--video-decoder [--video-decoder-uid UID]` (take18b; an Image of `xnuloader-crosvm
+  --shared-ram --media`, whose disks list has `media MIB POOL-PA`). crosvm then gets `--virtio-media
+  kind=decoder,uid=UID` (default 2000; crosvm runs the decoder in a helper process under that uid, which its codec
+  services see as the caller). The decoder's pool is crosvm's `--pre-alloc media-host-mb=MIB` (on the same `--pre-alloc`
+  as the GPU's `drm-host-mb`, one option) and is given for every such Image, with or without the flag, because the
+  Image's layout has it; boot.sh checks crosvm's tree for `media_host@POOL-PA` (`video:` lines in run.txt) and stops the
+  VM before the kernel's decoder starts when it is elsewhere. Without the flag the Image runs with the pool and no device
+  (iOS decodes in software, as before); the flag with an Image that has no pool is refused. Not run on the phone.
+- The performance log: `--perf-log` (perf.txt; `vmperf.rs`): the GPU's limits and its time at each clock at the start and
+  the end, every thread of crosvm (CPUs, class, CPU time, the scheduler's wait) 25 s in, each minute and as the stop is
+  asked, surfaceflinger's vsync model and TimeStats (enabled and cleared at the start, disabled again at the end: the one thing it
+  changes on Android), and logcat's lines of crosvm's display client and drm2kgsl (nothing is set for crosvm: the prebuilt has
+  `CROSVM_DRM2KGSL_DIAG` on). Its own process, waited for at the end (20 s at most) after everything is put back.
+- The device workers' CPUs: `--unpin-workers`: every thread of crosvm but the vCPUs' gets the main thread's CPUs
+  (`taskset -p`), every 5 s in the first minute and every 30 s after; each one moved is a `sched:` line of perf.txt with the
+  CPUs it had (this prebuilt holds them to the core of the vCPU that started their device). Nothing is put back: the threads
+  end with crosvm.
+- The end: `crosvm stop`'s words and, when the 20 s pass and it is killed, its threads (name, state, wchan) are in
+  `stop.txt`; the takeover's `ui.log` is copied too (not what One UI's start writes after the result). The
+  session before's are `ui.log.prev` and `stop.txt.prev` on the phone.
+- The GPU's interrupt: an Image made with `xnuloader-crosvm --gpu-intid N` lists `gpu-intid N` (an SPI, 32 to 1019;
+  refused without the `gpu` line). Once crosvm's tree is whole, after the `drm2kgsl_host@` check and before the bridge,
+  the script reads `fdt.dtb` as hex words (`od -An -tx1 -v`, `tr`, `sed`, `grep -o -E`) and wants exactly one
+  `interrupt-map` entry for the GPU's device (child address `device << 11`, any pin and GIC phandle) naming SPI N-32
+  level-high: run.txt then says `gpu: the GPU's interrupt is intid N (crosvm's SPI N-32): its waits sleep on it`.
+  Another line, an edge line, no entry or two: a `gpu:` line with what crosvm gave, and the VM is stopped
+  (`stop.request`, result `refused pool`): a wrong line could be another device's level interrupt. The run's `gpu:`
+  lines are printed with the others at the end (`docs/native.md` "Flattening the power gap").
 
-9 unit tests (`vmboot::tests`: the pool's share of the RAM (`check_pool`); the label with and without the pool; the disks list's refusals; stop before kill, the
+Unit tests (`vmboot::tests`: the pool's share of the RAM (`check_pool`); the label with and without the pool; the disks list's refusals; stop before kill, the
 stop request, THP written back; the disks' checks before crosvm and the pool check right after it; the `fb` line in the
 pool and its refusals; the bridge after the pool check and before the main wait, ended after the VM, absent without a
 screen; the touchscreen's lookup run by the PC's `sh` and `awk` on the S25's device list (`event8`) and its refusals
 (not direct, missing, on a side key's device), the forwarder listening before crosvm and crosvm's multi-touch device on
 its socket with glob expansion off, both ended after the VM, the test swipes only with `--swipe-test`, the volume-down reader after the bridge
-and ended after the VM; the scripts parse under `bash --posix -n`, `sh -n` and `dash -n`). Boot 1 on the S25 (2026-11-23, 2 GiB, 1 vCPU, 90 s, no disk): the
+and ended after the VM; the clock floors off by default and opted in with `--gpu-floor`/`--cpu-floor`; the GPU interrupt's line parsed and refused without the GPU or outside 32-1019, its check after the arena's and before the bridge, run by the PC's `sh` on crosvm-shaped trees (the match passes; another SPI, an edge line, no entry and two entries stop the VM), absent without the line; the touch boost and the idle timer opted in, in every EXIT trap, a killed forwarder's clocks back from its file, kept when a write is refused, the CPUs' floor's lowest seen put back however it ends, `ui.log.prev`, the thermal log's columns and the display's last word run by the PC's `sh`; the scripts parse under `bash --posix -n`, `sh -n` and `dash -n`). Boot 1 on the S25 (2026-11-23, 2 GiB, 1 vCPU, 90 s, no disk): the
 kernel's whole start up to the root device's wait, `crosvm stop` at 90 s, One UI on (`docs/native.md` "The native
 kernel in crosvm").
 
@@ -1708,6 +1832,13 @@ allocations, so that Gunyah lends a VM's RAM in 2 MiB pieces (`docs/native.md` "
   The .ko goes to `/data/local/tmp/oneios-hugepool/`, its SHA-256 checked there; then `sync` and `insmod ...
   pool_want=N [disable_kapi=...]` beside One UI (N 64 = 128 MiB by default; the CMA reservoir stays off: no
   `migrate_cma_val`). Then `status`.
+  `load --samfor12` (take18; not with `--ko`): the alternative module instead, `/mnt/tkg-build/oneios/hugepage/out/
+  android15-6.6-samfor12.ko` (`scripts/hugepage/build.sh WORK samfor12`: samfor12/gh-hugepage-reserve-temp-root-support
+  361d499 = our pin 00c8a03 + six commits of 2026-11-18: the pool's pages carry PG_reserved while the module holds them,
+  cleared before each free and before a page is served to the VM; a dead VM's death grace 3 -> 13 s). The same module
+  name, parameters, sysfs files and `kapi_check` (its `abi/` is unchanged), so every other command works as with ours.
+  Off unless named: `unload` and `load` without it go back. Built (sha256 d9e7ec5b...); not loaded on the phone.
+  `cli_tests::hugepool_load_takes_the_alternative_module_by_name_only`.
 - `grow --want N [--mode 3] [--limit 180] [--out DIR]`: refused during a session, when the module is not loaded, or
   while a VM holds pool pages or an acquire runs. Pushes `cycle.sh` (the `CYCLE` text) and starts it detached
   (`setsid`). The script refuses unless One UI's framework runs; records the zygotes' and zygote's restart list's
@@ -2417,11 +2548,13 @@ stale (`stage_tool` in `kernel/lib/stage.sh`; `ONEIOS_TOOL=PATH` for another bin
 | `kernel gen net` | `.../net/build-oneios-net.py` | `build_oneios_net.rs` | **retired 2026-11-13**: deleted, its output frozen in `tests/kernelgen/golden/` |
 | `kernel gen hid` | `.../hid/build-oneios-hid.py` | `build_oneios_hid.rs` | **retired 2026-11-13**: deleted, its output frozen in `tests/kernelgen/golden/` |
 | `kernel gen audio` | `.../audio/build-oneios-audio.py` | `build_oneios_audio.rs` | **retired 2026-11-13**: deleted, its output frozen in `tests/kernelgen/golden/` |
+| `kernel gen codec` | none (upstream OneiOS's Rust generator of 2026-11-15) | `build_oneios_codec.rs`, `staged/codec_transport.rs`, `staged/codec_decode.rs` | new (take18b, 2026-11-26): the native kernel's video decoder archive (`kernel/patches/oneios-hosted/codec/README.md`); its edit lists are checked on the pinned sources by `tests/golden.rs` `the_codec_edits_fit_the_pinned_sources` |
 | `kernel gen gpu` | `.../gpu/build-oneios-gpu.py` | `build_oneios_gpu.rs`, `class_record.rs` | **retired 2026-11-13**: deleted, its output frozen in `tests/kernelgen/golden/` |
 | `kernel gen display` | `.../display/build-oneios-display.py` | `build_oneios_display.rs` | **retired 2026-11-13**: deleted, its output frozen in `tests/kernelgen/golden/` |
 | `kernel build-record finish --host linux\|macos --work DIR --config NAME --out OUT [--repo CHECKOUT]`, `kernel build-record --self-test` | `kernel/build-record.py` | `build_record.rs` | **retired 2026-11-13**: deleted, its output frozen in `tests/kernelgen/golden/` |
 | `kernel layout hid\|net [--kernelcache KC] [--prelink-report JSON] [--out FILE] [--repo CHECKOUT]` | `.../hid/layout.py`, `.../net/layout.py` | `hid_layout.rs`, `net_layout.rs`, `layout.rs` | **retired 2026-11-13**: deleted, its output frozen in `tests/kernelgen/golden/` |
 | `kernel port-legacy-display [--kernelcache KC] [--fixture JSON] [--classes JSON] [--out FILE] [--repo CHECKOUT]` | `.../display/port-legacy-display.py` | `port_legacy_display.rs` | **retired 2026-11-13**: deleted, its output frozen in `tests/kernelgen/golden/` |
+| `kernel staged transport\|gpu3d\|scanout\|legacy\|audio\|snd\|media\|vthost [--repo CHECKOUT]` | new (2026-11-26; `audio` and `snd` with take17, `media` and `vthost` with take18b) | `lib.rs` | prints a pinned source of `external/` as the kernel build compiles it (its edit lists applied, in the build's order): with `compile-command`, the compile check of an edit list without a build tree. The unchanged ones are the take14 build's staged copies byte for byte; `audio` is `DroidVMAudio.cpp` (`staged/audio.rs` AUDIO) and `snd` is `DroidVMVirtioSnd.c` (SND_TRANSPORT_PCI), the same bytes as the take17 build's; `media` is `DroidVMVirtioMedia.c` (`staged/codec_transport.rs` MEDIA_TRANSPORT_PCI) and `vthost` is `DroidVMVTHost.cpp` (`staged/codec_decode.rs` CODEC_DECODER, CODEC_CROSVM), the codec archive's |
 | `kernel compile-command RECORD SOURCE OBJECT [--repo CHECKOUT]` | new | `drivers_build.rs` | prints the compile command the archives are built with (it was the check of this crate's copy against `drivers/build.py`, which is retired: `drivers_build.rs` is the port now) |
 
 Shared: `gen.rs` (where a generator runs, Python's file and process calls as the scripts used them, the steps every
@@ -2541,7 +2674,8 @@ writes for the same build.
 | The generated files that are this project's own text (17: the bindings `*.S` of aes, gpu, display, hid and net, `OriginalLegacyFramebufferABI.h`, the two probe sources, the crumbs header, hid's and net's `report.json`, the GPU's `status.json`), from the Python build above | whole, `golden/build/` | `tests/kernelgen/compare-golden.sh WORK` after a build; the ones made from a record alone (aes, gpu, the display's header, the probes) also by `cargo test` |
 | The staged copies of other projects' sources and of Apple's `IOBlockStorageDevice.cpp` (10) | SHA-256, size and name, `golden/staged.sha256` | `compare-golden.sh WORK` |
 | What the nine generators print | `golden/stdout.txt`, the tree's and the checkout's paths taken out | `compare-golden.sh WORK` |
-| Each edit list applied to a made-up source by the script's own staging function (8 lists; the Contact Identifier change of 2026-11-12 is in `hid_transport`) | `golden/synthetic/NAME.in` and `NAME.out` | `cargo test` |
+| Each edit list applied to a made-up source by the script's own staging function (8 lists; the Contact Identifier change of 2026-11-12 is in `hid_transport`) | `golden/synthetic/NAME.in` and `NAME.out` | `cargo test`. After an edit list changes: add its new anchors to `NAME.in` by hand, then `ONEIOS_GOLDEN_UPDATE=1 cargo test -p oneios-kernel --test golden the_edit_lists_write` rewrites the `.out` of audio, gpu, gpu3d, display and display_scanout from the lists (read the diff before keeping it) |
+| The audio lists (`staged/audio.rs` AUDIO and SND_TRANSPORT_PCI) and the room and swap-gap hooks (`staged/gpu.rs` GPU3D_ROOM, `staged/display.rs` SCANOUT) against the pinned sources of `external/` (take17) | their anchors, order and counts, in the tests | `cargo test` (`the_audio_edits_fit_the_pinned_sources`, `the_room_and_swap_gap_hooks_are_weak_and_fit_the_pinned_sources`; on the made-up sources only without `external/`) |
 | The pen's edit list (`staged/hid_pen.rs`, spen 2026-11-15; no Python original), applied after `hid`'s to the pinned `external/NativeHidInput/NativeHidInput.cpp` | its anchors and results, in the test | `cargo test` (`the_pen_edits_fit_the_pinned_source`; skipped without `external/`) |
 | `drivers/build.py`'s command for a made-up record, C and C++ | `golden/synthetic/command.*.json` | `cargo test` |
 | `build-record.py`'s record of a made-up build (run from a made-up checkout; without the machine's part and the checkouts' commits) | `golden/synthetic/build-record.json`, `.series.txt` | `cargo test` |

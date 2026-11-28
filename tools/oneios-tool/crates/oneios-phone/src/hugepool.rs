@@ -27,6 +27,9 @@ use std::time::{Duration, Instant};
 pub const DIR: &str = "/data/local/tmp/oneios-hugepool";
 pub const PARAMS: &str = "/sys/module/gh_hugepage_reserve/parameters";
 pub const KO: &str = "/data/local/tmp/oneios-hugepool/gh_hugepage_reserve.ko";
+/// take18's alternative module on the PC (`hugepool load --samfor12`; scripts/hugepage/build.sh WORK samfor12): samfor12's
+/// temp-root fork 361d499 of our pin 00c8a03. It goes to the phone as KO, as ours does.
+pub const KO_SAMFOR12: &str = "/mnt/tkg-build/oneios/hugepage/out/android15-6.6-samfor12.ko";
 
 /// `status`'s read: each named file after a `=== NAME` line.
 pub fn status_script() -> String {
