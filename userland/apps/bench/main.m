@@ -11,13 +11,20 @@
 //   oneios-bench: <test> <metrics...> | fps=.. p50=.. p95=.. p99=.. drop=.. cpu=..ms gpu=..ms thermal=N foot=MiB
 // plus "oneios-bench: begin ..." and "oneios-bench: end ..." around a run, and "oneios-bench: mem-step ..." while the
 // memory test allocates (it may be killed by jetsam before it can say more; it runs last).
+// The lines are logged as public text (a "%@" argument is <private> in the stored log) and appended to a file too (the
+// launch line names it). "FPS" is the app's display-link callbacks; "screen" is what the render server drew, where it
+// tells (CARenderServerGetFrameCounter, looked up at run time): layers the render server cannot draw in time lower the
+// second and leave the first at 120.
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #import <ImageIO/ImageIO.h>
 #import <simd/simd.h>
+#include <dlfcn.h>
+#include <fcntl.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <os/log.h>
 #include <os/proc.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -43,7 +50,45 @@ static double footprint_mib(void) {
   if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return -1;
   return info.phys_footprint / 1048576.0;
 }
-static double avail_mib(void) { return os_proc_available_memory() / 1048576.0; }
+// os_proc_available_memory: a process with no memory limit gets a huge number; -1 here says "no limit"
+static double avail_mib(void) {
+  double a = os_proc_available_memory() / 1048576.0;
+  return a > 1048576.0 ? -1 : a;
+}
+// One line: public in the unified log, and in the results file (the first folder that takes it).
+static int g_logFd = -2;
+static const char *g_logPath = "none";
+static void BLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+static void BLog(NSString *format, ...) {
+  va_list ap;
+  va_start(ap, format);
+  NSString *s = [[NSString alloc] initWithFormat:format arguments:ap];
+  va_end(ap);
+  os_log(OS_LOG_DEFAULT, "%{public}s", s.UTF8String);
+  if (g_logFd == -2) {
+    static const char *paths[] = {"/private/var/oneios/log/bench.log", "/private/var/mobile/Library/Logs/oneios-bench.log",
+                                  "/private/var/mobile/Documents/oneios-bench.log", "/private/var/tmp/oneios-bench.log"};
+    g_logFd = -1;
+    for (size_t i = 0; i < sizeof paths / sizeof paths[0] && g_logFd < 0; i++) {
+      g_logFd = open(paths[i], O_WRONLY | O_CREAT | O_APPEND, 0644);
+      if (g_logFd >= 0) g_logPath = paths[i];
+    }
+  }
+  if (g_logFd >= 0) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    NSData *d = [[NSString stringWithFormat:@"%ld.%03d %d %@\n", (long)tv.tv_sec, (int)(tv.tv_usec / 1000), getpid(), s]
+        dataUsingEncoding:NSUTF8StringEncoding];
+    if (write(g_logFd, d.bytes, d.length) < 0) { close(g_logFd); g_logFd = -1; g_logPath = "none (write failed)"; }
+  }
+}
+// The frames the render server drew (every display update, whoever asked for it). 0 = it does not tell.
+static uint32_t (*g_frameCounter)(mach_port_t);
+static uint32_t screen_frames(void) {
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{ g_frameCounter = (uint32_t (*)(mach_port_t))dlsym(RTLD_DEFAULT, "CARenderServerGetFrameCounter"); });
+  return g_frameCounter ? g_frameCounter(MACH_PORT_NULL) : 0;
+}
 static NSString *thermal_name(NSProcessInfoThermalState s) {
   switch (s) {
     case NSProcessInfoThermalStateNominal: return @"nominal";
@@ -328,6 +373,8 @@ static BenchTest *T(NSString *name, Cat cat) {
   Samples *_oFrame, *_oCpu, *_oGpu, *_oPresent;  // overlay: the last half second
   int _drops, _gpuNA;
   double _overlayAt;
+  uint32_t _screenAtTest, _screenAtStep, _screenAtOverlay;  // the render server's frame counter at those moments
+  double _overlayScreenAt;
   double _lastCpu;
 
   // metal
@@ -420,10 +467,11 @@ static BenchTest *T(NSString *name, Cat cat) {
   char model[64] = "?";
   size_t len = sizeof model;
   sysctlbyname("hw.machine", model, &len, NULL, 0);
-  NSLog(@"oneios-bench: launch model=%s os=%@ cpus=%lu page=%lu ram=%.0fMiB metal=%@ lib=%.1fms foot=%.1fMiB avail=%.0fMiB",
+  BLog(@"oneios-bench: launch model=%s os=%@ cpus=%lu page=%lu ram=%.0fMiB metal=%@ lib=%.1fms foot=%.1fMiB avail=%.0fMiB screen-counter=%s file=%s",
         model, [UIDevice currentDevice].systemVersion, (unsigned long)[NSProcessInfo processInfo].activeProcessorCount,
         (unsigned long)vm_page_size, [NSProcessInfo processInfo].physicalMemory / 1048576.0,
-        _dev ? _dev.name : (_metalError ?: @"none"), _libMs, footprint_mib(), avail_mib());
+        _dev ? _dev.name : (_metalError ?: @"none"), _libMs, footprint_mib(), avail_mib(),
+        screen_frames() ? "yes" : (g_frameCounter ? "zero" : "none"), g_logPath);
 }
 
 - (void)viewDidLayoutSubviews {
@@ -523,7 +571,7 @@ static BenchTest *T(NSString *name, Cat cat) {
   [_runLog setString:@""];
   _summary.text = @"";
   [UIApplication sharedApplication].idleTimerDisabled = YES;
-  NSLog(@"oneios-bench: begin run=%d set=\"%@\" tests=%lu thermal=%ld foot=%.1fMiB avail=%.0fMiB", _runNumber, label,
+  BLog(@"oneios-bench: begin run=%d set=\"%@\" tests=%lu thermal=%ld foot=%.1fMiB avail=%.0fMiB", _runNumber, label,
         (unsigned long)tests.count, (long)[NSProcessInfo processInfo].thermalState, footprint_mib(), avail_mib());
   [self next];
 }
@@ -531,9 +579,14 @@ static BenchTest *T(NSString *name, Cat cat) {
   if (_stop || !_queue.count) {
     _current = nil;
     [UIApplication sharedApplication].idleTimerDisabled = NO;
-    NSLog(@"oneios-bench: end run=%d %@ thermal=%ld foot=%.1fMiB", _runNumber, _stop ? @"stopped" : @"done",
+    BLog(@"oneios-bench: end run=%d %@ thermal=%ld foot=%.1fMiB", _runNumber, _stop ? @"stopped" : @"done",
           (long)[NSProcessInfo processInfo].thermalState, footprint_mib());
     [_table reloadData];
+    // the footprint at rest, after what the tests freed has gone back: the number to compare between runs (a leak grows it)
+    int run = _runNumber;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+      if (!self->_current) BLog(@"oneios-bench: rest run=%d foot=%.1fMiB (5 s after its end)", run, footprint_mib());
+    });
     return;
   }
   _current = _queue.firstObject;
@@ -541,6 +594,7 @@ static BenchTest *T(NSString *name, Cat cat) {
   [_table reloadData];
   [self resetWindow];
   _testStart = now_s();
+  _screenAtTest = _screenAtStep = screen_frames();
   BenchTest *t = _current;
   if (t.work) {
     _bgRunning = YES;
@@ -566,13 +620,16 @@ static BenchTest *T(NSString *name, Cat cat) {
   _gpuNA = 0;
 }
 - (void)done:(BenchTest *)t metrics:(NSString *)metrics {
-  NSString *frames = [NSString stringWithFormat:@"fps=%.1f p50=%@ p95=%@ p99=%@ drop=%d cpu=%@ms gpu=%@ms%@ thermal=%ld foot=%.0fMiB",
-                      _frameMs.count / MAX(now_s() - _testStart, 0.001), fmt_ms([_frameMs pct:50]), fmt_ms([_frameMs pct:95]),
+  double took = MAX(now_s() - _testStart, 0.001);
+  uint32_t drawn = screen_frames();
+  NSString *screen = drawn ? [NSString stringWithFormat:@"%.1f", (uint32_t)(drawn - _screenAtTest) / took] : @"n/a";
+  NSString *frames = [NSString stringWithFormat:@"fps=%.1f screen=%@ p50=%@ p95=%@ p99=%@ drop=%d cpu=%@ms gpu=%@ms%@ thermal=%ld foot=%.0fMiB",
+                      _frameMs.count / took, screen, fmt_ms([_frameMs pct:50]), fmt_ms([_frameMs pct:95]),
                       fmt_ms([_frameMs pct:99]), _drops, fmt_ms([_cpuMs mean]), fmt_ms([_gpuMs mean]),
                       _gpuNA && !_gpuMs.count ? @"(none)" : @"", (long)[NSProcessInfo processInfo].thermalState, footprint_mib()];
   NSString *slug = [[t.name lowercaseString] stringByReplacingOccurrencesOfString:@" " withString:@"-"];
   NSString *line = [NSString stringWithFormat:@"%@ %@ | %@", slug, metrics ?: @"", frames];
-  NSLog(@"oneios-bench: %@", line);
+  BLog(@"oneios-bench: %@", line);
   t.result = [NSString stringWithFormat:@"%@\n%@", metrics ?: @"", frames];
   [_runLog appendFormat:@"%@\n", line];
   _summary.text = _runLog;
@@ -625,14 +682,21 @@ static BenchTest *T(NSString *name, Cat cat) {
 }
 - (void)updateOverlay {
   double fps = _oFrame.count ? 1000.0 / [_oFrame mean] : 0;
+  uint32_t drawn = screen_frames();
+  double nowS = now_s();
+  NSString *screen = @"n/a";
+  if (drawn && _overlayScreenAt > 0 && nowS > _overlayScreenAt)
+    screen = [NSString stringWithFormat:@"%.0f", (uint32_t)(drawn - _screenAtOverlay) / (nowS - _overlayScreenAt)];
+  _screenAtOverlay = drawn;
+  _overlayScreenAt = nowS;
   NSString *test = _current ? [NSString stringWithFormat:@"%@ %.0f/%.0f s", _current.name, now_s() - _testStart, _current.seconds] : @"idle";
   _overlay.text.text = [NSString stringWithFormat:
-      @"FPS %.1f   frame p50 %@ p95 %@ p99 %@ max %@ ms\n"
+      @"app FPS %.1f  SCREEN %@   frame p50 %@ p95 %@ p99 %@ max %@ ms\n"
       @"test window: p50 %@ p95 %@ p99 %@ ms, dropped@120Hz %d\n"
       @"CPU/frame %@ ms   GPU/cb %@ ms%@   present %@ ms\n"
       @"thermal %@   footprint %.1f MiB   avail %.0f MiB\n"
       @"%@",
-      fps, fmt_ms([_oFrame pct:50]), fmt_ms([_oFrame pct:95]), fmt_ms([_oFrame pct:99]), fmt_ms([_oFrame max]),
+      fps, screen, fmt_ms([_oFrame pct:50]), fmt_ms([_oFrame pct:95]), fmt_ms([_oFrame pct:99]), fmt_ms([_oFrame max]),
       fmt_ms([_frameMs pct:50]), fmt_ms([_frameMs pct:95]), fmt_ms([_frameMs pct:99]), _drops,
       fmt_ms([_oCpu mean]), fmt_ms([_oGpu mean]), _gpuNA && !_oGpu.count ? @"(none)" : @"", fmt_ms([_oPresent mean]),
       thermal_name([NSProcessInfo processInfo].thermalState), footprint_mib(), avail_mib(), test];
@@ -657,7 +721,7 @@ static BenchTest *T(NSString *name, Cat cat) {
   if (depth) d.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
   NSError *e = nil;
   id<MTLRenderPipelineState> p = [_dev newRenderPipelineStateWithDescriptor:d error:&e];
-  if (!p) NSLog(@"oneios-bench: pipeline %@/%@ failed: %@", vs, fs, e.localizedDescription);
+  if (!p) BLog(@"oneios-bench: pipeline %@/%@ failed: %@", vs, fs, e.localizedDescription);
   return p;
 }
 - (void)setupMetal {
@@ -670,7 +734,7 @@ static BenchTest *T(NSString *name, Cat cat) {
   _libMs = now_ms() - t0;
   if (!_lib) {
     _metalError = [NSString stringWithFormat:@"newLibraryWithSource: %@", e.localizedDescription];
-    NSLog(@"oneios-bench: %@", _metalError);
+    BLog(@"oneios-bench: %@", _metalError);
     _dev = nil;
     return;
   }
@@ -753,7 +817,7 @@ static BenchTest *T(NSString *name, Cat cat) {
     double g = (b.GPUEndTime - b.GPUStartTime) * 1000.0;
     if (b.GPUStartTime > 0 && g > 0) { [gpu add:g]; [ogpu add:g]; }
     else { Bench *s = weakSelf; if (s) s->_gpuNA++; }
-    if (b.error) NSLog(@"oneios-bench: command buffer error: %@", b.error.localizedDescription);
+    if (b.error) BLog(@"oneios-bench: command buffer error: %@", b.error.localizedDescription);
     dispatch_semaphore_signal(sem);
   }];
   [cb commit];
@@ -1140,7 +1204,7 @@ static BenchTest *GPU(NSString *name) { return T(name, CatGPU); }
         b->_auxSum += c1 - c0;
         b->_param++;
       } else {
-        NSLog(@"oneios-bench: pipeline compile failed: %@", e.localizedDescription);
+        BLog(@"oneios-bench: pipeline compile failed: %@", e.localizedDescription);
       }
     }
     Uni *u = [b uniSlot];
@@ -1561,6 +1625,15 @@ static double pct_of(double *v, int n, double p) {
   }
 }
 
+// "/screenN" for the step that ends now: the render server's frames a second since the step before (call before the
+// step's start time is set again).
+- (NSString *)screenStep {
+  uint32_t drawn = screen_frames();
+  NSString *r = drawn ? [NSString stringWithFormat:@"/screen%.1f", (uint32_t)(drawn - _screenAtStep) / MAX(now_s() - _stepStart, 0.001)] : @"";
+  _screenAtStep = drawn;
+  return r;
+}
+
 - (void)addCATests:(NSMutableArray *)a {
   BenchTest *t;
 
@@ -1576,7 +1649,7 @@ static double pct_of(double *v, int n, double p) {
     int step = MIN((int)(el / 5.0), 2);
     if (step != b->_param) {
       if (b->_param >= 0)
-        [b->_stepLog appendFormat:@"n%d=%.1ffps ", counts[b->_param], b->_aux.count / (now_s() - b->_stepStart)];
+        [b->_stepLog appendFormat:@"n%d=%.1ffps%@ ", counts[b->_param], b->_aux.count / (now_s() - b->_stepStart), [b screenStep]];
       [b->_aux reset];
       b->_param = step;
       b->_stepStart = now_s();
@@ -1600,7 +1673,7 @@ static double pct_of(double *v, int n, double p) {
     }
   };
   t.finish = ^NSString *(Bench *b) {
-    [b->_stepLog appendFormat:@"n24=%.1ffps", b->_aux.count / (now_s() - b->_stepStart)];
+    [b->_stepLog appendFormat:@"n24=%.1ffps%@", b->_aux.count / (now_s() - b->_stepStart), [b screenStep]];
     return [NSString stringWithFormat:@"UIVisualEffectView systemMaterial moving over 40 spinning views: %@", b->_stepLog];
   };
   [a addObject:t];
@@ -1616,7 +1689,7 @@ static double pct_of(double *v, int n, double p) {
     static const int counts[3] = {50, 150, 300};
     int step = MIN((int)(el / 5.0), 2);
     if (step != b->_param) {
-      if (b->_param >= 0) [b->_stepLog appendFormat:@"n%d=%.1ffps ", counts[b->_param], b->_aux.count / (now_s() - b->_stepStart)];
+      if (b->_param >= 0) [b->_stepLog appendFormat:@"n%d=%.1ffps%@ ", counts[b->_param], b->_aux.count / (now_s() - b->_stepStart), [b screenStep]];
       [b->_aux reset];
       b->_param = step;
       b->_stepStart = now_s();
@@ -1640,7 +1713,7 @@ static double pct_of(double *v, int n, double p) {
     }
   };
   t.finish = ^NSString *(Bench *b) {
-    [b->_stepLog appendFormat:@"n300=%.1ffps", b->_aux.count / (now_s() - b->_stepStart)];
+    [b->_stepLog appendFormat:@"n300=%.1ffps%@", b->_aux.count / (now_s() - b->_stepStart), [b screenStep]];
     b->_stage.backgroundColor = UIColor.blackColor;
     return [NSString stringWithFormat:@"moving views with shadows, no shadowPath: %@", b->_stepLog];
   };
@@ -1827,13 +1900,13 @@ static double decode_loop(NSData *data, double seconds, int *count, size_t *pixe
   _memWarning = YES;
   _memWarnAt = _chunks.count * 32.0;
   _memAvailAtWarn = avail_mib();
-  NSLog(@"oneios-bench: mem-warning allocated=%.0fMiB foot=%.1fMiB avail=%.0fMiB", _memWarnAt, footprint_mib(), _memAvailAtWarn);
+  BLog(@"oneios-bench: mem-warning allocated=%.0fMiB foot=%.1fMiB avail=%.0fMiB", _memWarnAt, footprint_mib(), _memAvailAtWarn);
 }
 - (void)reportLastMemoryRun {
   NSUserDefaults *u = [NSUserDefaults standardUserDefaults];
   NSInteger step = [u integerForKey:@"oneios.memStep"];
   if (step > 0) {
-    NSLog(@"oneios-bench: mem-previous the last memory test did not finish: it reached %ldMiB (killed, probably by jetsam)", (long)step * 32);
+    BLog(@"oneios-bench: mem-previous the last memory test did not finish: it reached %ldMiB (killed, probably by jetsam)", (long)step * 32);
     [u removeObjectForKey:@"oneios.memStep"];
   }
 }
@@ -1860,7 +1933,7 @@ static double decode_loop(NSData *data, double seconds, int *count, size_t *pixe
     double avail = avail_mib();
     if (avail < 96) {  // stop before jetsam: the warning never came
       b->_stepStart = -1;
-      NSLog(@"oneios-bench: mem-stop no warning before avail<96MiB allocated=%luMiB", (unsigned long)b->_chunks.count * 32);
+      BLog(@"oneios-bench: mem-stop no warning before avail<96MiB allocated=%luMiB", (unsigned long)b->_chunks.count * 32);
       return;
     }
     void *p = malloc(32 << 20);
@@ -1869,7 +1942,7 @@ static double decode_loop(NSData *data, double seconds, int *count, size_t *pixe
     [b->_chunks addObject:[NSValue valueWithPointer:p]];
     [[NSUserDefaults standardUserDefaults] setInteger:(NSInteger)b->_chunks.count forKey:@"oneios.memStep"];
     if (b->_chunks.count % 4 == 0)
-      NSLog(@"oneios-bench: mem-step allocated=%luMiB foot=%.1fMiB avail=%.0fMiB", (unsigned long)b->_chunks.count * 32, footprint_mib(), avail);
+      BLog(@"oneios-bench: mem-step allocated=%luMiB foot=%.1fMiB avail=%.0fMiB", (unsigned long)b->_chunks.count * 32, footprint_mib(), avail);
   };
   t.finish = ^NSString *(Bench *b) {
     double peak = footprint_mib();
@@ -1897,7 +1970,10 @@ static double decode_loop(NSData *data, double seconds, int *count, size_t *pixe
     void (^setup)(Bench *, UIView *) = t.setup;
     NSString *(^finish)(Bench *) = t.finish;
     void (^frame)(Bench *, double) = t.frame;
-    t.setup = ^(Bench *b, UIView *stage) { if (b->_dev) setup(b, stage); };
+    t.setup = ^(Bench *b, UIView *stage) {
+      if (b->_dev) setup(b, stage);
+      else b->_current.seconds = 0.5;  // no device: no 15 s of a black stage (it looked like a hang)
+    };
     t.frame = ^(Bench *b, double el) { if (b->_dev) frame(b, el); };
     t.finish = ^NSString *(Bench *b) {
       return b->_dev ? finish(b) : [NSString stringWithFormat:@"no-metal-device (%@)", b->_metalError ?: @"?"];
