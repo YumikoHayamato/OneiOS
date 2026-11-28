@@ -58,13 +58,8 @@ static double avail_mib(void) {
 // One line: public in the unified log, and in the results file (the first folder that takes it).
 static int g_logFd = -2;
 static const char *g_logPath = "none";
-static void BLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
-static void BLog(NSString *format, ...) {
-  va_list ap;
-  va_start(ap, format);
-  NSString *s = [[NSString alloc] initWithFormat:format arguments:ap];
-  va_end(ap);
-  os_log(OS_LOG_DEFAULT, "%{public}s", s.UTF8String);
+// The results file, opened once (before the launch line, which names it).
+static const char *blog_open(void) {
   if (g_logFd == -2) {
     static const char *paths[] = {"/private/var/oneios/log/bench.log", "/private/var/mobile/Library/Logs/oneios-bench.log",
                                   "/private/var/mobile/Documents/oneios-bench.log", "/private/var/tmp/oneios-bench.log"};
@@ -74,6 +69,16 @@ static void BLog(NSString *format, ...) {
       if (g_logFd >= 0) g_logPath = paths[i];
     }
   }
+  return g_logPath;
+}
+static void BLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+static void BLog(NSString *format, ...) {
+  va_list ap;
+  va_start(ap, format);
+  NSString *s = [[NSString alloc] initWithFormat:format arguments:ap];
+  va_end(ap);
+  os_log(OS_LOG_DEFAULT, "%{public}s", s.UTF8String);
+  blog_open();
   if (g_logFd >= 0) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
@@ -489,7 +494,7 @@ static BenchTest *T(NSString *name, Cat cat) {
         model, [UIDevice currentDevice].systemVersion, (unsigned long)[NSProcessInfo processInfo].activeProcessorCount,
         (unsigned long)vm_page_size, [NSProcessInfo processInfo].physicalMemory / 1048576.0,
         _dev ? _dev.name : (_metalError ?: @"none"), _libMs, footprint_mib(), avail_mib(),
-        screen_source(), g_logPath);
+        screen_source(), blog_open());
 }
 
 - (void)viewDidLayoutSubviews {
@@ -1950,7 +1955,7 @@ static double decode_loop(NSData *data, double seconds, int *count, size_t *pixe
     if (el - b->_stepStart < 0.15) return;
     b->_stepStart = el;
     double avail = avail_mib();
-    if (avail < 96) {  // stop before jetsam: the warning never came
+    if (avail >= 0 && avail < 96) {  // stop before jetsam: the warning never came (-1: no limit, the warning ends it)
       b->_stepStart = -1;
       BLog(@"oneios-bench: mem-stop no warning before avail<96MiB allocated=%luMiB", (unsigned long)b->_chunks.count * 32);
       return;
