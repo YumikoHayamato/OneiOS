@@ -33,79 +33,161 @@ pub struct Opts {
     pub fill_after_stop: bool,
     /// --host-keep-mib N: what Android keeps available beside the VM
     pub keep_mib: u32,
+    /// take24, --host-overhead-mib N: what the running VM takes of Android's memory beyond the pool (None: OVERHEAD_MIB)
+    pub overhead_mib: Option<u32>,
+    /// take24, --pagecensus FILE: runtime/pagecensus's binary, run after the fill
+    pub pagecensus: Option<String>,
     /// --orchestrator
     pub orchestrator: bool,
     /// --orchestrator-set KEY=VALUE, repeatable
     pub orch_set: Vec<String>,
 }
 
-pub const KEEP_MIB: u32 = 1024;
-/// The most seconds the choice may spend on one candidate (two settles of 30 s, the acquire's 3 + 120 + 2, the hash): the
-/// takeover's failsafe is given this much more for each (vm_boot).
-pub const PICK_SECONDS: u32 = 200;
+/// take24: 600 (the owner's choice; 1024 in take23). The module's own sweep brakes under 512 MiB of MemAvailable.
+pub const KEEP_MIB: u32 = 600;
+/// take24: what the running VM takes of Android's MemAvailable beyond the pool (crosvm, the renderer, the GPU's memory, the
+/// 32 MiB of the VM outside the pool). take23's session, 4608 MiB: 4402 MiB available after the fill, 3959 as crosvm
+/// started, 3816 at the lowest (hostmem.txt): 586. The choice counts it, so that KEEP is what Android has while iOS runs.
+pub const OVERHEAD_MIB: u32 = 600;
+/// The most seconds the fill may take (take24: once for all candidates: four acquires of 30 + 2 + 60 + 2 s at most, the slabs,
+/// the compaction, the census) and the seconds of one candidate's check (its file's hash): the takeover's failsafe is given
+/// FILL_SECONDS plus PICK_SECONDS a candidate more (vm_boot).
+pub const FILL_SECONDS: u32 = 480;
+pub const PICK_SECONDS: u32 = 10;
 /// The most RAM of an Image in the new order (the loader's own limit).
 pub const MAX_RAM_MIB: u32 = 8192;
 
-/// The choice, in the takeover, right before the pool's top-up (takeover_script's `need=N` line): `cands` the largest first,
-/// the main Image last. It leaves RAM, NEED, ARENA and KIMG for the lines apply_pick rewrote. A candidate is taken when
-/// (a) the module's table holds its pages (pool_size_max: `hugepool load --system-reserve-mb`), (b) Android keeps KEEP MiB
-/// available once the pool has them (MemAvailable now, less 2 MiB a page the pool still lacks, less the 32 MiB of the VM
-/// outside the pool), (c) its file is the one that was pushed, and (d) the pages come
-/// (the module's acquire, mode 3, 120 s at most). Pages the pool has beyond the chosen Image's stay in it (the module's
-/// shrink has never run in a session of ours: not asked for). None taken: the session ends before crosvm starts, One UI
-/// comes back (the trap).
+/// The fill and the choice, in the takeover, right before the pool's top-up (takeover_script's `need=N` line): `cands` the
+/// largest first, the main Image last. It leaves RAM, NEED, ARENA and KIMG for the lines apply_pick rewrote.
+///
+/// take24, the fill (take23 asked the module once a candidate and logged only the end: 2437 pages in 2 s, "scanned all
+/// present memory", with 4.4 GiB still available to Android). Once, toward the largest candidate's pages, bounded by the
+/// module's table (pool_size_max) and by KEEP + the overhead MiB of MemAvailable left to Android; `fill:` lines in run.txt:
+/// 1. `sweep`: the module's acquire 3 (its own slab drop, then every 2 MiB window whose pages are all free or movable);
+/// 2. `after-slab-shrink`: every cache's `/sys/kernel/slab/*/shrink` (the empty slabs SLUB keeps a CPU and a cache), a
+///    sync and drop_caches 3 again, acquire 3;
+/// 3. `after-compaction`: `/proc/sys/vm/compact_memory`, acquire 3;
+/// 4. `with-reclaim`: acquire 2 (the sweep with the module's system-wide reclaim instead of each window's own).
+/// A step runs only while the pool is short; each says the pages it added, its seconds and the module's stop reason. Before
+/// and after: meminfo's kernel memory, the free blocks by kind and order and the 2 MiB blocks by kind (/proc/pagetypeinfo),
+/// the module's counters, and `--pagecensus`'s lines (which kind of page refuses how many windows).
+/// The module takes a window only when nothing in it is unmovable (gh_a_candidate_range), so a fill that stops short with
+/// memory free stopped on fragmentation: the census says by what. The earlier lever is `hugepool load --want N --leave-mib M`
+/// (the pool taken seconds after the phone's start, before the kernel's own pages spread).
+///
+/// The choice: a candidate is taken when (a) the module's table holds its pages, (b) the pool has them, (c) Android keeps
+/// KEEP MiB available while the VM runs (MemAvailable less OVERHEAD_MIB, --host-overhead-mib), and (d) its file is the one that was pushed.
+/// Pages the pool has beyond the chosen Image's stay in it (the module's shrink has never run in a session of ours: not
+/// asked for) and are logged. None taken: the session ends before crosvm starts, One UI comes back (the trap).
 pub fn pick_block(cands: &[Candidate], keep_mib: u32) -> String {
+    pick_block_with(cands, keep_mib, OVERHEAD_MIB)
+}
+
+/// pick_block with --host-overhead-mib.
+pub fn pick_block_with(cands: &[Candidate], keep_mib: u32, overhead_mib: u32) -> String {
     let mut list = String::new();
     for c in cands {
         list += &format!("{} {} {} {} {}\n", c.ram, c.need, if c.arena.is_empty() { "-" } else { &c.arena }, c.file, c.sha);
     }
-    PICK.replace("__KEEP__", &keep_mib.to_string()).replace("__LIST__", &list)
+    let most = cands.iter().map(|c| c.need).max().unwrap_or(0);
+    PICK.replace("__KEEP__", &keep_mib.to_string()).replace("__OVER__", &overhead_mib.to_string()).replace("__MAXNEED__", &most.to_string()).replace("__LIST__", &list)
 }
 
 const PICK: &str = r##"# take23 (vm-boot --fill-after-stop / --image-larger): the largest Image that fits, now that One UI is down
 KEEP=__KEEP__
+OVER=__OVER__
+MAXNEED=__MAXNEED__
 PMAX=$(cat $P/pool_size_max 2>/dev/null); case $PMAX in ''|*[!0-9]*|0) PMAX=; echo "pick: the module's pool_size_max is not readable: its table is not asked (the pool's pages coming is the test)" ;; esac
 RAM=; NEED=; ARENA=; KIMG=
 pool_n() { v=$(grep "^$1=" $P/refill_stat 2>/dev/null | cut -d= -f2); case $v in ''|*[!0-9]*) v=0 ;; esac; echo $v; }
 pool_settle() { ps=0; while [ $ps -lt $1 ] && ! grep -q '^acquire_active=0$' $P/refill_stat; do sleep 1; ps=$((ps + 1)); done; }
+mi() { v=$(sed -n "s/^$1: *\([0-9]*\).*/\1/p" /proc/meminfo); echo $((${v:-0} / 1024)); }
+# take24: the pool's fill, once, toward the largest Image's pages, in steps, each with what it gained and why it stopped.
+# fill_state: what holds the 2 MiB blocks (meminfo's kernel memory, the free blocks by order and by kind, the blocks' kinds)
+fill_state() {
+  echo "fill: $1: MiB: MemFree $(mi MemFree) MemAvailable $(mi MemAvailable) CmaFree $(mi CmaFree) Slab $(mi Slab) SUnreclaim $(mi SUnreclaim) PageTables $(mi PageTables) KernelStack $(mi KernelStack) VmallocUsed $(mi VmallocUsed) Unevictable $(mi Unevictable) Shmem $(mi Shmem) KgslShmemUsage $(mi KgslShmemUsage)"
+  echo "fill: $1: free blocks by kind, order 0 to 10 (4 KiB << n; 9 and 10 are the 2 MiB ones): $(grep ', type ' /proc/pagetypeinfo 2>/dev/null | tr -s ' ' | sed 's/^Node [0-9]*, zone //; s/, type / /' | tr '\n' ';')"
+  echo "fill: $1: 2 MiB blocks by kind: $(sed -n '/^Number of blocks type/,$p' /proc/pagetypeinfo 2>/dev/null | tr -s ' ' | tr '\n' ';')"
+}
+# fill_step NAME MODE: the module's acquire (3: the sweep with each window's own pages evicted; 2: with a system-wide reclaim)
+fill_step() {
+  [ "$(pool_n pool_avail)" -lt $WANT ] || return 0
+  p0=$(pool_n pool_avail); t0=$(now)
+  pool_settle 30
+  if ! echo $2 > $P/acquire 2>/dev/null; then echo "fill: step $1: the module refused acquire $2 ($(stat_line))"; return 0; fi
+  sleep 2 </dev/null
+  pool_settle 60
+  [ $ps -lt 60 ] || { echo 0 > $P/acquire; sleep 2 </dev/null; echo "fill: step $1: the acquire still ran after 60 s: cancelled"; }
+  p1=$(pool_n pool_avail)
+  echo "fill: step $1: pool $p0 -> $p1 pages (+$((p1 - p0))) in $(( $(now) - t0 )) s; the module's stop reason: $(grep '^acquire_stop_reason=' $P/refill_stat | cut -d= -f2-); MemAvailable $(mi MemAvailable) MiB, MemFree $(mi MemFree) MiB"
+}
+fill_state before
+ma=$(mi MemAvailable); pa=$(pool_n pool_avail)
+room=$(( pa + (ma - KEEP - OVER) / 2 ))
+WANT=$MAXNEED; why="the largest Image's pages"
+if [ -n "$PMAX" ] && [ $WANT -gt $PMAX ]; then WANT=$PMAX; why="the module's table (hugepool load --system-reserve-mb)"; fi
+if [ $WANT -gt $room ]; then WANT=$room; why="$KEEP MiB left to Android (--host-keep-mib) beside the $OVER the running VM takes of it (--host-overhead-mib)"; fi
+echo "fill: the pool has $pa pages (2 MiB each), Android $ma MiB available; the fill goes to $WANT pages: $why (largest Image $MAXNEED, table ${PMAX:-?}, with $KEEP + $OVER MiB left $room)"
+if [ $pa -ge $WANT ]; then
+  echo "fill: nothing to take: the pool holds $pa pages already"
+else
+  pool_settle 30
+  pw=$(pool_n pool_want)
+  # the want is raised to the fill's, or lowered to it when a load's larger want would take Android under KEEP; never under
+  # what the pool holds (that would be the module's shrink)
+  [ $pw -eq $WANT ] || { echo $WANT > $P/pool_want || echo "fill: pool_want $WANT refused ($(stat_line))"; }
+  fill_step sweep 3
+  if [ "$(pool_n pool_avail)" -lt $WANT ]; then
+    # empty and half-empty slabs the kernel keeps for each CPU and cache: given back, then the caches once more
+    sn=0; for f in /sys/kernel/slab/*/shrink; do [ -w "$f" ] || continue; echo 1 > "$f" 2>/dev/null && sn=$((sn + 1)); done
+    sync; echo 3 > /proc/sys/vm/drop_caches
+    echo "fill: slabs shrunk in $sn caches, caches dropped again; Slab $(mi Slab) MiB, SUnreclaim $(mi SUnreclaim) MiB"
+    fill_step after-slab-shrink 3
+  fi
+  if [ "$(pool_n pool_avail)" -lt $WANT ]; then
+    t0=$(now); echo 1 > /proc/sys/vm/compact_memory 2>/dev/null
+    echo "fill: memory compacted in $(( $(now) - t0 )) s"
+    fill_step after-compaction 3
+  fi
+  fill_step with-reclaim 2
+  pa=$(pool_n pool_avail)
+  if [ $pa -ge $WANT ]; then why2="it reached the fill's $WANT pages ($why)"
+  else why2="the module found no other 2 MiB window it can empty (its reason: $(grep '^acquire_stop_reason=' $P/refill_stat | cut -d= -f2-)): $((WANT - pa)) pages short"; fi
+  echo "fill: done: the pool has $pa pages ($((pa * 2)) MiB); it stopped because $why2; Android: MemAvailable $(mi MemAvailable) MiB, MemFree $(mi MemFree) MiB, CmaFree $(mi CmaFree) MiB"
+  echo "fill: the module's counters: $(cat $P/reclaim_debug 2>/dev/null | tr '\n' ' ')"
+  fill_state after
+fi
+if [ -x $D/pagecensus ]; then $D/pagecensus 2>&1 | sed 's/^pagecensus:/fill: census:/'; fi
 while read cram cneed carena cfile csha; do
   [ -n "$csha" ] || continue
-  ma=$(sed -n 's/^MemAvailable: *\([0-9]*\).*/\1/p' /proc/meminfo); ma=$((${ma:-0} / 1024))
+  ma=$(mi MemAvailable)
   pa=$(pool_n pool_avail)
-  more=$((cneed - pa)); [ $more -gt 0 ] || more=0
-  left=$((ma - 2 * more - 32))
+  left=$((ma - OVER))
   if [ -n "$PMAX" ] && [ $cneed -gt $PMAX ]; then
     echo "pick: $cram MiB: no: it takes $cneed pool pages and the module's table holds $PMAX (hugepool load --system-reserve-mb)"; continue
   fi
+  if [ $pa -lt $cneed ]; then
+    echo "pick: $cram MiB: no: it takes $cneed pool pages and the pool has $pa (the fill's lines above say why)"; continue
+  fi
   if [ $left -lt $KEEP ]; then
-    echo "pick: $cram MiB: no: Android has $ma MiB available and the pool $pa free pages; beside this VM $left MiB would be left, under $KEEP"; continue
+    echo "pick: $cram MiB: no: Android has $ma MiB available beside the pool; with the $OVER MiB the running VM takes of it $left MiB would be left, under $KEEP"; continue
   fi
   if [ "$(sha256sum $D/$cfile 2>/dev/null | cut -d' ' -f1)" != "$csha" ]; then
     echo "pick: $cram MiB: no: $D/$cfile is not the file that was pushed"; continue
   fi
-  if [ $pa -lt $cneed ]; then
-    pool_settle 30
-    [ "$(pool_n pool_want)" -ge $cneed ] || echo $cneed > $P/pool_want
-    echo 3 > $P/acquire; sleep 3 </dev/null
-    pool_settle 120
-    [ $ps -lt 120 ] || { echo 0 > $P/acquire; sleep 2 </dev/null; }
-    pa=$(pool_n pool_avail)
-    if [ $pa -lt $cneed ]; then
-      echo "pick: $cram MiB: no: the pool reached $pa of $cneed pages in $ps s ($(stat_line))"; continue
-    fi
-  fi
   RAM=$cram; NEED=$cneed; ARENA=$carena; KIMG=$D/$cfile
-  echo "pick: $cram MiB: yes: Android had $ma MiB available, the pool has $pa free pages of the $cneed it takes; about $left MiB stay to Android"
+  echo "pick: $cram MiB: yes: the pool has $pa free pages of the $cneed it takes; Android has $ma MiB available, about $left MiB stay to it while the VM runs ($OVER MiB counted for crosvm, the renderer and the GPU's memory)"
   break
 done <<'ONEIOS_PICK'
 __LIST__ONEIOS_PICK
 if [ -z "$RAM" ]; then
   echo "pick: no Image fits: memory $(mem_line); $(stat_line)"
+  echo "pick: the pool gives no page back to Android (the module's shrink is not used): when it is Android's memory that is short, a smaller want at hugepool load (--leave-mib) or a lower --host-keep-mib"
   end "refused memory: no Image of the list fits with $KEEP MiB left to Android"; exit 1
 fi
 # Pages the pool has beyond this VM's stay in it: giving them back would be the module's shrink (a lower pool_want), which no
 # session of ours has run; they are not counted as Android's above either.
-spare=$(( $(pool_n pool_avail) - NEED )); [ $spare -le 0 ] || echo "pick: $spare pages (2 MiB each) stay unused in the pool"
+spare=$(( $(pool_n pool_avail) - NEED )); [ $spare -le 0 ] || echo "pick: $spare pages (2 MiB each, $((spare * 2)) MiB) stay unused in the pool: neither iOS nor Android has them"
 echo "pick: the VM runs the Image of $RAM MiB ($KIMG)"
 "##;
 
@@ -134,12 +216,13 @@ pub fn apply_pick(script: &str, main: &Candidate, block: &str) -> Result<String>
 /// hostmem.txt, started with the wait for the VM's end: Android's memory beside the VM, every 5 s.
 pub const HOSTMEM: &str = r##"# take23: Android's memory while the VM runs (no session before take23 logged it)
 (
-  echo "# time MemAvailable MemFree (MiB) pool_avail pool_total (pages of 2 MiB) crosvm VmRSS (MiB)"
+  echo "# time MemAvailable MemFree (MiB) pool_avail pool_total (pages of 2 MiB) crosvm VmRSS (MiB, every crosvm process) CmaFree KgslShmemUsage (MiB)"
   while kill -0 $pid 2>/dev/null; do
     ma=$(sed -n 's/^MemAvailable: *\([0-9]*\).*/\1/p' /proc/meminfo); mf=$(sed -n 's/^MemFree: *\([0-9]*\).*/\1/p' /proc/meminfo)
     pa=$(grep '^pool_avail=' $P/refill_stat 2>/dev/null | cut -d= -f2); pt=$(grep '^pool_total=' $P/refill_stat 2>/dev/null | cut -d= -f2)
-    rs=$(sed -n 's/^VmRSS: *\([0-9]*\).*/\1/p' /proc/$pid/status 2>/dev/null)
-    echo "$(date +%T) $((${ma:-0} / 1024)) $((${mf:-0} / 1024)) ${pa:--} ${pt:--} $((${rs:-0} / 1024))"
+    rs=0; for q in $(pidof crosvm 2>/dev/null); do r1=$(sed -n 's/^VmRSS: *\([0-9]*\).*/\1/p' /proc/$q/status 2>/dev/null); rs=$((rs + ${r1:-0})); done
+    cf=$(sed -n 's/^CmaFree: *\([0-9]*\).*/\1/p' /proc/meminfo); kg=$(sed -n 's/^KgslShmemUsage: *\([0-9]*\).*/\1/p' /proc/meminfo)
+    echo "$(date +%T) $((${ma:-0} / 1024)) $((${mf:-0} / 1024)) ${pa:--} ${pt:--} $((rs / 1024)) $((${cf:-0} / 1024)) $((${kg:-0} / 1024))"
     sleep 5
   done
 ) > $D/hostmem.txt 2>&1 &
@@ -340,13 +423,18 @@ mod tests {
         // nothing of the choice writes anywhere but the pool's two files
         for l in b.lines() {
             if let Some((_, to)) = l.split_once(" > ") {
-                assert!(to.starts_with("$P/pool_want") || to.starts_with("$P/acquire"), "{l}");
+                // take24: and the three files of the fill's steps (the slabs' shrink, the cache drop, the compaction)
+                let fill = ["\"$f\" 2>/dev/null", "/proc/sys/vm/drop_caches", "/proc/sys/vm/compact_memory 2>/dev/null"];
+                assert!(to.starts_with("$P/pool_want") || to.starts_with("$P/acquire") || fill.iter().any(|f| to.starts_with(f)), "{l}");
             }
         }
         assert!(!b.contains("__"));
-        // the pool is never asked to shrink: its want is only ever raised to a candidate's pages
+        // take24: the want is written once, the fill's (never under what the pool holds: that branch runs only when the
+        // pool has fewer pages than the fill wants), and the choice itself presses no acquire
         assert_eq!(b.matches("> $P/pool_want").count(), 1);
-        assert!(b.contains("[ \"$(pool_n pool_want)\" -ge $cneed ] || echo $cneed > $P/pool_want"));
+        assert!(b.contains("if [ $pa -ge $WANT ]; then\n  echo \"fill: nothing to take"));
+        assert!(b.contains("KEEP=1024\nOVER=600\nMAXNEED=3568\n") && pick_block_with(&[cand(4608, "19f800000")], 600, 0).contains("KEEP=600\nOVER=0\nMAXNEED=2288\n"));
+        assert!(!b[at("while read cram")..].contains("$P/acquire"));
     }
 
     #[test]

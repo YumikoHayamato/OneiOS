@@ -114,6 +114,37 @@ pub fn load(adb: &Adb, ko: &str, kapi_check: &str, want: u32, out: &str) -> Resu
 
 /// `phone hugepool load --system-reserve-mb N` (insmod_line_with).
 pub fn load_with(adb: &Adb, ko: &str, kapi_check: &str, want: u32, out: &str, reserve_mb: Option<u32>) -> Result<()> {
+    load_full(adb, ko, kapi_check, want, out, reserve_mb, None)
+}
+
+/// take24: the lines around the insmod. `leave_mib` (hugepool load --leave-mib): the want is lowered on the phone to
+/// (MemAvailable - leave) / 2 pages, 64 at least. Always: Android's memory and its free blocks by order before and after,
+/// with the uptime (the pool's pages come from blocks of 2 MiB that are free at that moment: how many there are is the
+/// whole question).
+pub fn load_lines(line: &str, want: u32, leave_mib: Option<u32>) -> String {
+    let mem = "mem() { echo \"load: $1: uptime $(cut -d' ' -f1 /proc/uptime) s; $(grep -E '^(MemFree|MemAvailable|CmaFree):' /proc/meminfo | tr -s ' ' | tr '\\n' ' '); free blocks by order: $(tr -s ' ' < /proc/buddyinfo | tr '\\n' ';')\"; }\n";
+    let mut s = String::from(mem);
+    s += "mem before\n";
+    let line = match leave_mib {
+        Some(leave) => {
+            s += &format!(
+                "ma=$(sed -n 's/^MemAvailable: *\\([0-9]*\\).*/\\1/p' /proc/meminfo); ma=$((${{ma:-0}} / 1024))\n\
+                 W={want}; r=$(( (ma - {leave}) / 2 )); [ $r -ge 64 ] || r=64; [ $W -le $r ] || W=$r\n\
+                 echo \"load: Android has $ma MiB available: the want is $W pages of the {want} asked ({leave} MiB left to Android while it starts)\"\n"
+            );
+            line.replace(&format!("pool_want={want} "), "pool_want=$W ")
+        }
+        None => line.to_string(),
+    };
+    s += &format!("sync\nt0=$(cut -d' ' -f1 /proc/uptime)\n{line}; rc=$?\nt1=$(cut -d' ' -f1 /proc/uptime)\necho \"insmod exit $rc ($t0 to $t1)\"\nmem after\n");
+    s
+}
+
+/// `phone hugepool load` with every option (load_with, and take24's --leave-mib: load_lines).
+pub fn load_full(adb: &Adb, ko: &str, kapi_check: &str, want: u32, out: &str, reserve_mb: Option<u32>, leave_mib: Option<u32>) -> Result<()> {
+    if leave_mib.is_some_and(|mb| !(1024..=8192).contains(&mb)) {
+        bail!("--leave-mib: 1024 to 8192 MiB");
+    }
     if reserve_mb.is_some_and(|mb| !(RESERVE_MIN_MB..=6144).contains(&mb)) {
         bail!("--system-reserve-mb: {RESERVE_MIN_MB} to 6144 MiB (the module's own is 6144; what Android keeps is asked again at each vm-boot, --host-keep-mib)");
     }
@@ -157,8 +188,8 @@ pub fn load_with(adb: &Adb, ko: &str, kapi_check: &str, want: u32, out: &str, re
     let line = insmod_line_with(want, pb, &disable, reserve_mb);
     println!("load: {} bytes, sha256 {sha}; {line}", data.len());
     let script = format!(
-        "got=$(sha256sum {KO} | cut -d' ' -f1); [ \"$got\" = \"{sha}\" ] || {{ echo \"sha256 $got, not {sha}\"; exit 1; }}\n\
-         sync\nt0=$(cut -d' ' -f1 /proc/uptime)\n{line}; rc=$?\nt1=$(cut -d' ' -f1 /proc/uptime)\necho \"insmod exit $rc ($t0 to $t1)\"\n"
+        "got=$(sha256sum {KO} | cut -d' ' -f1); [ \"$got\" = \"{sha}\" ] || {{ echo \"sha256 $got, not {sha}\"; exit 1; }}\n{}",
+        load_lines(&line, want, leave_mib)
     );
     let r = adb.root(&script)?;
     print!("{}{}", r.out, r.err);
@@ -530,6 +561,13 @@ mod tests {
             format!("insmod {KO} pool_want=64 pageblock_order_val=9 migrate_cma_val=-1 pool_want_with_cma=0")
         );
         assert!(insmod_line(64, 9, "kallsyms_lookup_name").ends_with(" disable_kapi=kallsyms_lookup_name"));
+        // take24: --leave-mib lowers the want on the phone; without it the insmod line is the one given
+        let line = insmod_line_with(4080, 9, "", Some(3072));
+        let plain = load_lines(&line, 4080, None);
+        assert!(plain.contains(&format!("\n{line}; rc=$?\n")) && plain.starts_with("mem() {") && plain.ends_with("mem after\n"));
+        let left = load_lines(&line, 4080, Some(2560));
+        assert!(left.contains("W=4080; r=$(( (ma - 2560) / 2 )); [ $r -ge 64 ] || r=64; [ $W -le $r ] || W=$r\n"));
+        assert!(left.contains(" pool_want=$W pageblock_order_val=9 ") && !left.contains("pool_want=4080"));
         assert_eq!(pageblock_order("absent\n6.6.127-x\nPage block order: 9\n"), Some(9));
         assert_eq!(pageblock_order("absent\n6.6.127-x\n"), None);
         assert_eq!(stat("state=idle\npool_avail=12\nactive_vms=0\n", "pool_avail"), Some("12"));

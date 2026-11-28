@@ -1617,6 +1617,12 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
         if o.vsync.is_some() {
             bail!("--fill-after-stop with --vsync-lock: the vsync page's place follows the RAM's size; not done");
         }
+        if t23.pagecensus.as_ref().is_some_and(|f| !Path::new(f).is_file()) {
+            bail!("--pagecensus {}: not there (make -C runtime/pagecensus)", t23.pagecensus.as_deref().unwrap_or(""));
+        }
+        if t23.overhead_mib.is_some_and(|mb| mb > 2048) {
+            bail!("--host-overhead-mib: 2048 MiB at most");
+        }
         if !(512..=4096).contains(&t23.keep_mib) {
             bail!("--host-keep-mib: 512 to 4096 MiB");
         }
@@ -1699,6 +1705,12 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
         for (path, file) in &larger_files {
             println!("vm-boot: --image-larger {path}: pushing as {file}");
             adb.push(path, &format!("{DIR}/{file}"))?;
+        }
+        // take24: the census of what holds the 2 MiB blocks, run by the fill when it is there (root's own copy)
+        adb.root_ok(&format!("rm -f {DIR}/pagecensus\n"), "the last session's pagecensus")?;
+        if let Some(file) = &t23.pagecensus {
+            adb.push(file, &format!("{DIR}/pagecensus"))?;
+            adb.root_ok(&format!("chown root:root {DIR}/pagecensus && chmod 755 {DIR}/pagecensus\n"), "pagecensus")?;
         }
     }
     if let Some(f) = disks.as_ref().and_then(|d| d.fb.as_ref()) {
@@ -1791,7 +1803,7 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
                 bail!("--fill-after-stop: the boot script names the pool's address (an Image without the GPU's scanout): not done for it");
             }
         }
-        text = crate::take23::apply_pick(&text, main, &crate::take23::pick_block(&cands, t23.keep_mib))?;
+        text = crate::take23::apply_pick(&text, main, &crate::take23::pick_block_with(&cands, t23.keep_mib, t23.overhead_mib.unwrap_or(crate::take23::OVERHEAD_MIB)))?;
     }
     if t23.fill_after_stop || orch.is_some() {
         let (start, after) = match &orch {
@@ -1813,7 +1825,7 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
     adb.push(script.to_str().context("path")?, &format!("{DIR}/boot.sh"))?;
     // take23: the choice of the Image runs between One UI's stop and crosvm's start; the failsafe and this tool's own wait
     // for the end are that much longer
-    let pick_extra = if t23.fill_after_stop { crate::take23::PICK_SECONDS * cands.len() as u32 } else { 0 };
+    let pick_extra = if t23.fill_after_stop { crate::take23::FILL_SECONDS + crate::take23::PICK_SECONDS * cands.len() as u32 } else { 0 };
     if o.takeover {
         // One UI's stop and start (ui.sh, sourced by boot.sh): its failsafe gives the session 5 minutes past its seconds
         let ui = Path::new(out).join("ui.sh");
@@ -1936,6 +1948,13 @@ mod tests {
         assert!(picked.contains("--mem size=$RAM ") && picked.contains(" $KIMG </dev/null >$D/crosvm.log") && picked.contains("drm2kgsl_host@$ARENA"));
         assert!(!picked.contains("--mem size=4608") && !picked.contains("need=2288") && picked.matches("19f800000").count() == 1);
         assert!(picked.contains("\n4608 2288 19f800000 kernel.img "));
+        // take24: one fill toward the largest candidate's pages, in steps (the sweep, the slabs, the compaction, the reclaim),
+        // then the choice, which presses no acquire of its own
+        assert!(picked.contains("\nKEEP=1024\nOVER=600\nMAXNEED=3568\n"));
+        assert!(at("fill_step sweep 3") < at("/sys/kernel/slab/*/shrink") && at("/sys/kernel/slab/*/shrink") < at("fill_step after-slab-shrink 3"));
+        assert!(at("fill_step after-slab-shrink 3") < at("> /proc/sys/vm/compact_memory") && at("fill_step after-compaction 3") < at("fill_step with-reclaim 2"));
+        assert!(at("fill_step with-reclaim 2") < at("$D/pagecensus 2>&1") && at("$D/pagecensus 2>&1") < at("while read cram cneed carena cfile csha"));
+        assert_eq!(picked[at("while read cram cneed carena cfile csha")..].matches("> $P/acquire").count(), 2, "only the takeover's own top-up after the choice");
         let orch = crate::take23::Orch::DEFAULT;
         let whole = crate::take23::around_wait(&picked, 3600, &format!("{}{}", crate::take23::HOSTMEM, crate::take23::orch_start(&orch)), "orch_end\n").unwrap();
         let at = |s: &str| whole.find(s).unwrap_or_else(|| panic!("{s}"));
