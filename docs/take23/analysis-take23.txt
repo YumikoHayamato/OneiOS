@@ -1,0 +1,359 @@
+take23: what take22's two sessions say, and what take23 changes. Written 2026-11-28 on the PC. NOTHING OF take23 HAS RUN ON THE PHONE.
+PROVEN = a log line, a file or a binary says it (named). INFERRED = the lines fit it, none says it. NOT TESTED = shipped, no run.
+
+SOURCES AND CLOCKS
+- take22 (first boot, cold) 03:26-03:44 local, take22b (second boot, warm) 04:47-05:04 local; local = UTC + 1 h. Both ran
+  images-newmetal/kernel-take22-ALL-4352-v54.img (sha256 ef642185..., in both .out files): the plug-in of ci/metal-upgrade
+  6b8d8b4, i.e. WITH the corrected prewarm and the screen-recording gate.
+- session/take22*/serial.txt (10 s rounds), thermal.txt (a sample every 1.29 s), perf.txt (thread tables once a minute, KGSL's
+  time in each clock, surfaceflinger's TimeStats), crosvm.log, run.txt. pace.txt is one line ("No such file"): --vsync-lock was
+  not asked, so there is no pace log; the frames' timing is the kernel's oneios-display-pace, oneios-frames, oneios-gpu-stages.
+- iOS log: oneios-tool ioslog show --boot last of data/data-take22.img and data-take22b.img (apfs-fuse fallback), wall time by
+  take19's wall.py (+-1 s; the log's own clock runs 52x slow, so order inside one second is not reliable).
+- Store files: oneios/log/*, backboardd's m2v folder (apfs-ls / apfs-copy).
+- Binaries: 24A446's dyld shared cache (take18/work/dsc), the kernel's source as built for take22
+  (/dev/shm/t19/work/out/kernel-native-take22/.../xnu-work), Droid-VM's gh_hugepage_reserve and virglrenderer sources.
+- Scripts and tables: scripts/t8.py, scripts/coreui-memclass.py, tables/.
+
+IN ONE SCREEN
+  item                               finding                                                    in take23
+  1 identity a+e                     CoreUI's class value is NOT the GiB: 3 = 4 GB, 4 = 3 GB,   loader: class from CoreUI's table;
+                                     no 5 or 7 (PROVEN, the table read from the binary)         4352-5632 MiB -> 3, 6144-7168 -> 6
+  2 new boot order                   the "2560 pages" is the module's table (insmod only); the   tool: --fill-after-stop,
+                                     top-up after the stop existed; the refusal was a check      --image-larger, hugepool load
+                                     made BEFORE the stop (PROVEN, code)                         --system-reserve-mb; 7 Images
+  3 two boot arguments               removed                                                     images.sh
+  4 recording at 120                 NOT reachable in take23: the H.264 encoder runs in          time split in the log; the cause
+                                     mediaplaybackd at 209-277 % CPU for 34 frames a second      and the road named (hardware
+                                     (PROVEN; "software": INFERRED); replayd asks 60; the        encoder); nothing faked
+                                     screen itself fell to 31-47 while recording (PROVEN)
+  5a 2048 / Bench                    the kernel's view over /Applications is the OS volume's     appreg mounts its own view
+                                     folder, taken before Data is mounted (PROVEN, source+log)   (ci/apps 94ab61c); NOT TESTED
+  5b keyboard clicks                 22 real key touches in Safari 03:34:44-50 local; no click   nothing changed; a test for the
+                                     source after (PROVEN); heard later: delay or timing, open   owner (Settings > keyboard clicks)
+  5c prewarm                         ran: 376 made + 196 already kept of 581 own records in      (kept)
+                                     30.4 s; 452 refused are a stale journal's lines (PROVEN)
+  6 menus' opening                   first openings: bursts of ~1000 small GPU blobs; the lag    no cure claimed; diag Image
+                                     that REPEATS: backboardd needs 16 ms of CPU a swap (6-7    (frame trace + allocation
+                                     scrolling), 2-3x the system calls: frames take two          counter); 0011 for the first-use
+                                     refreshes (PROVEN). What the 16 ms are: not in the logs     compiles
+  7 caches                           inventory below; one new cache layer shipped (0011)         oneios-prewarm-archive=0 opts out
+  8 heat and clocks                  our own floors hold the GPU at 1200 MHz 67 % of the time   vm-boot --orchestrator (opt-in
+                                     at 20 % busy and clamp the vCPUs to their top (PROVEN)      flag), orch.txt, hostmem.txt
+
+1. IDENTITY (groups a and e)
+PROVEN (tables/coreui-memory-classes.txt, scripts/coreui-memclass.py): CoreUI's _gThemeMemoryPerformanceClasses in 24A446's
+shared cache, 0x1e1555ca0, entries {value, constant, name}:
+   0 kCoreThemeMemoryClassLow 512MB | 1 1GB | 2 2GB | 3 4GB | 4 3GB | 6 6GB | 8 8GB | 9 9GB | 12 12GB | 16 16GB | 15 1.5GB
+The value is an enumeration, not a size: 3 is the 4 GB class and 4 the 3 GB one; 5, 7, 10, 11, 13, 14 do not exist.
+What is PROVEN here is the table. That the device tree's number IS this enumeration's value rests on take19's reading of
+the path (identity-evidence.txt, item 6: ArtworkTraits -> DevicePerformanceMemoryClass, a number -> CoreUI
+__deviceMemoryClass, integerValue, absent = 0 = Low; no other reader), not re-read now; Apple's own tree agrees with it
+(12 on the 12 GB iPhone18,2). If CoreUI mapped the number some other way, only the Images of 5632 MiB and less would be
+off (they write 3 where take19 wrote 4); 6144 and more write 6 either way.
+So take19's formula (whole GiB of the VM's RAM) was wrong three ways: 4352/4608 MiB wrote 4 = CoreUI's 3 GB class, 5 GiB
+would write 5 and 7 GiB 7, which CoreUI does not hold (what it does with an unknown value: NOT VERIFIED).
+take23's formula (runtime/loader, xl_machine_memory_class_of): the largest class whose size the VM's RAM holds, at most Apple's:
+   RAM MiB   1024  1536  2048  3072  4096-6143  6144-8191  8192
+   value        1    15     2     4          3          6     8
+The owner's sizes: 4352, 4608, 5120, 5632 -> 3 ("4GB"); 6144, 6656, 7168 -> 6 ("6GB"). There is no 5 GB class: a 5 GiB VM is
+CoreUI's 4 GB class. What the class changes: asset catalogs' memory-class renditions (INFERRED, as in take19).
+Group a as the owner chose it: new loader options --identity-omit NAMES and --display-gamut sRGB|P3.
+PROVEN on the PC (tables/identity-adt-diff-take22-4608-vs-take23-5120.txt): against take22's tree the new one adds exactly
+device-perf-memory-class 0x3, artwork-dynamic-displaymode "0", artwork-device-idiom "phone", artwork-device-subtype 0xb34
+(2868), artwork-display-gamut "sRGB"; no graphics-featureset key; everything else that differs is the RAM's size and the
+addresses that follow it. Loader tests: 942 + 494 checks pass.
+RISK kept from take19's evidence: artwork-device-subtype 2868 selects the safe-area row of a 440x956 pt panel (top inset 62,
+bottom 34) on our 360x780 pt screen: the status bar and the home bar may sit lower/higher than now. The -plain Image is the way back.
+
+2. THE NEW BOOT ORDER
+What the code and the logs say (PROVEN):
+- "2560 pages": gh_hugepage_reserve.c gh_init: pool_size_max = (RAM - min(RAM/2, system_reserve_mb)) / 2 MiB, system_reserve_mb
+  6144 by default and settable only at insmod (0400). With the S25 Ultra's MemTotal (11,084 MiB) the table holds about 2770
+  pages (5.4 GiB); no pool_want gets past it. oneios-tool's insmod line never passed the parameter, and its --want stopped at 3072.
+- The top-up after the stop is NOT new: vm-boot --takeover has topped the pool up after One UI's stop since take18
+  (takeover_script: "pool: N pages free, M wanted: topped up while One UI is down"). What refused larger Images was
+  vmprobe::check_mem BEFORE the stop: VM + 1024 MiB against MemAvailable + pool, with One UI still up (1.4-2.3 GiB available),
+  and its MAX_MEM of 6144. The loader refused RAM above 6144 MiB too.
+- What is there after the stop (run.txt, 6 sessions take19-take22b): MemAvailable 3970-4767 MiB BESIDE a pool that already
+  held the VM (2160 pages for 4352 MiB; with a pool grown to 2560 pages, 400 pages = 800 MiB sat unused in it).
+  So about 9.1-9.8 GiB are to share between the VM and Android once One UI is down.
+- What Android needs while the VM runs: NOT MEASURED in any session (no file logs host memory after the start). The GPU's
+  blobs are guest pages (shared RAM, drm-host-mb=8), so the host side is crosvm, the renderer and the kernel: INFERRED small.
+take23 (oneios-tool, crates/oneios-phone/src/take23.rs; 103 unit tests pass, the same 1 tmpfs failure as before):
+- hugepool load --system-reserve-mb N (2048-6144): the module's table. 3072 gives about 4000 pages (8 GiB). --want up to 4096.
+- vm-boot --fill-after-stop: the memory rule is asked on the phone AFTER the stop and the cache drop (run.txt `pick:` lines).
+- vm-boot --image-larger FILE (repeatable): the candidates are pushed as kernel-RAM.img; the largest is taken for which
+  (a) the module's table holds its pages, (b) MemAvailable - 2 MiB x (pages the pool still lacks) - 32 >= --host-keep-mib
+  (1024), (c) the file's SHA-256 is the pushed one, (d) the pool's pages come within 120 s (acquire mode 3; the module took
+  1536 pages in 20 s and 1961 in 31 s in earlier grows: docs/native.md). pool_size_max and system_reserve_mb are parameters
+  of the .ko the owner loads (strings of out/android15-6.6.ko); an unreadable pool_size_max skips (a). A candidate that
+  fails gives way to the next; none: the session ends before crosvm starts and One UI comes back (the existing trap).
+  The takeover's failsafe and the PC's wait are 200 s longer for each candidate (the choice runs before crosvm starts).
+  Pages the pool holds beyond the chosen Image's go back to Android (a lower pool_want makes the module shrink).
+- The script's four RAM-bound values (pool pages, crosvm --mem, the GPU arena's address, the kernel file) are read from the
+  choice; the tool refuses to boot when it does not find each of them in the script it made (no half-changed script).
+- hostmem.txt: MemAvailable, MemFree, pool pages, crosvm's VmRSS every 5 s (the missing measurement).
+- The loader takes --ram-mib up to 8192 (crosvm places its PCI window after the RAM: take22b's fdt has it at 0x190800000 for
+  4352 MiB; nothing of the layout is at a fixed address above the RAM).
+Checked on the PC: the choice's shell run under dash against a fake pool in five situations (pool full, table too small,
+pages not coming, nothing fits): it picks, falls back and refuses as written. NOT TESTED on the phone; no Image above 4608 MiB
+has ever booted (the QEMU bench stops at 3072 MiB). Expected from the numbers above: 7168 MiB leaves Android about 1.9 GiB;
+8192 would leave under 1 GiB and is not built.
+No flashing, no partition, nothing outside /data/local/tmp and the module's own sysfs files is written.
+
+3. BOOT ARGUMENTS
+memorystatus_pressure_threshold_mb=600 and memorystatus_reaper_minimum_age_apps_seconds=1800 are out of every take23 Image
+(take22's oneios-disable-jobs stays). take22: the Safari page went grey with the 600 line all the same (the owner), so
+take21's cause 1 was not the whole cause; not looked at further (the owner left Safari out of this take).
+
+4. SCREEN RECORDING AT 120: WHERE THE FRAMES GO (not reachable in take23; each line says how sure)
+take22, the second recording (02:31:02-02:31:27 UTC, IMG_0007.MP4):
+- the file: 863 frames in 25.5 s = 33.8 a second; the gaps between frames in 120 Hz ticks: 2 (268), 3 (303), 4 (136), 5+
+  (155), never 1: no two frames are closer than 16.7 ms (tables/IMG_0007.MP4.pts). IMG_0006: 28.8 a second, a gap of 783 ms.
+- replayd: "fvdp_initFromOptions: setting framerate to 60 fps", "fvdp_encoderControlSetFramerate: new framerate: 60 fps",
+  "usage mode: 'Uncompressed' ... pixel format: '420f', bitrate: 8000000"; at the end "received: 865 source frames, 868
+  writeback requests"; stats "Submits 36 | Encodes 36 | EncDrops 0". So ReplayKit itself asks 60, and backboardd made only
+  34 writeback requests a second.
+- why only 34: the screen itself fell to 31.2 and 47.3 swaps a second in those rounds (oneios-display-pace; 104 the round
+  before), with mediaplaybackd at 209 % and 277 % of a CPU and backboardd at 106-109 % (oneios-cpu, all 530 of 600 %).
+  mediaplaybackd is the encoder (PROVEN: its log, 02:31:0x, "VTCompressionSessionCreateWithOptions: ... new compression
+  session (primary-session): codec avc1" and "FigAssetWriter ... Create FigMediaProcessor for video compression"; the kernel's
+  oneios-video line counts its surface locks at 20-50 a second, the recorded rate). That it is a SOFTWARE encoder is
+  INFERRED: no line names it; this guest has no AppleAVE driver (none in the serial log) and the process burns 2-3 CPUs
+  exactly while it encodes. The file is H.264 High 4.2 at 8.5 Mb/s: about 2.4 CPUs for 34 frames = ~70 ms of CPU a frame.
+  At that cost 120 frames a second would take ~8.5 CPUs of the VM's 6; 60 would take 4.2 and leave the screen nothing.
+- the copy (our CPU scaler): "1200 copies ... average 12864 us, failed 0", synchronous on Core Animation's render thread
+  (ScreenRecord.inc transformSurface; "events 0/0": no shared event is passed, so none of it is an event wait). At 34 a
+  second that is 44 % of the render thread; it alone would cap the screen near 80 a second while recording.
+- Why Core Animation's own GPU copy fails ("926 of 927", take18, before the scaler existed): NOT DETERMINED. With
+  oneios-screenrec=1 the scaler takes every copy, so take22's logs never reach that path, and take18's said only "failed to
+  copy main layer". One fact for whoever looks: the 555b13d plug-in does import 4:2:0 surfaces as textures (take22b:
+  "surface texture 256x144 format 500 over a 420v surface"), which the take18 plug-in did not. It is not the limit either
+  way: with the encoder at 2.4 CPUs for 34 frames a second no scaler, GPU or CPU, gets the file past ~35.
+What reaches 120 (not in take23, a project): the hardware encoder. iOS 27's VideoToolbox has a paravirtualized encoder
+(ParavirtualizedVideoEncoder_*), Droid-VM's crosvm has --virtio-media kind=encoder (AMediaCodec), our kernel's codec archive
+is the decoder's guest half only and has never run on the phone (xnuloader-crosvm --media, vm-boot --video-decoder). Order:
+(1) one session with the decoder Image, (2) the encoder's guest side, (3) ReplayKit's 60 asked up to 120 (replayd), (4) the copy
+off the render thread or on the GPU.
+take23 changes only the log (ScreenRecord.inc): "...; of the average: waits W us, locks L us, copy C us; this recording: K
+copies in T ms (R a second)", so the next recording says where the 12 ms are. No behaviour changed: the recording works.
+
+5. THREE INVESTIGATIONS
+(a) 2048 and OneiOS Bench still nowhere. PROVEN.
+  appreg.log (store, oneios/log), take22 03:27 and take22b 04:49 local: "staged /private/var/staged_system_apps/OneiOS2048.app
+  (copied)" then "(kept)": the copies are in the Data volume. "apps-url: /Applications/OneiOS2048.app is not visible (the view of
+  the staged apps is off?): skipped". "rebuild: registered=1 installed=0" (lsd: "Rebuilding LS database" 03:49:04, "SUCCESS
+  Finished" 03:49:32: 28 s of lsd at each boot; 51 s in take22's), "url: registered=0" (lsd: "no install info, bundle at ...
+  will not be registered"). oneios-init.log: appreg started and "ended, status 2" at each of the three boots.
+  Cause: kern_exec.c native_owner_data_prepare calls native_staged_apps_union with the comment "still the OS volume's
+  /private/var", BEFORE it mounts the Data volume there: the bindfs union over /Applications shows the OS volume's
+  /private/var/staged_system_apps (Apple's 52 apps), and never the Data volume's folder of the same name. take22's fix copied
+  into a folder nothing shows.
+  Not done: showing the Data volume's folder instead. It holds full copies of Apple's 52 apps too (apfs-ls): a union with it
+  on top would run them from the Data volume, not the sealed one (launch constraints: INFERRED risk).
+  Fix (ci/apps 94ab61c, CI run 46109381734 green, macho-check PASS, CDHash ccdfa36a1a74bb713a5933001599980c837eb1ec): appreg
+  copies the bundles into /private/var/oneios/appsview (ours only) and mounts THAT over /Applications itself (bindfs, read
+  only, union; entitlement com.apple.private.bindfs-allow, which bind_vfsops.c asks for), then registers. A name not in it
+  falls through to what /Applications was. Self-check after the mount (entry counts by readdir and by NSFileManager, Settings,
+  Weather, Camera, ours): if anything is off it unmounts at once. The rebuild way is asked only when the bundle is visible
+  (no more 28-51 s of lsd for nothing). env=ONEIOS_APPREG_VIEW=0 in appreg.conf turns the view off.
+  One good sign: lsd did honour appreg's rebuild entitlement in take22 ("Rebuilding LS database" at its call), so the
+  entitlements of our trust-listed ad hoc binaries are read; bindfs's check reads the same signature (INFERRED).
+  NOT TESTED: whether the kernel honours the entitlement for our ad hoc binary, whether a second union over /Applications
+  lists both layers, and whether lsd then registers: appreg.log's `view:` line says the first two, its apps-url/rebuild lines
+  the third. It is a userland-only change; the kernel is take22's.
+(b) keyboard clicks "at 03:36 while scrolling Safari". PROVEN: the only click source is real typing two minutes earlier.
+  iOS log, take22: MobileSafari's _UIKBFeedbackGenerator made its engine at 02:34:42.6 UTC ("haptics+audio mode", custom audio
+  events = the click samples); 02:34:44.2-02:34:50.7: 22 "sending event array" with "KeyboardTouch touch down", "Keyboard adds a
+  string", "Keyboard inserts text" (the owner typing the search); "Engine stopped", "Releasing engine" at 02:34:5x. Between
+  02:34:51 and 02:40:00 no process sends a keyboard feedback event; the only other audio feedback is SpringBoard's
+  SystemSoundsAndHaptics session that stops at 02:35:55.
+  Not separable from these logs: (1) the owner's "03:36" is the typing at 03:34:44 heard as scrolling began, or (2) the 22
+  clicks came out late. For (2) there is no evidence: DroidVMAudio reports "0 late" periods and "0 dropped (host behind)";
+  crosvm.log has one "playback stream resumed after 5 ms with nothing queued"; audiomxd logged Audio IO overloads at
+  02:34:5x (7), 02:35:2x, 02:35:5x, 02:36:2x, 02:37:2x (a glitch each, a pop, not a click sample).
+  Test for the owner: Settings > Sounds & Haptics > Keyboard Feedback > Sound off, then the same scroll. Gone: it was the
+  keyboard's own sound (late or not). Still there: it is the glitch (overloads), another item.
+(c) the corrected prewarm ran. PROVEN.
+  take22b, backboardd 03:49:59.4 UTC: "native-metal: prewarm: 376 of 1092 descriptors made in 30417 ms (452 refused, 196
+  already kept)". prewarm2.log (store) holds 581 records in the new form (function by its source name); 376 + 196 = 572 of
+  them were made or already made by the boot itself. The 452 refused are the lines of an old pipelines.log (a journal of a
+  log-gpu boot, 586 R lines in the take21 nickname form) that the pass also reads; they cost a lookup each, nothing else.
+  The pass stopped at its limit of 1024 lines (376 + 452 + 196), after its own 581: nothing of ours was cut.
+  take22 (the first boot of that plug-in): "51 of 586 descriptors made (512 refused, 23 already kept)": the list was still the
+  old journal's; it recorded 581 real ones during the session, and take22b used them.
+  The pass began 20 s after the first pipeline and took 30 s: it ended 76 s after the boot, 25 s into the owner's use.
+
+6. THE "..." MENUS AND THE SHARE SHEET: THE RENDER SERVER'S CPU, NOT THE GPU AND NOT THE CACHE
+Window: take22b 03:57:11-03:58:11 UTC (04:57-04:58 local, Notes), rounds 52-57. tables/menus-rounds-take22b.txt:
+  round UTC       (what: INFERRED from the      swaps  2+ refreshes  backboardd  CPU ms   unix calls  context     GPU us    blobs
+                  processes in the round)              apart         CPU %       a swap   a swap      switches    a frame   made
+   22  03:52:18   scroll                          717      7 %          45         6.3      142          65       3322        28
+   45  03:56:10   use (Photos)                    789      5 %          55         7.0      139          68       2296       334
+   52  03:57:21   Notes opens after a pause       754      8 %          88        11.7      288         140       3164      1277
+   53  03:57:31   Notes' menus, first times      1083      7 %         115        10.6      244         117       2497       970
+   54  03:57:41   Share sheet, first time        1037      4 %          76         7.3      162          82       2751       889
+   56  03:58:01   menus / Share, repeated         675     25 %         109        16.1      392         187       3339       172
+   57  03:58:11   menus / Share, repeated         434     48 %          71        16.4      285         139       2948        87
+PROVEN, two different things:
+(1) The first openings (rounds 52-54): GPU blobs. backboardd made 1277, 970 and 889 in 10 s (28 when scrolling), nearly all
+    under 64 KiB (oneios-gpu-ages: 1246 of round 52's; 597 under 16 KiB), and oneios-gpu-legs: "blobs made +1277 in <.5/<1/<2/
+    <4/<8/<16/<33 ms +962/+127/+83/+43/+21/+29/+4 longer +8": 62 creations of 8 ms or more. Round 51, 50 s of still screen
+    before: "closed +760 (deferred +690)" = our idle trim of Turnip's freed-BO cache (mesa 0001): the first burst after a
+    pause allocates everything again. These rounds still swap on time (4-8 % late).
+(2) The lag that repeats (rounds 56-57, the owner's "always, even after many repeats"): the render server's CPU.
+    backboardd spends 16 ms of CPU for each swap, against 6-7 ms when scrolling; the budget of a refresh is 8.33 ms, so a
+    frame takes two: 25 % and 48 % of the swaps came two or more refreshes after the one before (5-7 % when scrolling).
+    Per swap it makes 285-392 unix system calls (139-142 when scrolling) and 139-187 context switches (65-68).
+    It is NOT: blobs (172 and 87 in those rounds; the oneios-hitch lines at the openings say "blobs +0", +0, +4, +20);
+    the GPU (2.9-3.3 ms a frame, as when scrolling; 22 frames of 16-32 ms in round 56); pipeline compiles (the kept states;
+    no "kept states"/refusal line in the window); the fence polling (4.0-5.1 waits and 40-55 looks a swap, as when scrolling);
+    mach traps (42-43 a swap, fewer than scrolling's 66-88).
+    backboardd at 109 % means one thread at its limit and a little of others: the frames are single-thread bound in the
+    render server while a menu's materials are on screen.
+NOT in the logs: what the 16 ms and the 250 extra system calls a swap are (which calls; how many render passes a menu
+frame has; whether it is the frontend's encode thread handing commands over). The kernel counts calls, not their kind;
+the plug-in logged nothing per frame.
+The Share sheet adds its own, iOS's: SharingUIService (a remote view), sharingd 113 log lines, rapportd, wifip2pd,
+mDNSResponder in the same second at each opening (discovery).
+take23:
+- No cure is claimed for (2). Its cause is one level deeper than these logs go.
+- The diagnostic Image (-diag: log-gpu=1 diag=1 oneios-res-log=1): the frontend's frame trace and pipeline journal (diag,
+  log-gpu) and 0011's allocation counter; with the protocol of the README (10 openings, 3 s apart, nothing else) it gives the
+  passes and allocations of a menu frame against a scroll frame.
+- For (1): NativeMetal 0011 part 1 (below, section 7) removes first-use compiles of the pipelines Core Animation lists at
+  the boot; the blob bursts after a pause are the idle trim (A/B: oneios-bo-cache-idle=0, an existing switch; no Image built).
+- The clocks matter here: a frame that is CPU-bound on one thread wants that thread's core at its top. The orchestrator
+  (section 8) raises the clamp again when a round's swaps slip under 85 % on time (round 56: 75 %, round 57: 52 %), but a
+  single opening inside a good round may be slower with it than without. The README tells the owner to compare.
+- Seen on the way, NOT done (a loader change with a scheduler risk): the VM's vCPUs 4 and 5 are pinned to the phone's two
+  prime cores (4.47 GHz against 3.53), but the device tree gives XNU six equal "P" CPUs, so the render thread lands on a
+  small-cluster vCPU as often as not. Telling XNU which two are faster is the first thing to try for (2) after the diag run.
+
+7. CACHES: WHAT EXISTS, WHAT WAS ADDED, WHAT COULD BE
+Today (PROVEN, take21's section 9 and take22b):
+- the translator's disk cache, per process: <Caches>/<process>/m2v/v1 (backboardd: 2460 entries / 16.5 MiB written in take21,
+  476 read again and 331 new in take21b). Persists; read at use.
+- the base's warm pass: pipeline-records-<process>.bin (backboardd's 1.5 MB), remade in the background at each start; it
+  warms the translator, it does not hand Core Animation a ready state.
+- OneiOS 0009 (oneios-prewarm=1): kept render pipeline states + prewarm2.log + the boot pass: 572 of 581 ready in take22b (5c).
+- the prime list (--prime-list, prime.log): QuartzCore's default.metallib: "kernels=54 renders=39 made=60 ... refused=33
+  ... ms=17174"; CoreImage.metallib "made=0 refused=75".
+- per process only: backboardd's sandbox denies org.unixnu.metal (take21 section 8); a process without that rule
+  (Settings) does use the shared folder.
+- dead weight: ~1.2 GiB (58,798 files) of three older plug-in builds' entries in backboardd's folder: disk, not RAM.
+Added in take23 (safe, with a switch): 0011's archive asks = Core Animation's own list of the system's pipelines compiled
+before they are drawn, including never-seen ones; recorded in prewarm2.log, so the next boot's pass has them too.
+The Images carry oneios-prewarm-max=2048 (1024 before): take22b already kept about 600 states and how many the archive
+asks add is not known yet; the line's "N not queued" says if the limit binds.
+The memory of the extra kept states is not measured (a state is the driver's pipeline object, which exists anyway once used).
+Could be cached, NOT done (each with its reason):
+- every possible Core Animation pipeline: they are combinations of constants made at run time; the archive asks are the
+  list iOS itself gives. If orch/diag logs show asks that are never answered, the next step is the limit oneios-prewarm-max
+  (1024 states; the line "N not queued (the 1024 kept states' limit)" says when it binds).
+- pipeline packs (NativeAdrenoMetal.m2vpack importer, unwired): a pack made on one phone and shipped in the addon would warm
+  a FRESH Data store; the owner's store is already warm, so it gains nothing for him now. Wiring it = plug-in work + a pack
+  format tied to the driver build; not safe to ship blind.
+- the shared folder for backboardd: needs a sandbox exception in the kernel (a kernel build); gain: a pipeline compiled by
+  one process is not compiled by the next. Not in take23 (the kernel is take22's).
+- Core Image kernels (iconservicesagent: "binary archive refused ... InvalidFile" 15 times in take22b; killed at its 15 MiB
+  limit in take21): its archives are Apple GPU binaries, unusable here; the kernels compile from source in each short-lived
+  process. A cache needs the client cache (0008) to be reachable by that process's sandbox: same blocker as the line above.
+- the 1.2 GiB of dead entries: a cleanup deletes the owner's files in the store; not done without his word. One line in the
+  README says how to do it by hand when he wants.
+
+8. HEAT AND CLOCKS (take22b; tables/t8-take22b.txt, scripts/t8.py; take22's numbers in tables/t8-take22.txt agree)
+Sensors (757 samples): CPU sensors max 104.3 / 106.5 C, mean 79.4 / 77.6; GPU 99.2 max; board 57.6; battery 44.1.
+A CPU sensor at 100 C or more in 21.5 % of the samples, 103 C or more in 15.7 %.
+8.1 Who holds the clocks high (PROVEN)
+- The GPU: KGSL's own time in each clock over the session (perf.txt, trans_stat end - start, 981 s): 1200 MHz 66.8 %,
+  222 MHz 12.8 %, 607 MHz 9.2 % (the touch boost's floor), 160 MHz 5 %, 1100 MHz 5 %. Its load in the samples at 967-1200 MHz
+  (510): mean 19.9 % busy, median 20, p90 38; over 55 % busy in 2.4 % of them.
+  Why 1200: not the governor. take18's renderer keeps, by design, backboardd's GPU context at "the highest level" (KGSL
+  power constraint) whenever it submits 60 times a second or more, and raises the six vCPU threads' uclamp.min to 1024
+  (drm2kgsl_renderer.c kgsl_constraint_update / kgsl_vcpu_animating; crosvm.log: "context 12: power constraint at the highest
+  level", "vCPU uclamp.min 1024: 6 of 6 threads (ok)"). vm-boot's default --gpu-host-floors deadline keeps both.
+  They were put there in take18/19 against stutter (the governor reads a guest compositor's short bursts as idle).
+- The CPUs: in the 62 "use" rounds (guest 148 % of 600) the small cluster's sampled clock is 2.3-3.0 GHz in 67 % of the
+  samples and 3.0-3.53 in 14 %; the prime cluster 3.0-4.47 GHz in 40 %. In the 14 heavy rounds (>= 300 %): 3.0-3.53 in 92 %,
+  4.0-4.47 in 73 %, the sensors at 100 C. Idle rounds (still screen, 11 %): 1.89 / 1.06 GHz, 60.5 C.
+8.2 How much above what the frames need
+- GPU frames (59,109; guest submit to host done, at the clocks above): under 4 ms 86 %, 4-8 ms 11.5 %, over the 8.33 ms
+  budget 2.6 %. Scaling each 967-1200 MHz sample's load to a lower clock (worst case: all of a frame's time scales with the
+  clock, which the host's CPU part does not): at 607 MHz the same work would be over 100 % busy in 3.7 % of those samples and
+  over 70 % in 12.2 %; at 734 MHz 2.0 % / 5.7 %; at 832 MHz 2.0 % / 4.1 %; at 967 MHz 0.2 % / 2.2 %.
+  So for ~96 % of the time the GPU spends at its top clock, 607 MHz would do the same frames inside the budget.
+- CPUs, the host's view (perf.txt thread tables, a minute each; clock = mean of the samples; need = clock x busiest vCPU
+  thread / 0.80): time-weighted the small cluster ran at 2.64 GHz where the busiest thread's minute needed 1.52; the prime
+  cluster at 2.47 where 1.03 was needed. Minute means hide bursts: this is a floor of the waste's estimate, not a clock to set.
+- Which clocks are high while the frames already meet 120 Hz: the 28 moving rounds with 95 % or more of their swaps on time
+  ran the GPU at 967-1200 MHz in 82 % of their samples (21 % busy), the prime cluster at 3.0 GHz or more in 49 %, the small
+  one at 2.71 GHz on average; the 43 other moving rounds: 80 %, 50 %, 2.80 GHz. The clocks are the same whether the frames
+  come or not: they follow "the compositor animates" (the floors), not the frames.
+- Swaps while moving (71 rounds): one refresh apart or less 91.2 %, two 6.3 %, more 2.6 %; surfaceflinger's own
+  present-to-present: 8 ms 47,862, 16 ms 2,706, 24 ms 717. The misses are not where the clocks are low: the heavy rounds run
+  every clock at its top and miss most (CPU-bound: the encoder, app launches).
+8.3 Idle against busy; the polling
+- Still screen: 10 swaps a second (the poster/clock), each 7.7-8.0 ms of GPU at 222 MHz, backboardd 8-9 % of a CPU, the
+  whole guest 11-21 % of 600; the vCPU threads 0-3 % each on the host. Idle is cheap.
+- Busy: the host's vCPU threads run more than the guest accounts: e.g. 03:52:06-03:53:07 the guest used 79 % of a CPU, the
+  six vCPU threads 169 %; 03:57:10-03:58:10: 114 % against 196 %. The gap (45-90 % of a CPU) is the halt poll (up to 200 us
+  a wake-up, gunyah_halt_poll) plus guest time the per-process table does not hold (interrupts, idle exits): NOT separable
+  from these logs (the module's parameters and the threads' user/system split are not logged).
+- The GPU fence polling inside the guest: oneios-gpu-waits: 27,209 "looks" a round on average (92,710 at most), 8.4 looks a
+  wait, spin 300 us, interrupts 0 ("intid 0 (off)"). backboardd's oneios-cpu-why in a menu round: 264,695 "u" and 126,055
+  "x" events in 10 s for 675 frames. The -gpuirq Image (the GPU's interrupt instead of the looks) is the A/B for this share;
+  it has never run. Its expected gain: the CPU the render server and v_gpu (3-7 % of a host CPU) spend looking.
+8.4 Power, and the charger
+- The battery's current against the guest's CPU, per round: power out of the battery = -1.56 W + 0.025 W x CPU% (of 600),
+  r2 0.77, n 90: about 2.5 W for each fully busy vCPU. Idle rounds: 2.5 W INTO the battery; 150-300 %: 4.95 W out; >= 300 %:
+  8.0 W out (11.7 at most), with the charger connected the whole session (usb online 1 in 757 of 757 samples).
+- "usb online 1" is most likely the adb cable to the PC, which vm-boot needs: a PC port gives 2.5-4.5 W (0.5-0.9 A at 5 V).
+  That fits the idle rounds (2.5 W into the battery with the screen on). So the "charger" here is a small one: under load
+  the phone drew 8 W MORE than it gave. INFERRED, not read: the port's own current is not readable on this phone (usb
+  current/voltage: no file).
+- What the logs cannot separate: the SoC's absolute power and the share of the heat that is the charge (battery 44.1 C,
+  board 57.6 C). If Samsung cuts the charge when hot, the 0.025 W per % above is too high by that much. Ten minutes with
+  the cable out give both: the battery's current is then the whole system's power. The session survives that: boot.sh
+  runs on the phone, detached; the PC's loop ignores failed adb calls until its time is up; the cable must be back
+  before the stop so that the files can be pulled. scripts/t8.py prints the battery's power per value of the usb column.
+8.5 The compromise shipped: vm-boot --orchestrator (take23.rs ORCH; opt-in by flag = the opt-out is to leave it out)
+- GPU: the cap (Samsung's gpu_max_clock, the file the takeover already lifts; the renderer's "highest level" is then that
+  cap) starts at 607 MHz and follows the GPU's load 4 times a second: a step up at 55 % busy (two at 70 %), a step down
+  after 2 s at 30 % or less; steps 607/660/734/832/900/967/1050/1100/1200. The clocks under the cap stay the governor's
+  and the touch boost's.
+- vCPUs: the clamp the renderer gives the vCPU threads at each animation (its own file, /data/local/tmp/drm2kgsl-vcpu-uclamp)
+  starts at 1024 and follows the GUEST's frames: every 10 s the kernel's oneios-display-pace line (swaps on time while
+  moving); 92 % or more on time: a step (128) down, to 512 at the least; under 85 %: two steps up and the GPU's cap to its top
+  for 10 s. Between: kept. So it finds the lowest clamp that keeps the frames, and gives back at once when they slip.
+- Heat: a CPU sensor at 98 C: the clamp and the cap go a step down every 2 s whatever the frames say.
+- Numbers changeable per run: --orchestrator-set gpu-floor=, gpu-up=, gpu-down=, gpu-hold=, clamp-floor=, clamp-step=,
+  good=, bad=, hot=.
+- At the end the cap is the lifted one and the clamp file is gone; caps_restore puts Samsung's cap back as before.
+Checked on the PC: the loop run under dash against fake sysfs files (steps up at 60/80 %, down after 8 looks, a good and a
+bad round, a hot sensor, the end). NOT TESTED on the phone. Not claimed: a number of degrees. The GPU's rail power is not
+in any log; the estimate above is time at clocks, not watts.
+8.6 What to collect to confirm it (two sessions of the same 10 minutes, same Image, the second with --orchestrator)
+- thermal.txt (as now) -> scripts/t8.py: the share of the session at 1200 MHz (66.8 % now), the clusters' clocks per class,
+  the sensors' mean and the share at 100 C or more (21.5 % now), the battery's W per CPU% (0.025 now).
+- serial.txt -> swaps on time while moving (91.2 % now), frames over the GPU budget (2.6 % now).
+- orch.txt: the cap's and the clamp's path, each change with its reason.
+- If the owner agrees: the same 10 minutes once more OFF the charger (8.4).
+- Third, separate: the -gpuirq Image for the polling share (8.3).
+
+WHAT IS BUILT, AND FROM WHAT (details: ../README.txt, "COSA C'E' DENTRO")
+- kernel: take22's kernel.kc, unchanged. Loader, tool, recipes: branch take23. Ten Images, take23/images (SHA256SUMS).
+- plug-in: CI run 46112727401 on ci/metal-upgrade 72dc37c, green: 13 OneiOS patches (0011 among them) + ScreenRecord.inc;
+  the binary holds "archive asks", "native-metal: res:", "this recording". The first run (46109240136, d80d019) failed at the
+  frontend's compile: three -Werror,-Wvexing-parse on `bool oneiosResOn();` declared inside methods (my code); fixed with
+  `(void)` and checked here before the second push with clang -Werror against stand-in declarations.
+- apps: CI run 46109381734 on ci/apps 94ab61c, green; oneios-appreg CDHash ccdfa36a..., macho-check PASS; 2048 and Bench
+  byte-identical to take22's.
+- Checked in each Image: the whole addon at 0x8414000, the five CDHashes in its bytes, no memorystatus argument; against
+  take22's 4608 Image the boot arguments lose the two memorystatus ones and gain oneios-prewarm-max=2048; the device tree
+  gains the five identity properties and nothing else (tables/identity-adt-diff-take22-4608-vs-take23-4608.txt); -plain's
+  tree is take22's.
+- The tool without the new options writes take22b's boot.sh line for line but for the list of files removed at its start
+  (compared with the session's own boot.sh).
+
