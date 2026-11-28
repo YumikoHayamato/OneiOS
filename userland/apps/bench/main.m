@@ -1735,6 +1735,7 @@ static double pct_of(double *v, int n, double p) {
     tv.contentOffset = CGPointMake(0, y);
   };
   t.finish = ^NSString *(Bench *b) {
+    g_listImages = nil;  // 64 images of 240x240: about 15 MiB that stayed in the footprint after the first run
     return @"UITableView 3000 rows, image + 2 labels + shadowed badge each, 2400 pt/s";
   };
   [a addObject:t];
