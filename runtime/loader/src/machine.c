@@ -84,6 +84,89 @@ static bool product_dropped(const char *name)
   return false;
 }
 
+// The identity groups (machine.h identity_groups): their names, by the bit's number, and below the /product properties each takes
+// (the artwork group's are every artwork-* but the two the machine sets itself, display_gamut's and display_scale's).
+static const char *const group_names[XL_IDENTITY_GROUPS] = { "artwork", "quality", "workgroup", "ids", "memclass", "root" };
+
+unsigned xl_identity_group_of(const char *name)
+{
+  static const struct { const char *name; unsigned group; } named[] = {
+    { "graphics-featureset-class", XL_IDENTITY_ARTWORK }, { "graphics-featureset-fallbacks", XL_IDENTITY_ARTWORK },
+    { "ui-background-quality", XL_IDENTITY_QUALITY }, { "ui-weather-quality", XL_IDENTITY_QUALITY },
+    { "display-workgroup-interval", XL_IDENTITY_WORKGROUP }, { "hid-workgroup-interval", XL_IDENTITY_WORKGROUP },
+    { "udid-version", XL_IDENTITY_IDS }, { "product-description", XL_IDENTITY_IDS }, { "public-key-accelerator", XL_IDENTITY_IDS },
+    { "device-perf-memory-class", XL_IDENTITY_MEMCLASS },
+  };
+  if (!strncmp(name, "artwork-", 8)) return strcmp(name, "artwork-display-gamut") && strcmp(name, "artwork-scale-factor") ? XL_IDENTITY_ARTWORK : 0;
+  for (unsigned i = 0; i < sizeof named / sizeof *named; i++)
+    if (!strcmp(name, named[i].name)) return named[i].group;
+  return 0;
+}
+
+const char *xl_identity_group_name(unsigned group)
+{
+  for (unsigned i = 0; i < XL_IDENTITY_GROUPS; i++)
+    if (group == 1u << i) return group_names[i];
+  return NULL;
+}
+
+bool xl_identity_groups_parse(const char *list, unsigned *groups, char *bad, size_t size)
+{
+  unsigned mask = 0;
+  if (bad && size) bad[0] = 0;
+  if (!list) return false;
+  for (const char *word = list; ; ) {
+    const char *comma = strchr(word, ',');
+    const size_t n = comma ? (size_t)(comma - word) : strlen(word);
+    unsigned bit = n == 3 && !memcmp(word, "all", 3) ? XL_IDENTITY_ALL : 0;
+    for (unsigned i = 0; !bit && i < XL_IDENTITY_GROUPS; i++)
+      if ((n == strlen(group_names[i]) && !memcmp(word, group_names[i], n)) || (n == 1 && word[0] == (char)('a' + i))) bit = 1u << i;
+    if (!bit) {
+      if (bad && size) {
+        const size_t k = n < size - 1 ? n : size - 1;
+        memcpy(bad, word, k);
+        bad[k] = 0;
+      }
+      return false;
+    }
+    mask |= bit;
+    if (!comma) break;
+    word = comma + 1;
+  }
+  *groups = mask;
+  return true;
+}
+
+// device-perf-memory-class is an integer of 1, 2, 4 or 8 bytes (little-endian: Apple's tree has 4: 0xc).
+static bool integer_width(uint32_t length) { return length == 1 || length == 2 || length == 4 || length == 8; }
+
+static uint64_t integer_value(const xl_adt_prop *p)
+{
+  uint64_t v = 0;
+  for (uint32_t i = p->length; i--; ) v = v << 8 | p->value[i];
+  return v;
+}
+
+// The most a VM's class can be: Apple's own where it is a usable one (1 to 65535), else 16.
+static uint32_t class_max(const xl_adt_prop *apple)
+{
+  const uint64_t v = apple && integer_width(apple->length) ? integer_value(apple) : 0;
+  return v >= 1 && v <= 0xffff ? (uint32_t)v : 16;
+}
+
+uint32_t xl_machine_memory_class_max(const xl_adt_node *identity)
+{
+  const xl_adt_node *product = identity ? xl_adt_child(identity, "product") : NULL;
+  return class_max(product ? xl_adt_get(product, "device-perf-memory-class") : NULL);
+}
+
+static void set_integer(xl_adt_node *node, const char *name, uint32_t width, uint64_t value)
+{
+  uint8_t bytes[8];
+  for (uint32_t i = 0; i < width; i++) bytes[i] = (uint8_t)(value >> (8 * i));
+  xl_adt_set(node, name, bytes, width);
+}
+
 // graphics-featureset-fallbacks without APPLE2 and MTL2,2 (a NUL-terminated, colon-separated list):
 // with them MobileGestalt answers DeviceSupportsASTC and SplashBoard writes app snapshots in the AGX
 // GPU's own ASTC layout, which no other GPU decodes.
@@ -108,10 +191,66 @@ static void set_featuresets(xl_adt_node *product, const xl_adt_prop *p)
   xl_adt_set(product, p->name, out, used);
 }
 
+// One of the source's /product properties into `product` as it is (Apple's bytes), but for two: the featureset fallbacks are
+// filtered (above) and device-perf-memory-class is the VM's (machine.h vm_ram_mib), of Apple's width. NULL, or why it cannot be.
+static const char *copy_product(xl_adt_node *product, const xl_adt_prop *p, const xl_machine *m)
+{
+  if (!strcmp(p->name, "graphics-featureset-fallbacks")) set_featuresets(product, p);
+  else if (strcmp(p->name, "device-perf-memory-class")) xl_adt_set(product, p->name, p->value, p->length);
+  else if (!integer_width(p->length)) return "the identity tree's device-perf-memory-class is not an integer of 1, 2, 4 or 8 bytes";
+  else if (!m->memory_class && !m->vm_ram_mib) return "the identity tree's device-perf-memory-class needs the VM's RAM size or a memory class";
+  else {
+    uint64_t value = m->memory_class;
+    if (!value) {
+      value = m->vm_ram_mib / 1024;                 // the whole GiB, at least 2, at most Apple's
+      if (value < 2) value = 2;
+      if (value > class_max(p)) value = class_max(p);
+    }
+    set_integer(product, p->name, p->length, value);
+  }
+  return NULL;
+}
+
+// The board name at the start of a compatible property (its first entry, "V54AP"), with its NUL, in out[size]: its length with
+// the NUL, or 0 where there is no entry or it does not fit.
+static size_t first_compatible(const xl_adt_prop *p, char *out, size_t size)
+{
+  if (!p || !p->length) return 0;
+  const size_t n = strnlen((const char *)p->value, p->length);
+  if (!n || n + 1 >= size) return 0;
+  memcpy(out, p->value, n);
+  out[n] = 0;
+  return n + 1;
+}
+
 static void reg(xl_adt_node *n, uint64_t armio_base, uint64_t base, uint64_t size)
 {
   uint64_t v[2] = { base - armio_base, size };
   xl_adt_set(n, "reg", v, sizeof v);
+}
+
+// A name launchd can put in a file name and the kernel's sysctl in its answer.
+bool xl_machine_jetsam_product_ok(const char *name)
+{
+  size_t n = name ? strlen(name) : 0;
+  if (n < 1 || n > 31 || name[0] == '.') return false;
+  for (size_t i = 0; i < n; i++) {
+    const char c = name[i];
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')) return false;
+  }
+  return true;
+}
+
+// A SoC generation as Apple's trees give it ("H18"): the characters of the jetsam name, a dot allowed first.
+bool xl_machine_soc_generation_ok(const char *name)
+{
+  size_t n = name ? strlen(name) : 0;
+  if (n < 1 || n > 31) return false;
+  for (size_t i = 0; i < n; i++) {
+    const char c = name[i];
+    if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')) return false;
+  }
+  return true;
 }
 
 xl_adt_node *xl_machine_tree(const xl_machine *m, const char **error)
@@ -124,6 +263,9 @@ xl_adt_node *xl_machine_tree(const xl_machine *m, const char **error)
   if (m->timebase_hz == 0) FAIL("the timebase frequency is missing");
   if ((m->dram_base | m->dram_size) & 0x3fff) FAIL("the RAM base and size must be 16 KiB aligned");
   if (m->armio_base == 0) FAIL("the arm-io base must not be 0");
+  if (m->gpu_intid && (m->gpu_intid < 32 || m->gpu_intid > 1019)) FAIL("the GPU's interrupt must be an SPI: INTID 32 to 1019");
+  if (m->audio_intid && (m->audio_intid < 32 || m->audio_intid > 1019 || m->audio_slot == 0 || m->audio_slot > 31))
+    FAIL("the sound card's interrupt must be an SPI (INTID 32 to 1019) read for a slot 1 to 31");
   if (m->ncpu > 1 && (!m->psci_method || (strcmp(m->psci_method, "hvc") && strcmp(m->psci_method, "smc"))))
     FAIL("more than one CPU needs a PSCI conduit");
   if (m->gic_redist_size < m->gic_redist_stride * m->ncpu) FAIL("the redistributor window is smaller than one frame per CPU");
@@ -136,9 +278,31 @@ xl_adt_node *xl_machine_tree(const xl_machine *m, const char **error)
       FAIL("a device window lies outside the arm-io window");
   if (m->panic_size && ((m->panic_base | m->panic_size) & 0x3fff)) FAIL("the panic region must be 16 KiB aligned");
 
+  if (m->jetsam_product && !xl_machine_jetsam_product_ok(m->jetsam_product))
+    FAIL("the jetsam properties' name: 1 to 31 of A-Z a-z 0-9 . _ -, not starting with a dot");
+
   const xl_adt_node *id = m->identity, *id_product = id ? xl_adt_child(id, "product") : NULL;
   if (id && (!id_product || !xl_adt_get(id, "model") || !xl_adt_get(id, "target-type")))
     { *error = "the identity tree has no model, target-type or /product"; return NULL; }
+  // The identity groups (machine.h identity_groups): their source, and the root and the memory class they ask for
+  const xl_adt_node *source = m->identity_product, *from = source ? xl_adt_child(source, "product") : NULL;
+  const unsigned groups = m->identity_groups;
+  if (id && source) FAIL("an identity tree is the whole identity or the groups' source, not both");
+  if (groups & ~XL_IDENTITY_ALL) FAIL("an identity group that does not exist");
+  if (groups && !source) FAIL("the identity groups need an identity tree");
+  if (source && !from) FAIL("the identity tree has no /product");
+  const xl_adt_prop *source_target = source ? xl_adt_get(source, "target-type") : NULL;
+  char board[160];
+  const size_t board_size = source ? first_compatible(xl_adt_get(source, "compatible"), board, sizeof board - 32) : 0;
+  if ((groups & XL_IDENTITY_ROOT) && (!source_target || !source_target->length || !board_size))
+    FAIL("the identity tree has no target-type or compatible for the root group");
+  if (m->memory_class && !(groups & XL_IDENTITY_MEMCLASS)) FAIL("a memory class needs the identity group memclass");
+  if (m->memory_class && m->memory_class > xl_machine_memory_class_max(source))
+    FAIL("the memory class: 1 to the identity's own (16 where it has none)");
+  if (m->soc_generation && !xl_machine_soc_generation_ok(m->soc_generation))
+    FAIL("the SoC generation: 1 to 31 of A-Z a-z 0-9 . _ -");
+  if (m->has_display_corner_radius && (m->display_corner_radius > XL_CORNER_RADIUS_MAX || m->display_corner_word2 > XL_CORNER_WORD2_MAX))
+    FAIL("the display corner radius: 0 to 200 points and a second word of 0 to 65535");
 
   root = xl_adt_new("device-tree");
   char compatible[160];
@@ -157,6 +321,12 @@ xl_adt_node *xl_machine_tree(const xl_machine *m, const char **error)
     }
   } else {
     xl_adt_set_str(root, "model", m->model ? m->model : "oneios-xnuhost");
+    // the root group: the identity's target-type, and its board name first in compatible, as with `identity` (the model stays)
+    if (groups & XL_IDENTITY_ROOT) {
+      xl_adt_set(root, "target-type", source_target->value, source_target->length);
+      memcpy(compatible, board, board_size);
+      used = board_size;
+    }
   }
   memcpy(compatible + used, "oneios,xnuhost", sizeof "oneios,xnuhost");
   used += sizeof "oneios,xnuhost";
@@ -310,11 +480,35 @@ xl_adt_node *xl_machine_tree(const xl_machine *m, const char **error)
     if (acoustic) xl_adt_set(audio, "acoustic-id", acoustic->value, acoustic->length);
   } else {
     xl_adt_set_str(product, "product-name", "OneiOS guest");
+    // the groups that are /product's: the source's own values of some properties, and no child node. A placeholder is iBoot's
+    // recipe for a value ("syscfg/DClr"), not the value: it is left out.
+    for (unsigned i = 0; from && i < from->nprops; i++) {
+      const xl_adt_prop *p = &from->props[i];
+      if (!(groups & xl_identity_group_of(p->name)) || (p->flags & 1)) continue;
+      const char *why = copy_product(product, p, m);
+      if (why) FAIL(why);
+    }
+    // the artwork group's gamut is the machine's (the source's is not copied), written with the group and not without it
+    if (groups & XL_IDENTITY_ARTWORK) xl_adt_set_str(product, "artwork-display-gamut", m->display_gamut ? m->display_gamut : "P3");
+    // a memory class given for a source that has no such property
+    if (m->memory_class && !xl_adt_get(product, "device-perf-memory-class")) set_integer(product, "device-perf-memory-class", 4, m->memory_class);
   }
   // The artwork scale follows the UI scale (the identity tree's is the iPhone panel's 3). The artwork subtype
   // stays the identity's (2868 for iPhone18,2): it names a set of assets, and no set exists for another height.
   if (m->display_scale) xl_adt_set_u32(product, "artwork-scale-factor", m->display_scale);
+  // The corner radius (machine.h display_corner_radius): two little-endian words, whatever the identity fields say
+  if (m->has_display_corner_radius) {
+    uint8_t radius[8];
+    for (unsigned i = 0; i < 4; i++) {
+      radius[i] = (uint8_t)(m->display_corner_radius >> (8 * i));
+      radius[4 + i] = (uint8_t)(m->display_corner_word2 >> (8 * i));
+    }
+    xl_adt_set(product, "display-corner-radius", radius, sizeof radius);
+  }
   xl_adt_set_str(product, "model", "oneios,xnuhost");
+  // The name of the jetsam properties (machine.h): the kernel reads this property of /product at boot (xnu-12377's
+  // sysctl_load_jetsam_properties_product_type, read in the native kernel's code) and prefers it to the target-type.
+  if (m->jetsam_product) xl_adt_set_str(product, "jetsam-properties-product-type", m->jetsam_product);
 
   xl_adt_node *io = xl_adt_add(root, "arm-io");
   xl_adt_set_str(io, "device_type", "arm-io");
@@ -322,6 +516,7 @@ xl_adt_node *xl_machine_tree(const xl_machine *m, const char **error)
   xl_adt_set_u32(io, "#size-cells", 2);
   uint64_t ranges[3] = { 0, m->armio_base, m->armio_size };
   xl_adt_set(io, "ranges", ranges, sizeof ranges);
+  if (m->soc_generation) xl_adt_set_str(io, "soc-generation", m->soc_generation);
   xl_adt_node *intc = xl_adt_add(io, "intc");
   xl_adt_set_str(intc, "compatible", "arm,gic-v3");
   uint64_t gic[4] = { m->gic_dist - m->armio_base, m->gic_dist_size, m->gic_redist - m->armio_base, m->gic_redist_size };
@@ -331,13 +526,14 @@ xl_adt_node *xl_machine_tree(const xl_machine *m, const char **error)
   xl_adt_set_str(xl_adt_add(io, "wlan"), "device_type", "wlan");
 
   unsigned blocks = 0, inputs = 0;
+  bool gpu_line = false; bool snd_line = false;
   for (unsigned i = 0; i < m->ndev; i++) {
     const xl_device *d = &m->dev[i];
     char name[32];
     const char *compat;
     if (d->pci && d->kind != XL_DEV_BLOCK && d->kind != XL_DEV_DATA_STORE && d->kind != XL_DEV_INPUT && d->kind != XL_DEV_GPU &&
-        d->kind != XL_DEV_SND && d->kind != XL_DEV_NET)
-      FAIL("only a disk, the input bus, the GPU, the sound card or the network card can be on PCI");
+        d->kind != XL_DEV_SND && d->kind != XL_DEV_NET && d->kind != XL_DEV_MEDIA)
+      FAIL("only a disk, the input bus, the GPU, the sound card, the network card or the video decoder can be on PCI");
     switch (d->kind) {
     case XL_DEV_BLOCK:
       snprintf(name, sizeof name, d->pci ? "virtio-pci-%u" : "virtio-mmio-%u", blocks++);
@@ -366,7 +562,12 @@ xl_adt_node *xl_machine_tree(const xl_machine *m, const char **error)
       break;
     case XL_DEV_BRIDGE:     snprintf(name, sizeof name, "bridge"); compat = "oneios,bridge"; break;
     case XL_DEV_CAMERA:     snprintf(name, sizeof name, "camera"); compat = "oneios,camera"; break;
-    case XL_DEV_MEDIA:      snprintf(name, sizeof name, "virtio-media-0"); compat = "droidvm,virtio-media"; break;
+    case XL_DEV_MEDIA:
+      // on PCI: bus 0 of crosvm's ECAM, where the kernel takes the first virtio-pci media function (DroidVMVirtioMedia.c,
+      // staged/codec_transport.rs MEDIA_TRANSPORT_PCI): crosvm's --virtio-media decoder, which crosvm places itself
+      snprintf(name, sizeof name, "virtio-media-0");
+      compat = d->pci ? "oneios,virtio-media-pci" : "droidvm,virtio-media";
+      break;
     default: FAIL("unknown device kind");
     }
     if (xl_adt_child(io, name)) FAIL("two devices of a kind that has one node");
@@ -377,7 +578,15 @@ xl_adt_node *xl_machine_tree(const xl_machine *m, const char **error)
     // The line of the window on the board's GIC: SPI INTID 32 + its index, under the name UniXNU-droidvm's
     // transports read. Not "interrupts": the tree has no interrupt-controller node (ArmCpu owns the GIC), and
     // IOKit's IODTMapOneInterrupt walks the parents of a node with "interrupts" forever looking for one.
+    // On PCI the line is the PCI host's (crosvm's interrupt-map), not the board's: only the GPU is given its own
+    // (gpu_intid, which vm-boot checks against crosvm's tree); the other functions poll.
     if (!d->pci) xl_adt_set_u32(n, "droidvm,intid", XL_BOARD_VIRTIO_SPI + i);
+    else if (d->kind == XL_DEV_GPU && m->gpu_intid) { xl_adt_set_u32(n, "droidvm,intid", m->gpu_intid); gpu_line = true; }
+    else if (d->kind == XL_DEV_SND && m->audio_intid) {   // take18: the sound card's line and the slot it is for
+      xl_adt_set_u32(n, "droidvm,intid", m->audio_intid);
+      xl_adt_set_u32(n, "oneios,intid-slot", m->audio_slot);
+      snd_line = true;
+    }
     if (d->kind == XL_DEV_GPU && m->gpu_pool_size) {
       uint64_t pool[2] = { m->gpu_pool_base, m->gpu_pool_size };
       xl_adt_set(n, "drm-host-pool", pool, sizeof pool);
@@ -387,6 +596,8 @@ xl_adt_node *xl_machine_tree(const xl_machine *m, const char **error)
       xl_adt_set(n, "media-host-pool", pool, sizeof pool);
     }
   }
+  if (m->gpu_intid && !gpu_line) FAIL("an interrupt for the GPU without the GPU on PCI");
+  if (m->audio_intid && !snd_line) FAIL("an interrupt for the sound card without the sound card on PCI");
   if (m->cpufreq_size) {
     xl_adt_node *freq = xl_adt_add(io, "cpufreq");
     xl_adt_set_str(freq, "compatible", "oneios,cpufreq");

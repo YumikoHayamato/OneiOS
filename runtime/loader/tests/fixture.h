@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: MIT
 // Generated Mach-O fixtures for the loader tests: no Apple binaries. The layout follows DarwinBoot's
-// Test/make-fixtures.py (a __TEXT with the header and code, a zero-fill __DATA, LC_UNIXTHREAD).
+// Test/make-fixtures.py (a __TEXT with the header and code, a zero-fill __DATA, LC_UNIXTHREAD). And a made-up identity tree
+// (fx_identity: the shape of Apple's decoded device tree, none of its bytes).
 #ifndef XL_TEST_FIXTURE_H
 #define XL_TEST_FIXTURE_H
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+// by its path from here: runtime/xnuhost/tests/mkkernel.c includes this file with -I../loader/tests alone
+#include "../include/xnuloader/adt.h"
 
 #define FX_BASE 0xfffffff007004000ull
 
@@ -113,6 +116,54 @@ static inline fx_image fx_trustcache(unsigned entries)
     h[20] = 2;
   }
   return im;
+}
+
+// An identity tree of the shape the loader reads (a root with model, target-type and compatible; /product with its children), made
+// up: every /product property the identity groups take (xl_machine.identity_groups: 13 of them, and the artwork-display-gamut and
+// artwork-scale-factor that the machine sets instead, "SRGB" and 3 here; the 12 GB device-perf-memory-class as 4 bytes; a featureset
+// list with APPLE2 and MTL2,2 in it), the ones no group takes (the notch, the camera button, burn-in mitigation, virtualization, the
+// corner radius, three exclaves keys, a product-name, a jetsam name, oled-display, a placeholder), and the children iopm, camera and audio.
+static inline xl_adt_node *fx_identity(void)
+{
+  static const uint8_t corner[8] = { 0x3e, 0, 0, 0, 1, 0, 0, 0 };
+  xl_adt_node *t = xl_adt_new("device-tree");
+  xl_adt_set_str(t, "model", "Fixture1,1");
+  xl_adt_set_str(t, "target-type", "F1");
+  xl_adt_set(t, "compatible", "F1AP\0Fixture1,1\0AppleARM", sizeof "F1AP\0Fixture1,1\0AppleARM");
+  xl_adt_node *p = xl_adt_add(t, "product");
+  xl_adt_set_u32(p, "AAPL,phandle", 0x175);
+  xl_adt_set_str(p, "product-name", "Fixture phone");
+  xl_adt_set_str(p, "artwork-device-idiom", "phone");
+  xl_adt_set_u32(p, "artwork-device-subtype", 2868);
+  xl_adt_set(p, "artwork-dynamic-displaymode", "0", 2);
+  xl_adt_set_str(p, "artwork-display-gamut", "SRGB");
+  xl_adt_set_u32(p, "artwork-scale-factor", 3);
+  xl_adt_set_str(p, "graphics-featureset-class", "APPLE10");
+  xl_adt_set_str(p, "graphics-featureset-fallbacks", "APPLE9:APPLE3v1:APPLE2:APPLE1:MTL2,2:GLES2,0");
+  xl_adt_set_u32(p, "ui-background-quality", 100);
+  xl_adt_set_u32(p, "ui-weather-quality", 100);
+  xl_adt_set_u32(p, "display-workgroup-interval", 1);
+  xl_adt_set_u32(p, "hid-workgroup-interval", 1);
+  xl_adt_set_u32(p, "udid-version", 2);
+  xl_adt_set_u32(p, "public-key-accelerator", 1);
+  xl_adt_set_str(p, "product-description", "Fixture Phone 17");
+  xl_adt_set_u32(p, "device-perf-memory-class", 12);
+  xl_adt_set_u32(p, "island-notch-location", 0x90);
+  xl_adt_set_u32(p, "supports-camera-button", 1);
+  xl_adt_set_u32(p, "supports-burnin-mitigation", 1);
+  xl_adt_set_u32(p, "has-virtualization", 1);
+  xl_adt_set(p, "display-corner-radius", corner, sizeof corner);
+  xl_adt_set_u32(p, "exclaves-enabled", 1);
+  xl_adt_set_u32(p, "has-exclaves", 1);
+  xl_adt_set_u32(p, "exclaves-fixture", 1);
+  xl_adt_set_str(p, "jetsam-properties-product-type", "F1b");
+  xl_adt_set_u32(p, "oled-display", 1);
+  xl_adt_set_str(p, "device-colors", "syscfg/DClr");
+  ((xl_adt_prop *)xl_adt_get(p, "device-colors"))->flags = 1;       // a placeholder: iBoot's recipe for the value
+  xl_adt_set_u32(xl_adt_add(p, "iopm"), "aot-mode", 0xd);
+  xl_adt_set_u32(xl_adt_add(p, "camera"), "flash", 1);
+  xl_adt_set_u32(xl_adt_add(p, "audio"), "acoustic-id", 77);
+  return t;
 }
 
 #endif

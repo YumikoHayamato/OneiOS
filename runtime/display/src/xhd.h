@@ -137,6 +137,11 @@ int xhd_touch_event(uint16_t type, uint16_t code, int32_t value, struct xhd_vinp
 // also asks for the panel to be switched (*toggle = 1). *power_down: when power went down (0: up), kept by the caller.
 // Returns the events written to out, 0 for anything else.
 #define XHD_POWER_CLICK_S 2.0
+// Whether a click of power (xhd_side_key's toggle) switches the panel too: only with displayctl touch --power-blanks. By default
+// the key goes to the VM alone and the panel stays as it is (take14: the panel went black by itself on a short click, and
+// iOS, which owns the screen in a takeover, did not ask for it).
+int xhd_power_blanks_panel(int toggle, int power_blanks);
+
 unsigned xhd_side_key(uint16_t type, uint16_t code, int32_t value, double now, double *power_down, int *toggle,
                       struct xhd_vinput out[2]);
 #endif

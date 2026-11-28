@@ -4,7 +4,7 @@
 // The bench for the native kernel (kernel/build-native.sh; the plain one of kernel/build-linux.sh too) before any phone
 // (docs/native.md).
 //   xnuloader-qemu KERNEL OUTDIR [--cpus N] [--ram-mib N] [--timebase HZ] [--args TEXT] [--args-add TEXT] [--qemu-cpu M]
-//                  [--image DIR --data FILE]
+//                  [--image DIR --data FILE] [--jetsam-product NAME]
 // Writes into OUTDIR:
 //   window.bin  the kernel's window from its physical base: its segments, the device tree, boot_args and the trust
 //               caches (xl_boot_place, the code xnuhost uses, with virt_base = the kernel's own base as a firmware gives it)
@@ -25,6 +25,14 @@
 // configuration space in virt's ECAM, with a window for the BAR the kernel places (virt has no firmware to assign it)
 // and a DMA window, as crosvm's restricted DMA pool gives one: everything the device touches lies there, after the
 // window and the boot video, outside the RAM the kernel manages.
+// --jetsam-product NAME (default none): /product jetsam-properties-product-type, as xnuloader-crosvm gives it (its header
+// comment: the name of the jetsam properties launchd reads, V54 for the iPhone18,2 set), so that the list can be tried
+// on this bench before a phone.
+// --media (take18b): the video decoder's node as xnuloader-crosvm --media gives it, /arm-io/virtio-media-0
+// ("oneios,virtio-media-pci") = bus 0 of virt's ECAM, and the boot arguments oneios-codec=1 droidvm-vt-paravirt=1. QEMU has
+// no virtio-media device: the bench boots the kernel's codec archive with its PCI scan and no decoder (serial.log:
+// `droidvm-media: no 1af4:1070 function on bus 0`, `ONEIOS CODEC: 1 virtio-media device(s), 0 up; ... not published`).
+// No media-host-pool (nothing maps a buffer without a device).
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -79,7 +87,7 @@ static void spit(const char *dir, const char *name, const void *data, size_t siz
 
 static void usage(void)
 {
-  fprintf(stderr, "usage: xnuloader-qemu KERNEL OUTDIR [--cpus N] [--ram-mib N] [--timebase HZ] [--args TEXT] [--args-add TEXT] [--qemu-cpu M] [--image DIR --data FILE [--pci]] [--display WxH [--scale 2|3] [--hz N]] [--input tablet,keyboard]\n");
+  fprintf(stderr, "usage: xnuloader-qemu KERNEL OUTDIR [--cpus N] [--ram-mib N] [--timebase HZ] [--args TEXT] [--args-add TEXT] [--qemu-cpu M] [--image DIR --data FILE [--pci]] [--display WxH [--scale 2|3] [--hz N]] [--input tablet,keyboard] [--audio] [--media] [--jetsam-product NAME]\n");
   exit(2);
 }
 
@@ -87,6 +95,7 @@ int main(int argc, char **argv)
 {
   if (argc < 3) usage();
   const char *kernel_path = argv[1], *out = argv[2], *args = default_args, *image_dir = NULL, *data_path = NULL;
+  const char *jetsam_product = NULL;
   unsigned cpus = 1, ram_mib = 1024;
   // The display (--display WxH): QEMU's virtio-gpu-device on the transport after the disks, the boot video right after the
   // kernel's window, the mode and scale in the tree as xnuhost gives them (docs/booter.md 2.8). 0: no display.
@@ -95,15 +104,22 @@ int main(int argc, char **argv)
   // takes it as one finger while its button is down, NativeHidInput's touch screen) and virtio-keyboard-device, on the
   // transports after the GPU, as /arm-io/input-N ("droidvm,virtio-input"). The pointer is the VNC client's mouse.
   bool input_tablet = false, input_keyboard = false;
+  // The sound card (--audio; take17): QEMU's virtio-sound-device (one output and one input stream, audiodev none: what is
+  // played is dropped, what is recorded is silence at the stream's rate) on the transport after the input devices, as
+  // /arm-io/virtio-snd ("droidvm,virtio-snd"): the bench of the kernel's virtio-snd transport and its microphone
+  // (DroidVMVirtioSnd.c as staged; boot arguments oneios-audio-mic=1 oneios-audio-mic-selftest=N, OneiOSAudio.c).
+  bool audio = false;
   // The CPU: a Cortex-A710 (Armv9.0, PAuth, BTI, 64-byte DC ZVA, no FEAT_LVA), the kind of core a phone has, not QEMU's
   // max: max has FEAT_LVA, and the DEVELOPMENT kernel asserts that no CPU has it (vm_sanitize.c:643, launchd's first
   // jobs, 2026-11-20). No SVE (Apple's cores have none; neither has the S25's Oryon). Its counter at 1 GHz, as the tree's
   // timebase says (--timebase and cntfrq= go together).
   const char *qemu_cpu = "cortex-a710,pauth-impdef=on,sve=off,cntfrq=1000000000";
   uint32_t timebase = 1000000000;
-  bool pci = false;
+  bool pci = false, media = false;
   for (int i = 3; i < argc; i++) {
     if (!strcmp(argv[i], "--pci")) { pci = true; continue; }
+    if (!strcmp(argv[i], "--audio")) { audio = true; continue; }
+    if (!strcmp(argv[i], "--media")) { media = true; continue; }
     if (i + 1 >= argc) usage();
     if (!strcmp(argv[i], "--cpus")) cpus = (unsigned)strtoul(argv[++i], NULL, 0);
     else if (!strcmp(argv[i], "--qemu-cpu")) qemu_cpu = argv[++i];
@@ -123,6 +139,7 @@ int main(int argc, char **argv)
     }
     else if (!strcmp(argv[i], "--scale")) display_scale = (unsigned)strtoul(argv[++i], NULL, 0);
     else if (!strcmp(argv[i], "--hz")) display_hz = (unsigned)strtoul(argv[++i], NULL, 0);
+    else if (!strcmp(argv[i], "--jetsam-product")) jetsam_product = argv[++i];
     else if (!strcmp(argv[i], "--input")) {
       const char *list = argv[++i];
       input_tablet = strstr(list, "tablet") != NULL;
@@ -138,6 +155,10 @@ int main(int argc, char **argv)
   }
   if (cpus < 1 || cpus > XL_MAX_CPUS || ram_mib < 256 || ram_mib > 3072) { fprintf(stderr, "xnuloader-qemu: 1-%d CPUs, 256-3072 MiB\n", XL_MAX_CPUS); return 2; }
   if (!image_dir != !data_path) { fprintf(stderr, "xnuloader-qemu: --image and --data go together\n"); return 2; }
+  if (jetsam_product && !xl_machine_jetsam_product_ok(jetsam_product)) {
+    fprintf(stderr, "xnuloader-qemu: --jetsam-product: 1 to 31 of A-Z a-z 0-9 . _ -, not starting with a dot (iPhone18,2's list is V54)\n");
+    return 2;
+  }
   if (pci && !image_dir) { fprintf(stderr, "xnuloader-qemu: --pci is for the image set's disks (--image)\n"); return 2; }
   static xh_imageset set;
   static image_disk disks[IMAGE_DISKS_MAX];
@@ -176,6 +197,7 @@ int main(int argc, char **argv)
   m.uart_size = 0x1000ull;
   m.psci_method = "hvc";
   m.model = "iPhone18,2";
+  m.jetsam_product = jetsam_product;
   m.have_chip_id = true;
   m.chip_id = 0x8150;
   m.unique_chip_id = 0x0ce10511e5000001ull;     // a bench's own: not a phone's
@@ -212,6 +234,18 @@ int main(int argc, char **argv)
     if (at >= sizeof with_display) { fprintf(stderr, "xnuloader-qemu: boot arguments too long\n"); return 2; }
     args = with_display;
   }
+  // --media: the codec archive starts and would publish VideoToolbox's service with a decoder up (none here)
+  if (media) {
+    static char with_media[4096];
+    size_t at = (size_t)snprintf(with_media, sizeof with_media, "%s", args);
+    if (at < sizeof with_media && !strstr(args, "oneios-codec="))
+      at += (size_t)snprintf(with_media + at, sizeof with_media - at, " oneios-codec=1");
+    if (at < sizeof with_media && !strstr(args, "droidvm-vt-paravirt="))
+      at += (size_t)snprintf(with_media + at, sizeof with_media - at, " droidvm-vt-paravirt=1");
+    if (at >= sizeof with_media) { fprintf(stderr, "xnuloader-qemu: boot arguments too long\n"); return 2; }
+    args = with_media;
+    m.dev[m.ndev++] = (xl_device){ XL_DEV_MEDIA, PCI_ECAM, 0x100000, true };
+  }
   // The input devices on the transports after the GPU's (or the disks', without a display): input-0 the tablet, then the
   // keyboard, in that order (xl_machine_tree numbers the input nodes as it meets them).
   unsigned next_transport = disk_transports + (display_w ? 1 : 0), tablet_transport = 0, keyboard_transport = 0, ninput = 0;
@@ -225,6 +259,11 @@ int main(int argc, char **argv)
     keyboard_transport = next_transport++;
     input_transport[ninput++] = keyboard_transport;
     m.dev[m.ndev++] = (xl_device){ XL_DEV_INPUT, VIRTIO_BASE + keyboard_transport * VIRTIO_SIZE, VIRTIO_SIZE, false };
+  }
+  unsigned snd_transport = 0;
+  if (audio) {
+    snd_transport = next_transport++;
+    m.dev[m.ndev++] = (xl_device){ XL_DEV_SND, VIRTIO_BASE + snd_transport * VIRTIO_SIZE, VIRTIO_SIZE, false };
   }
   const xh_imageset_file *os = image_dir ? xh_imageset_role(&set, "os") : NULL;
   if (os && *os->volume_uuid) m.root_volume_uuid = os->volume_uuid;
@@ -303,7 +342,7 @@ int main(int argc, char **argv)
                    qemu_cpu, cpus, (unsigned long long)qemu_mib, out, (unsigned long long)phys, out, (unsigned long long)STUB_PA);
   // The disks: modern virtio (OneiOSHostedDisk takes version 2 only), disk K on transport K. A path with a comma would
   // need QEMU's doubling: refused instead.
-  if ((ndisk || display_w || ninput) && n >= 0 && (size_t)n < sizeof line) n += snprintf(line + n, sizeof line - n, "-global\nvirtio-mmio.force-legacy=false\n");
+  if ((ndisk || display_w || ninput || audio) && n >= 0 && (size_t)n < sizeof line) n += snprintf(line + n, sizeof line - n, "-global\nvirtio-mmio.force-legacy=false\n");
   // The GPU: 2D only (no virgl), its first mode the panel's; QEMU's display backend is boot-vm.sh's (VNC or none).
   if (display_w && n >= 0 && (size_t)n < sizeof line)
     n += snprintf(line + n, sizeof line - n, "-device\nvirtio-gpu-device,bus=virtio-mmio-bus.%u,xres=%u,yres=%u,max_outputs=1\n",
@@ -312,6 +351,8 @@ int main(int argc, char **argv)
     n += snprintf(line + n, sizeof line - n, "-device\nvirtio-tablet-device,bus=virtio-mmio-bus.%u\n", tablet_transport);
   if (input_keyboard && n >= 0 && (size_t)n < sizeof line)
     n += snprintf(line + n, sizeof line - n, "-device\nvirtio-keyboard-device,bus=virtio-mmio-bus.%u\n", keyboard_transport);
+  if (audio && n >= 0 && (size_t)n < sizeof line)
+    n += snprintf(line + n, sizeof line - n, "-audiodev\nnone,id=snd0\n-device\nvirtio-sound-device,bus=virtio-mmio-bus.%u,audiodev=snd0\n", snd_transport);
   for (unsigned i = 0; i < ndisk && n >= 0 && (size_t)n < sizeof line; i++) {
     if (strchr(disks[i].path, ',') || strchr(disks[i].path, '\n')) { fprintf(stderr, "%s: a disk path with a comma\n", disks[i].path); return 1; }
     n += snprintf(line + n, sizeof line - n, "-drive\nif=none,id=disk%u,format=raw,file=%s,readonly=%s\n",
@@ -333,6 +374,9 @@ int main(int argc, char **argv)
          (unsigned long long)lay.args_pa, (unsigned long long)lay.tree_pa, (unsigned long long)lay.tree_size);
   printf("  stub at PA 0x%llx; QEMU RAM %llu MiB; %u CPU%s (%s), timebase %u Hz; boot args: %s\n", (unsigned long long)STUB_PA,
          (unsigned long long)qemu_mib, cpus, cpus == 1 ? "" : "s", qemu_cpu, timebase, args);
+  if (jetsam_product)
+    printf("  jetsam properties: /product jetsam-properties-product-type \"%s\": launchd reads /System/Library/LaunchDaemons/com.apple.jetsamproperties.%s.plist"
+           " (the OS image must have it)\n", jetsam_product, jetsam_product);
   if (trust.data) printf("  trust caches: %u modules, %zu bytes; root: the OS volume %s\n", (unsigned)trust.data[0], trust.size, m.root_volume_uuid);
   for (unsigned i = 0; i < ndisk; i++) {
     if (pci)
@@ -350,5 +394,7 @@ int main(int argc, char **argv)
            (unsigned long long)(fb_bytes >> 20));
   if (input_tablet) printf("  input: tablet (one finger while the button is down) on transport 0x%llx\n", (unsigned long long)(VIRTIO_BASE + tablet_transport * VIRTIO_SIZE));
   if (input_keyboard) printf("  input: keyboard on transport 0x%llx\n", (unsigned long long)(VIRTIO_BASE + keyboard_transport * VIRTIO_SIZE));
+  if (media) printf("  video decoder: /arm-io/virtio-media-0 on bus 0 of the ECAM at 0x%llx (QEMU has no virtio-media device: the kernel finds none)\n",
+                    (unsigned long long)PCI_ECAM);
   return 0;
 }

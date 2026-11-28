@@ -63,15 +63,37 @@ NDK's `ANativeWindow` on that `Surface`, from the mapped memfd straight into the
   1440x3120: 1436x3120 at x = 2). Both layers are at the top of the built-in display's stack.
 - **The panel.** The modes come from surfaceflinger (`DisplayControl`, the way scrcpy reads them): the active
   one, and the native one, which is the largest the panel has at its highest refresh rate. With `--takeover` (a
-  session: system_server is gone) a panel that One UI left in a lower mode (FHD+ 1080x2340 is One UI's default
-  resolution setting) is put in the native mode: the display's desired mode specs are read, their default mode
-  replaced and their refresh ranges opened to that mode's rate, and written back
-  (`SurfaceControl.setDesiredDisplayModeSpecs`); the helper waits up to a second for the mode to become active.
+  session: system_server is gone) the panel is put in the native mode: the display's desired mode specs are read,
+  their default mode replaced and their refresh ranges (primary and app request, physical and render) opened to
+  that mode's rate, and written back (`SurfaceControl.setDesiredDisplayModeSpecs`); the helper waits up to a second
+  for the mode to become active. It does so whenever the panel is in another size (FHD+ 1080x2340 is One UI's
+  default resolution setting) or surfaceflinger's policy (One UI's last word before its framework stopped) has
+  another default mode or caps the rate below the native mode's (`OneiOSDisplay.wantsSpecs`, host-tested). In the
+  crosvm mode (`--crosvm-display`) the rate is also **held**: the ranges are that rate alone (120 to 120), set as
+  well when the panel runs below it or the policy lets it fall below it. Until 2026-11-25 only another size did: with power saving on (or the
+  standard motion setting) One UI's policy is 10 to 60 Hz, the layer's vote for 120 Hz counts for nothing against
+  it, and the panel showed at most 60 of the 100 frames a second the guest drew for a 120 Hz tick (docs/native.md
+  "The frame rate in the shared-RAM VM"; inferred from surfaceflinger's policy after the session). Held, not only
+  allowed, where crosvm presents: with the framework gone nothing tells surfaceflinger of a touch, and its idle
+  timer (250 ms here) would lower the rate between gestures. The session's helper (xnuhost's frames) keeps ranges
+  from 0, as before. The specs as
+  they were are kept and given back when the helper leaves (its shutdown hook in the crosvm mode, the end of the
+  run otherwise: `surfaceflinger's policy is One UI's again: ...`); a helper killed with SIGKILL leaves the 120 Hz
+  specs until One UI's framework sets its own at its start (not tested).
   Then the display's projection is set to the active mode, unrotated, so the layer space is the panel's own
   pixels whatever rotation One UI left. If the mode is refused the panel stays as it was and the frame is
-  scaled. The return restarts surfaceflinger, which forgets both. Without `--takeover` nothing of the display is
-  changed and the logical size comes from the display manager. The layer votes for the mode's highest refresh
-  rate (`setFrameRate`, 120 Hz on this panel), which is the rate the guest's vsync tick runs at.
+  scaled (`the panel shows N frames a second, not the M the guest is told` when the rate was not taken). Without
+  `--takeover` nothing of the display is changed and the logical size comes from the display manager. The layer
+  votes for the mode's highest refresh rate (`setFrameRate`, 120 Hz on this panel), which is the rate the guest's
+  vsync tick runs at.
+  The lines: `panel modes: active 1440x3120 at 60 Hz (mode 2; up to 120 Hz at that size), native 1440x3120 at 120
+  Hz; surfaceflinger's policy: default mode 2, the panel at 10 to 60 Hz` (the active mode's own rate; the old line
+  gave only the size's highest), `asked surfaceflinger for the native mode (id 0) held at 120 Hz` (`..., up to 120 Hz` in the session's helper), `the panel is in
+  its native mode 1440x3120 at 120 Hz (mode 0); surfaceflinger's policy: default mode 0, the panel at 120 to 120 Hz`.
+  In the crosvm mode (`--crosvm-display`) the helper also looks at the panel's rate every 5 s (one call to
+  surfaceflinger): `the panel runs at 120 Hz (mode 0, 1440x3120); the guest draws for 120 Hz` when it changes
+  (`: at most 60 of its frames a second are shown` when it is below `--hz`), and at the end `the panel's rate over
+  the session: 120 Hz 100 % (N looks, 5 s apart)`.
   Whether One UI's resolution setting is a panel mode or only a logical size on this phone is not known; the
   helper's `panel modes: active ..., native ...` line of the first run says.
 - **Frames.** One copy per frame, of the damaged rectangle only: the window copies back what the last buffer had
@@ -265,6 +287,7 @@ path and its floor.
 
 ```sh
 displayctl touch --evdev /dev/input/eventN --socket PATH [--wait S] [--swipe-at S [--swipe-every S]]
+                 [--boost PATH=VALUE,... --boost-state FILE] [--scan-time]
 ```
 
 crosvm's multi-touch device (`--input multi-touch[path=PATH,width=W,height=H,name=N]`) connects to PATH and reads
@@ -282,6 +305,32 @@ connected, and every `--swipe-every` seconds after, the forwarder sends a swipe 
 edge up to the middle of the panel in 20 steps of 16 ms, then the lift: a test without a finger (boot 4b, 2026-11-23:
 the lock screen followed it up, and the next one opened the Home screen).
 
+`--boost PATH=VALUE,...` with `--boost-state FILE` (`vm-boot --touch-boost`, `src/boost.h`): a touch frame raises the lowest
+clocks PATH (devfreq's `min_freq`, cpufreq's `scaling_min_freq`) to VALUE; they are put back 1.5 s after the last frame (a
+finger held still long enough to send none lets go too). A process of its own writes them, told by a pipe, so a touch never
+waits for a clock; the pipe's end, whatever ended the forwarder, puts them back. FILE (the originals) is there only while
+something is raised: the forwarder uses it as soon as it sees that process ended (it looks at every turn of its loop, at
+most 500 ms apart), boot.sh when both were killed. A refused put-back (a cluster's cores offline) is tried again every
+second. A FILE of this boot that is there at the start is taken over: its values are the originals. The original is the lowest
+value seen while nothing was raised, and the first 30 s only read: Samsung holds minimums of its own around the start. A
+clock already at VALUE or above is left alone. Host tests: raise, hold, release, the pipe's end, both kills, the refusals, the stuck clocks.
+
+`--scan-time` (`vm-boot --touch-time`, `src/scantime.h`): each frame goes with the time the touchscreen's driver stamped
+it with. The guest polls its virtio-input every 4 ms and the S25's touchscreen sends no `MSC_TIMESTAMP`, so iOS got
+every touch stamped 0 to 4 ms and the path's jitter late, each frame differently; a finger's speed times that error is
+how far content that follows it was off. The forwarder asks the device for CLOCK_MONOTONIC event times
+(`EVIOCSCLOCKID`: without it, said once, the frames go as before) and puts `EV_MSC / MSC_TIMESTAMP` before each frame's
+`SYN_REPORT`: the low 32 bits of the frame's time in ticks of the counter the guest's clock reads (xnuhost's
+`scan_ticks`; `CNTVCT_EL0` and `CNTFRQ_EL0` read here). A time that cannot be the scan's (over 1 s old, or ahead of now)
+goes without one. The guest's kernel has taken such a time since it has had the touch (`kernel/patches/oneios-hosted/
+hid/README.md`, "Latency"). At its end the forwarder says how many frames went with it and how long after its scan it
+had each (least, mean, most). `--test-evdev` (the host tests): `--evdev` names a FIFO of the tests' own in the
+touchscreen's place; nothing is asked of it, taken or set. Host tests: the arithmetic and the frame, then the forwarder
+with a FIFO for the touchscreen and the test program for crosvm, with and without the flag (the events as crosvm gets
+them, two frames of one read each with its own time, a time too old and one from another clock passed on bare).
+`make test-arm64` runs the same tests on the phone's own static binary under `qemu-aarch64` (the counter is the
+emulator's there: the events and their spacing are checked).
+
 ## Not done
 
 - The dataspaces, `RGBA_FP16` buffers and the half-float path (2026-11-13) are host-tested only (`make test`: 110 +
@@ -291,8 +340,12 @@ the lock screen followed it up, and the next one opened the Home screen).
   in `java/OneiOSDisplay.java`, and each has a fallback or a logged failure.
 - The copy is not zero-copy. For that xnuhost would have to keep the guest's frame in a gralloc buffer
   (`AHardwareBuffer`) instead of a memfd and pass that; `virtio_gpu.c` and the socket's hello would change.
-- The native-mode request (`setDesiredDisplayModeSpecs` by reflection) is unproven like the rest; a refusal is
-  logged and the frame is scaled. At 1440x3120 a full-frame copy is 18 MB, 2.2 GB/s at 120 Hz when every frame
+- The native-mode request (`setDesiredDisplayModeSpecs` by reflection) at another size is unproven like the rest; a
+  refusal is logged and the frame is scaled. The request at the native size (the rate alone, 2026-11-25) is
+  host-tested only (`make test`: the choice, 21 checks; the calls to surfaceflinger -- reading the policy, giving the
+  specs back, the look at the rate every 5 s -- have run nowhere yet); whether Samsung's surfaceflinger takes a 120 Hz policy
+  from the helper while power saving is on is the next phone session's `the panel is in its native mode ... at 120
+  Hz` and `the panel's rate over the session` lines. At 1440x3120 a full-frame copy is 18 MB, 2.2 GB/s at 120 Hz when every frame
   is all damage.
 - A guest that truncates the memfd kills the helper (SIGBUS) and the screen goes dark; the session and the way
   back are not affected.
@@ -362,3 +415,31 @@ frame, the boot screen ends, and the panel is black as before. On the phone, rea
 frame of its own: all black ...` (where the old rule was ready) and `guest ready: first frame with content, T s and N
 frames after the guest's first (black) frame`; in `control/bootui.log` the feeder's `the boot screen ends` line at
 the same time, and on the glass the boot screen until the Apple logo.
+
+## take15: the power key and the panel
+
+In a takeover `displayctl touch --keys` passes power, volume up and volume down to the VM and nothing else: a short click of
+power no longer blanks the panel (take14: it went black by itself; iOS owns the screen). `--power-blanks` (with
+`--screen-file`) restores the old behavior (a click toggles the panel through the screen file and holds the touches back
+while it is off); `xhd_power_blanks_panel` is the decision and has a unit test. The screen file still works when something
+asks for it; nothing in iOS asks for it yet.
+
+## take18: the panel on at a takeover's start
+
+From YMGPwcca/OneiOS 843b06e and f048161 (bounded lock-screen WAKEUP pulses): One UI's keyguard darkens the panel a few
+seconds after its last wake, and once One UI's framework is stopped nothing wakes it again (`input keyevent` needs
+system_server). Two parts: `vm-boot --takeover` sends one `KEYCODE_WAKEUP` right before the stop while One UI is still up
+(`takeover: KEYCODE_WAKEUP sent as One UI stops` in run.txt; `--no-takeover-wake` leaves it out), and the helper's
+`--crosvm-display ... --screen-file` (a takeover's) puts the panel on once at its start with POWER_MODE_NORMAL unless the
+screen file is there already (`the panel is on (the takeover's start)` in display.txt). Upstream's four pulses 2 s apart
+are not copied: here the helper holds the panel itself, so one event is enough. Built (the dex: javac -Werror, d8;
+`TestModes` 21 checks); not run on the phone. `vmboot::tests::the_takeover_wakes_the_panel_once_before_one_ui_stops`.
+
+take19, a variable rate (`vm-boot --panel-rate-min HZ`): `--crosvm-display ... --takeover --rate-min HZ --rate-hold-file
+FILE` sets the native mode's ranges to [HZ, top] after the layer is up (surfaceflinger then follows the layer's frames and
+its 120 Hz vote, and its idle timer lowers the panel on a still screen), and to [top, top] while FILE exists (displayctl
+touch's boost.state: with One UI's framework down no touch reaches surfaceflinger), looked at every 10 ms. Lines: `the
+panel's rate is free from HZ to TOP Hz, held at TOP while FILE is there`, `touch: the panel held at TOP Hz (hold N)` (the
+first three) and at the end `the panel's rate was held at TOP Hz K times, P % of the session`. Without both options, or
+without --takeover, the rate is held as before. Built (javac -Xlint:all -Werror, d8; TestModes 21 checks); not run on the
+phone.

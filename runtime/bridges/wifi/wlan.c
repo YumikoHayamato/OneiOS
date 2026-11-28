@@ -66,6 +66,8 @@ struct br_wlan {
   bool running;
   char state_path[512];
   uint64_t rx_frames, tx_frames, rx_dropped, segmented, tx_refused, control_dropped;
+  uint64_t udp_segmented, drops[BR_WIFI_DROP_KINDS];   // take18: UDP frames cut into datagrams; the drops by kind
+  unsigned drops_said;
   unsigned dhcp_said;               // iOS's DHCP messages logged since the last join (the first of them)
   unsigned dhcp_others;             // other stations' DHCP messages seen since the last join (the first is logged)
   uint64_t joined_rx, joined_tx;    // the counters at the join, for the report 10 s after it
@@ -532,6 +534,22 @@ static void deliver(void *ctx, const uint8_t *frame, size_t length)
   if (w->rx) w->rx(w->rx_ctx, frame, length);
 }
 
+// take18: a frame for the guest that was not handed on, counted by kind (br_wifi_drop_kind), the first eight said with
+// what the receive path gave (take17 dropped 15 % of the frames for iOS and no line said which they were).
+static const char *const drop_names[BR_WIFI_DROP_KINDS] = { "UDP aggregated", "other aggregated", "UDP", "other IP", "not IP" };
+static void dropped(struct br_wlan *w, const struct virtio_net_hdr *h, const uint8_t *frame, size_t length)
+{
+  const unsigned kind = br_wifi_drop_kind(frame, length, (uint8_t)(h->gso_type & ~VIRTIO_NET_HDR_GSO_ECN));
+  w->rx_dropped++;
+  w->drops[kind]++;
+  if (w->drops_said >= 8) return;
+  w->drops_said++;
+  const uint16_t type = br_wifi_ethertype(frame, length);
+  const unsigned protocol = type == 0x0800 && length >= 34 ? frame[23] : type == 0x86dd && length >= 54 ? frame[20] : 0;
+  br_log(1, "wifi: a frame for iOS not handed on (%u of the first 8): %zu bytes, %s (ethertype %04x, protocol %u), gso type %u size %u, "
+         "flags %#x", w->drops_said, length, drop_names[kind], type, protocol, h->gso_type, h->gso_size, h->flags);
+}
+
 static void *frames_loop(void *arg)
 {
   struct br_wlan *w = arg;
@@ -551,9 +569,12 @@ static void *frames_loop(void *arg)
     say_dhcp(w, frame, length, false);
     // A frame the receive path coalesced (GRO was on, or came back on) has no checksum of its own any more.
     const bool coalesced = h.gso_type != VIRTIO_NET_HDR_GSO_NONE || (h.flags & VIRTIO_NET_HDR_F_NEEDS_CSUM);
-    size_t n = br_wifi_segment(frame, length, h.gso_type != VIRTIO_NET_HDR_GSO_NONE ? h.gso_size : 1448, coalesced, deliver, w);
-    if (!n) w->rx_dropped++;
-    else { w->rx_frames += n; if (n > 1) w->segmented++; }
+    // take18: a UDP flow the Wi-Fi driver aggregated (gso type UDP_L4, GRO off or not) goes as its datagrams.
+    const bool udp = (h.gso_type & ~VIRTIO_NET_HDR_GSO_ECN) == VIRTIO_NET_HDR_GSO_UDP_L4;
+    size_t n = udp ? br_wifi_segment_udp(frame, length, h.gso_size, deliver, w)
+                   : br_wifi_segment(frame, length, h.gso_type != VIRTIO_NET_HDR_GSO_NONE ? h.gso_size : 1448, coalesced, deliver, w);
+    if (!n) dropped(w, &h, frame, length);
+    else { w->rx_frames += n; if (n > 1) { w->segmented++; if (udp) w->udp_segmented++; } }
   }
   return NULL;
 }
@@ -780,6 +801,11 @@ void br_wlan_close(void)
   br_log(1, "wifi: closed (%llu frames to the guest, %llu from it, %llu cut from coalesced frames, %llu dropped, %llu of the guest's refused)",
          (unsigned long long)w->rx_frames, (unsigned long long)w->tx_frames, (unsigned long long)w->segmented, (unsigned long long)w->rx_dropped,
          (unsigned long long)w->tx_refused);
+  // take18: of the cut frames the UDP ones, and the drops by kind (br_wifi_drop_kind)
+  br_log(1, "wifi: closed: %llu UDP frames cut into datagrams; dropped: %llu UDP aggregated, %llu other aggregated, %llu UDP, %llu other IP, "
+         "%llu not IP", (unsigned long long)w->udp_segmented, (unsigned long long)w->drops[BR_WIFI_DROP_UDP_GSO],
+         (unsigned long long)w->drops[BR_WIFI_DROP_OTHER_GSO], (unsigned long long)w->drops[BR_WIFI_DROP_UDP],
+         (unsigned long long)w->drops[BR_WIFI_DROP_IP], (unsigned long long)w->drops[BR_WIFI_DROP_NOT_IP]);
   // w stays: a vCPU may still be inside br_wlan_send (the process ends next)
 }
 

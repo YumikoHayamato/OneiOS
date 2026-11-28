@@ -46,10 +46,12 @@ static uint32_t add(uint32_t sum, const uint8_t *data, size_t length)
   return sum;
 }
 
-// The checksums of one IPv4 or IPv6 TCP segment: IPv4 header (when IPv4) and TCP over the pseudo-header.
-static void tcp_checksums(uint8_t *l3, bool v6, size_t l3_len, size_t tcp_len)
+// The checksums of one IPv4 or IPv6 TCP segment or UDP datagram: the IPv4 header (when IPv4) and the transport's over
+// the pseudo-header (protocol 6 or 17; the checksum at 16 or 6 of the transport header). A UDP sum of 0 is sent as 0xffff.
+static void l4_checksums(uint8_t *l3, bool v6, size_t l3_len, size_t l4_len, uint8_t protocol)
 {
-  uint8_t *tcp = l3 + l3_len;
+  uint8_t *l4 = l3 + l3_len;
+  const size_t at = protocol == 17 ? 6 : 16;
   uint32_t sum = 0;
   if (v6) {
     sum = add(sum, l3 + 8, 32);                                 // source and destination
@@ -58,9 +60,64 @@ static void tcp_checksums(uint8_t *l3, bool v6, size_t l3_len, size_t tcp_len)
     put16(l3 + 10, fold(add(0, l3, l3_len)));
     sum = add(sum, l3 + 12, 8);
   }
-  sum += 6 + (uint32_t)tcp_len;                                   // protocol, TCP length
-  put16(tcp + 16, 0);
-  put16(tcp + 16, fold(add(sum, tcp, tcp_len)));
+  sum += protocol + (uint32_t)l4_len;                             // protocol, transport length
+  put16(l4 + at, 0);
+  const uint16_t c = fold(add(sum, l4, l4_len));
+  put16(l4 + at, protocol == 17 && !c ? 0xffff : c);
+}
+static void tcp_checksums(uint8_t *l3, bool v6, size_t l3_len, size_t tcp_len) { l4_checksums(l3, v6, l3_len, tcp_len, 6); }
+
+// take18: UDP the receive path coalesced. Qualcomm's Wi-Fi datapath aggregates the datagrams of a UDP flow itself (its
+// flow aggregation hands up one frame of the type UDP_L4 with the datagrams' size as gso_size, whatever GRO is), so a
+// QUIC download (YouTube, most of Google's and Cloudflare's sites) came as frames of up to 64 KiB that br_wifi_segment
+// only knew how to cut for TCP: they were dropped whole (take17: 8599 frames of 57313, 15 %; take16 2.2 %), which QUIC
+// sees as heavy loss and answers by sending slower. Each datagram again: `size` payload bytes (the last the rest), its
+// UDP length and checksum and its IP length made again (IPv4: the identifier counted on, its header checksum). Always cut,
+// also when the whole fits the link: two datagrams handed on as one would be one bad datagram. A datagram cannot be cut
+// smaller, so a size that does not fit the link (or not UDP, or IPv6 with extension headers) is a drop (0).
+size_t br_wifi_segment_udp(const uint8_t *frame, size_t length, uint16_t size, br_wifi_segment_fn fn, void *ctx)
+{
+  if (length < 14 + 20 + 8 || !size) return 0;
+  const uint16_t type = br_wifi_ethertype(frame, length);
+  const uint8_t *l3 = frame + 14;
+  size_t l3_len;
+  bool v6;
+  if (type == 0x0800 && (l3[0] >> 4) == 4 && l3[9] == 17) { v6 = false; l3_len = (size_t)(l3[0] & 15) * 4; }
+  else if (type == 0x86dd && length >= 14 + 40 + 8 && (l3[0] >> 4) == 6 && l3[6] == 17) { v6 = true; l3_len = 40; }
+  else return 0;
+  if (l3_len < 20 || length <= 14 + l3_len + 8) return 0;
+  const size_t headers = 14 + l3_len + 8;
+  if (headers + size > BR_WIFI_FRAME) return 0;
+  const uint8_t *payload = frame + headers;
+  const size_t total = length - headers;
+  const uint16_t id = v6 ? 0 : be16(l3 + 4);
+  uint8_t out[BR_WIFI_FRAME];
+  size_t count = 0;
+  for (size_t done = 0; done < total; done += size, count++) {
+    const size_t part = total - done < size ? total - done : size;
+    memcpy(out, frame, headers);
+    memcpy(out + headers, payload + done, part);
+    uint8_t *o3 = out + 14, *ou = o3 + l3_len;
+    const uint16_t udp_len = (uint16_t)(8 + part);
+    if (v6) put16(o3 + 4, udp_len);
+    else { put16(o3 + 2, (uint16_t)(l3_len + udp_len)); put16(o3 + 4, (uint16_t)(id + count)); }
+    put16(ou + 4, udp_len);
+    l4_checksums(o3, v6, l3_len, udp_len, 17);
+    fn(ctx, out, headers + part);
+  }
+  return count;
+}
+
+// What a frame for the guest that could not be handed on was, for the bridge's log and counters (wifi.h).
+unsigned br_wifi_drop_kind(const uint8_t *frame, size_t length, uint8_t gso_type)
+{
+  const uint16_t type = br_wifi_ethertype(frame, length);
+  const uint8_t *l3 = frame + 14;
+  if (gso_type == 5) return BR_WIFI_DROP_UDP_GSO;
+  if (gso_type != 0) return BR_WIFI_DROP_OTHER_GSO;
+  if (type == 0x0800 && length >= 14 + 20 && (l3[0] >> 4) == 4) return l3[9] == 17 ? BR_WIFI_DROP_UDP : BR_WIFI_DROP_IP;
+  if (type == 0x86dd && length >= 14 + 40 && (l3[0] >> 4) == 6) return l3[6] == 17 ? BR_WIFI_DROP_UDP : BR_WIFI_DROP_IP;
+  return BR_WIFI_DROP_NOT_IP;
 }
 
 size_t br_wifi_segment(const uint8_t *frame, size_t length, uint16_t mss, bool coalesced, br_wifi_segment_fn fn, void *ctx)

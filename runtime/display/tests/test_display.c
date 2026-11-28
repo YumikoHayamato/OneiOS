@@ -5,9 +5,12 @@
 //   test_display [path to a host build of displayctl]
 #define _GNU_SOURCE
 #include "xhd.h"
+#include "boost.h"
+#include "scantime.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +19,9 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <linux/input.h>
+#include <poll.h>
+#include <sys/un.h>
 
 static int checks, failed;
 static int as_helper(const char *session);
@@ -417,8 +423,192 @@ static void test_pool_parts(void)
   CHECK(!xhd_side_key(1, 113, 1, 11.0, &down, &toggle, k) && !xhd_side_key(3, 116, 1, 11.0, &down, &toggle, k));
   CHECK(xhd_side_key(1, 116, 1, 12.0, &down, &toggle, k) == 2 && down == 12.0 && !toggle);
   CHECK(xhd_side_key(1, 116, 0, 12.3, &down, &toggle, k) == 2 && toggle == 1 && down == 0 && k[0].code == 116 && !k[0].value);
+  CHECK(xhd_power_blanks_panel(1, 0) == 0 && xhd_power_blanks_panel(0, 1) == 0 && xhd_power_blanks_panel(1, 1) == 1);   // a short click: the key goes, the panel stays
   toggle = 0;
   CHECK(xhd_side_key(1, 116, 1, 20.0, &down, &toggle, k) == 2 && xhd_side_key(1, 116, 0, 23.5, &down, &toggle, k) == 2 && !toggle);
+}
+
+// The touch boost (displayctl touch --boost) on plain files for the clocks: its process as the forwarder starts it.
+static void test_boost(const char *dir)
+{
+  char gpu[64], cpu[64], state[64], list[256], line[200];
+  snprintf(gpu, sizeof gpu, "%s/gpu_min", dir);
+  snprintf(cpu, sizeof cpu, "%s/cpu_min", dir);
+  snprintf(state, sizeof state, "%s/boost.state", dir);
+  snprintf(list, sizeof list, "%s=607000000,%s=1497600", gpu, cpu);
+  struct boost b = { .state = state, .hold_s = 0.3, .settle_s = 0.4 };
+  CHECK(!boost_parse(&b, list) && b.n == 2 && b.node[1].target == 1497600 && !strcmp(b.node[0].path, gpu));
+  struct boost bad = { 0 };
+  CHECK(boost_parse(&bad, "") && boost_parse(&bad, "/a") && boost_parse(&bad, "a=1") && boost_parse(&bad, "/a=0") && boost_parse(&bad, "/a=1x") && boost_parse(&bad, "/a b=1"));
+  int make = open(gpu, O_CREAT | O_WRONLY, 0600); close(make);
+  make = open(cpu, O_CREAT | O_WRONLY, 0600); close(make);
+  boost_write(gpu, 160000000);
+  boost_write(cpu, 2227200);                  // a minimum someone holds at the start only
+  for (int round = 0; round < 3; round++) {
+    int ends[2];
+    CHECK(!pipe(ends));
+    b.node[0].low = b.node[1].low = 0;
+    pid_t child = fork();
+    if (!child) {
+      signal(SIGTERM, SIG_IGN);
+      close(ends[1]);
+      _exit(boost_run(&b, ends[0]));
+    }
+    close(ends[0]);
+    CHECK(write(ends[1], "t", 1) == 1);
+    usleep(150000);
+    CHECK(boost_read(gpu) == 160000000 && access(state, F_OK));      // the start: only read
+    if (!round) boost_write(cpu, 384000);
+    usleep(200000);
+    CHECK(write(ends[1], "t", 1) == 1);                               // read again, still at the start
+    usleep(250000);
+    CHECK(boost_read(gpu) == 160000000);
+    CHECK(write(ends[1], "t", 1) == 1);
+    usleep(150000);
+    CHECK(boost_read(gpu) == 607000000 && boost_read(cpu) == 1497600 && !access(state, F_OK));
+    FILE *f = fopen(state, "r");
+    int cpu_line = 0, boot_line = 0;
+    while (f && fgets(line, sizeof line, f)) {
+      if (!strncmp(line, "boot ", 5) && strlen(line) > 20) boot_line = 1;
+      if (strstr(line, "cpu_min 384000\n")) cpu_line = 1;
+    }
+    if (f) fclose(f);
+    CHECK(boot_line && cpu_line);                                     // never the start's 2227200
+    int status;
+    if (!round) {
+      // another touch holds it on, then the release, then a raise ended by the pipe's end while SIGTERM is ignored
+      CHECK(write(ends[1], "t", 1) == 1);
+      usleep(200000);
+      CHECK(boost_read(gpu) == 607000000);
+      usleep(350000);
+      CHECK(boost_read(gpu) == 160000000 && boost_read(cpu) == 384000 && access(state, F_OK));
+      CHECK(write(ends[1], "t", 1) == 1);
+      usleep(100000);
+      kill(child, SIGTERM);
+      usleep(50000);
+      CHECK(boost_read(gpu) == 607000000);
+    }
+    if (round == 2) kill(child, SIGKILL);
+    close(ends[1]);
+    CHECK(waitpid(child, &status, 0) == child);
+    if (round == 2) {
+      // killed outright: its file is there, and the forwarder puts the clocks back from it
+      CHECK(WIFSIGNALED(status) && boost_read(gpu) == 607000000 && !access(state, F_OK));
+      boost_restore_state(&b);
+    } else {
+      CHECK(WIFEXITED(status) && !WEXITSTATUS(status));
+    }
+    CHECK(boost_read(gpu) == 160000000 && boost_read(cpu) == 384000 && access(state, F_OK));
+  }
+  // a minimum already at the target or above is left alone
+  struct boost high = { .state = state };
+  CHECK(!boost_parse(&high, list));
+  boost_write(cpu, 2227200);
+  high.raises = 1;
+  boost_raise(&high);
+  CHECK(boost_read(cpu) == 2227200 && boost_read(gpu) == 607000000);
+  CHECK(!boost_release(&high) && boost_read(cpu) == 2227200 && boost_read(gpu) == 160000000);
+  // no place for the state file: nothing is raised
+  struct boost nowhere = { .state = "/nonexistent/boost.state", .told = 1 };
+  CHECK(!boost_parse(&nowhere, list));
+  boost_raise(&nowhere);
+  CHECK(boost_read(gpu) == 160000000 && !nowhere.up);
+  unlink(gpu);
+  unlink(cpu);
+}
+
+// The clock's file made unwritable (a directory in its place: root is refused too), as an offline policy's, and back.
+static void clock_gone(const char *path, int gone)
+{
+  char kept[100];
+  snprintf(kept, sizeof kept, "%s.kept", path);
+  if (gone) CHECK(!rename(path, kept) && !mkdir(path, 0700));
+  else CHECK(!rmdir(path) && !rename(kept, path));
+}
+
+// The ways a clock could stay raised: a refused put-back, the boost's process killed with no touch after, a file left over.
+static void test_boost_stuck(const char *dir)
+{
+  char clock[64], list[100], state[64], line[200];
+  snprintf(clock, sizeof clock, "%s/stuck_min", dir);
+  snprintf(state, sizeof state, "%s/stuck.state", dir);
+  snprintf(list, sizeof list, "%s=1497600", clock);
+  int make = open(clock, O_CREAT | O_WRONLY, 0600); close(make);
+  for (int round = 0; round < 4; round++) {
+    // 0: refused at the release, 1: refused at the pipe's end, 2: killed, 3: killed and refused at first
+    struct boost b = { .state = state, .hold_s = 0.3 };
+    CHECK(!boost_parse(&b, list));
+    boost_write(clock, 384000);
+    int ends[2], status;
+    CHECK(!pipe(ends));
+    pid_t child = fork();
+    if (!child) { close(ends[1]); _exit(boost_run(&b, ends[0])); }
+    close(ends[0]);
+    usleep(100000);
+    CHECK(write(ends[1], "t", 1) == 1);
+    usleep(100000);
+    CHECK(boost_read(clock) == 1497600 && !access(state, F_OK));
+    if (round == 0) {
+      clock_gone(clock, 1);
+      usleep(500000);
+      CHECK(!access(state, F_OK));
+      clock_gone(clock, 0);
+      usleep(1300000);                                    // no touch, the pipe still open
+      CHECK(boost_read(clock) == 384000 && access(state, F_OK));
+      CHECK(write(ends[1], "t", 1) == 1);                 // and it works on
+      usleep(100000);
+      CHECK(boost_read(clock) == 1497600);
+    }
+    if (round < 2) {
+      if (round) clock_gone(clock, 1);
+      close(ends[1]);
+      usleep(round ? 300000 : 0);
+      if (round) clock_gone(clock, 0);
+      CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
+    } else {
+      pid_t watched = child;
+      int touched = ends[1];
+      boost_watch(&b, &watched, &touched, 10);
+      CHECK(watched == child && touched == ends[1] && boost_read(clock) == 1497600);      // alive: nothing
+      kill(child, SIGKILL);
+      usleep(100000);
+      if (round == 3) clock_gone(clock, 1);
+      boost_watch(&b, &watched, &touched, 11);
+      CHECK(watched == -1 && touched == -1);
+      if (round == 3) {
+        CHECK(b.left && !access(state, F_OK));
+        clock_gone(clock, 0);
+        boost_watch(&b, &watched, &touched, 11.5);        // once a second
+        CHECK(b.left && boost_read(clock) == 1497600);
+        boost_watch(&b, &watched, &touched, 12.1);
+      }
+      CHECK(!b.left);
+    }
+    CHECK(boost_read(clock) == 384000 && access(state, F_OK));
+  }
+  // a state file of this boot at the start: its value is the original, not what the raised clock holds; kept with a raise
+  for (int other = 0; other < 2; other++) {
+    char id[64];
+    CHECK(boost_boot(id));
+    FILE *f = fopen(state, "w");
+    CHECK(f && fprintf(f, "boot %s\n%s 384000\n/etc/min_freq 5\n/sys/../x_min_freq 5\n/sys/oneios_none/scaling_min_freq 7\n", other ? "0" : id, clock) > 0);
+    if (f) fclose(f);
+    boost_write(clock, 1497600);
+    struct boost b = { .state = state };
+    CHECK(!boost_parse(&b, list));
+    boost_adopt(&b);
+    CHECK(b.n == (other ? 1 : 2) && b.node[0].low == (other ? 0 : 384000) && boost_any_raised(&b) == !other);
+    if (other) continue;
+    CHECK(boost_release(&b) && boost_read(clock) == 384000 && !access(state, F_OK));      // the one that is not there is kept
+    CHECK(!boost_save(&b));
+    int kept = 0;
+    f = fopen(state, "r");
+    while (f && fgets(line, sizeof line, f)) kept |= !strcmp(line, "/sys/oneios_none/scaling_min_freq 7\n");
+    if (f) fclose(f);
+    CHECK(kept);
+  }
+  unlink(state);
+  unlink(clock);
 }
 
 // displayctl with a stand-in for the helper: a shell script that takes the session, and leaves.
@@ -552,6 +742,10 @@ static void test_displayctl_pool(const char *displayctl, const char *dir)
            "--size 64x48 --stride 256 --seq-offset 16384 --helper %s > %s 2>&1", dir, displayctl, pid, self_path, out);
   status = system(command);
   CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 1);                  // never /proc as a stand-in
+  // touch: the boost's clocks and its file, both or neither
+  snprintf(command, sizeof command, "%s touch --evdev /dev/input/event0 --socket %s/t.sock --boost /a=1 > %s 2>&1", displayctl, dir, out);
+  status = system(command);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 2);
   // touch: only an event device's path, and a socket
   snprintf(command, sizeof command, "%s touch --evdev %s --socket %s/t.sock > %s 2>&1", displayctl, guest, dir, out);
   status = system(command);
@@ -617,6 +811,197 @@ static int as_helper(const char *socket_path)
   return 7;
 }
 
+// ---- the touch frames' scan time (src/scantime.h, displayctl touch --scan-time) ----
+static void test_scan_time(void)
+{
+  // xnuhost's arithmetic (tests/test_xnuhost.c): a frame read 2 ms after its scan is 38400 ticks of the 19.2 MHz counter back.
+  const uint64_t hz = 19200000, counter = 1000000000;
+  const int64_t now = 5000000000ll;
+  CHECK(scan_ticks(now - 2000000, now, counter, hz) == (uint32_t)(counter - 38400));
+  CHECK(scan_ticks(now, now, counter, hz) == (uint32_t)counter);
+  CHECK(scan_ticks(now + 5, now, counter, hz) == (uint32_t)counter);                    // a scan "after now": now
+  // the low 32 bits only: the counter past 2^32 (223 s at 19.2 MHz), and a scan before the wrap
+  CHECK(scan_ticks(now - 1000000, now, 0x100000010ull, hz) == (uint32_t)(0x100000010ull - 19200));
+  CHECK(scan_ticks(now - 1000000, now, 0x100000010ull, hz) == 0xffffb510u);
+  // seconds and their rest are converted apart: no overflow at days of uptime, no rounding up
+  CHECK(scan_ticks(now - 3000000001ll, now, 0x500000000ull, hz) == (uint32_t)(0x500000000ull - 3 * hz - 0));
+  CHECK(scan_ticks(now - 999999999, now, counter, hz) == (uint32_t)(counter - 19199999));
+  // what is usable: the past second, and a millisecond of the future (the two clocks are read one after the other)
+  CHECK(scan_usable(now - 1, now) && scan_usable(now, now) && scan_usable(now + 1000000, now) && scan_usable(now - 999999999, now));
+  CHECK(!scan_usable(now + 1000001, now) && !scan_usable(now - 1000000000, now) && !scan_usable(0, now) && !scan_usable(-5, now));
+  // a wall-clock time (the device kept CLOCK_REALTIME): decades after the monotonic now, never used
+  CHECK(!scan_usable(1795650229000000000ll, now));
+
+  // The frame: the time goes before its SYN_REPORT, and the frame is one event longer.
+  struct xhd_vinput frame[5] = { { EV_ABS, ABS_MT_POSITION_X, 100 }, { EV_ABS, ABS_MT_POSITION_Y, 200 }, { EV_SYN, SYN_REPORT, 0 } };
+  struct scan_stats stats = { 0 };
+  unsigned n = scan_stamp(frame, 3, 5, now - 2000000, now, counter, hz, &stats);
+  CHECK(n == 4 && frame[0].code == ABS_MT_POSITION_X && frame[1].code == ABS_MT_POSITION_Y);
+  CHECK(frame[2].type == SCAN_EV_MSC && frame[2].code == SCAN_MSC_TIMESTAMP && frame[2].value == (uint32_t)(counter - 38400));
+  CHECK(frame[3].type == EV_SYN && frame[3].code == SYN_REPORT && frame[3].value == 0);
+  CHECK(stats.stamped == 1 && stats.bare == 0 && stats.sum_us == 2000 && stats.least_us == 2000 && stats.most_us == 2000);
+  // the next ones: least and most follow
+  struct xhd_vinput lone[2] = { { EV_SYN, SYN_REPORT, 0 } };
+  CHECK(scan_stamp(lone, 1, 2, now - 100000, now, counter, hz, &stats) == 2 && lone[0].type == SCAN_EV_MSC && lone[1].type == EV_SYN);
+  lone[0] = (struct xhd_vinput){ EV_SYN, SYN_REPORT, 0 };
+  CHECK(scan_stamp(lone, 1, 2, now - 7000000, now, counter, hz, &stats) == 2);
+  CHECK(stats.stamped == 3 && stats.sum_us == 2000 + 100 + 7000 && stats.least_us == 100 && stats.most_us == 7000);
+  // as it is: no room, a time that cannot be the scan's, no rate, an empty frame
+  struct xhd_vinput full[3] = { { EV_ABS, ABS_MT_POSITION_X, 1 }, { EV_ABS, ABS_MT_POSITION_Y, 2 }, { EV_SYN, SYN_REPORT, 0 } };
+  CHECK(scan_stamp(full, 3, 3, now - 1000, now, counter, hz, &stats) == 3 && full[2].type == EV_SYN && full[1].code == ABS_MT_POSITION_Y);
+  CHECK(scan_stamp(frame, 3, 5, now - 2000000000ll, now, counter, hz, &stats) == 3);
+  CHECK(scan_stamp(frame, 3, 5, now - 1000, now, counter, 0, &stats) == 3);
+  CHECK(scan_stamp(frame, 0, 5, now - 1000, now, counter, hz, &stats) == 0);
+  CHECK(stats.stamped == 3 && stats.bare == 4);
+  CHECK(scan_stamp(frame, 3, 5, now - 1000, now, counter, hz, NULL) == 4);                 // nobody counts: still stamped
+  // this host's counter (the tests' stand-in on another machine than the phone): it moves, at its rate
+  const uint64_t a = scan_counter();
+  CHECK(scan_counter_hz() > 0 && scan_counter() >= a && scan_monotonic_ns() > 0);
+}
+
+// displayctl touch with a FIFO in the touchscreen's place (--test-evdev) and this program in crosvm's: the frames as they
+// reach crosvm's socket, with and without --scan-time.
+static int touch_events(int fifo, int64_t at_ns, const struct xhd_vinput *list, unsigned n)
+{
+  struct input_event ev[16];
+  memset(ev, 0, sizeof ev);
+  for (unsigned i = 0; i < n; i++) {
+    ev[i].input_event_sec = at_ns / 1000000000;
+    ev[i].input_event_usec = at_ns % 1000000000 / 1000;
+    ev[i].type = list[i].type; ev[i].code = list[i].code; ev[i].value = (int32_t)list[i].value;
+  }
+  return write(fifo, ev, n * sizeof *ev) == (ssize_t)(n * sizeof *ev);
+}
+
+static unsigned touch_read(int sock, struct xhd_vinput *out, unsigned want, int wait_ms)
+{
+  size_t got = 0;
+  while (got < want * sizeof *out) {
+    struct pollfd p = { sock, POLLIN, 0 };
+    if (poll(&p, 1, wait_ms) <= 0) break;
+    ssize_t r = read(sock, (char *)out + got, want * sizeof *out - got);
+    if (r <= 0) break;
+    got += (size_t)r;
+  }
+  return (unsigned)(got / sizeof *out);
+}
+
+static int wait_for_text(const char *file, const char *text, int tenths)
+{
+  char command[768];
+  snprintf(command, sizeof command, "grep -q -F \"%s\" %s 2>/dev/null", text, file);
+  for (int i = 0; i < tenths; i++) {
+    if (system(command) == 0) return 1;
+    usleep(100000);
+  }
+  return 0;
+}
+
+static void test_displayctl_touch(const char *displayctl, const char *dir, int scan)
+{
+  char fifo[256], sock[256], out[256], command[1024];
+  snprintf(fifo, sizeof fifo, "%s/events", dir);
+  snprintf(sock, sizeof sock, "%s/touch.sock", dir);
+  snprintf(out, sizeof out, "%s/touch.out", dir);
+  unlink(fifo); unlink(out);
+  CHECK(mkfifo(fifo, 0600) == 0);
+  pid_t child = fork();
+  if (!child) {
+    int o = open(out, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    dup2(o, 1); dup2(o, 2);
+    if (scan) execl(displayctl, displayctl, "touch", "--evdev", fifo, "--test-evdev", "--socket", sock, "--wait", "10", "--scan-time", (char *)NULL);
+    else execl(displayctl, displayctl, "touch", "--evdev", fifo, "--socket", sock, "--wait", "10", "--test-evdev", (char *)NULL);
+    _exit(127);
+  }
+  CHECK(child > 0);
+  // crosvm's side: connect to the forwarder's socket once it listens
+  int client = socket(AF_UNIX, SOCK_STREAM, 0), connected = -1;
+  struct sockaddr_un addr = { .sun_family = AF_UNIX };
+  strncpy(addr.sun_path, sock, sizeof addr.sun_path - 1);
+  for (int i = 0; i < 100 && connected; i++) { connected = connect(client, (struct sockaddr *)&addr, sizeof addr); if (connected) usleep(50000); }
+  CHECK(connected == 0);
+  CHECK(wait_for_text(out, "the touchscreen is the VM's", 50));            // (flushed before its loop: what came earlier was dropped)
+  // The counter's rate as the forwarder read it: this host's stand-in counts nanoseconds; the phone's binary run by
+  // qemu-aarch64 (argv[1] a script that does so) reads the emulated CNTFRQ_EL0, whatever it is.
+  unsigned long long rate = 0;
+  if (scan) {
+    CHECK(wait_for_text(out, "scan time: each frame goes with its scan time (the counter at ", 50));
+    snprintf(command, sizeof command, "sed -n 's/.*scan time: each frame goes with its scan time (the counter at \\([0-9]*\\) Hz).*/\\1/p' %s", out);
+    FILE *said = popen(command, "r");
+    CHECK(said && fscanf(said, "%llu", &rate) == 1 && rate >= 1000000);
+    if (said) pclose(said);
+  }
+  int touch = open(fifo, O_WRONLY | O_NONBLOCK);
+  CHECK(touch >= 0);
+  // A touch-down scanned 2 ms ago, with an event the forwarder never passes on (the IC's own EV_MSC).
+  const struct xhd_vinput down[7] = { { EV_ABS, ABS_MT_SLOT, 0 }, { EV_ABS, ABS_MT_TRACKING_ID, 7 }, { EV_ABS, ABS_MT_POSITION_X, 100 },
+                                      { EV_ABS, ABS_MT_POSITION_Y, 200 }, { EV_KEY, BTN_TOUCH, 1 }, { EV_MSC, MSC_SCAN, 99 }, { EV_SYN, SYN_REPORT, 0 } };
+  const int64_t scanned = (scan_monotonic_ns() - 2000000) / 1000 * 1000;     // an event's time is whole microseconds
+  CHECK(touch_events(touch, scanned, down, 7));
+  struct xhd_vinput got[16];
+  memset(got, 0, sizeof got);
+  unsigned n = touch_read(client, got, scan ? 7 : 6, 3000);
+  CHECK(n == (scan ? 7u : 6u));
+  CHECK(got[0].type == EV_ABS && got[0].code == ABS_MT_SLOT && got[1].code == ABS_MT_TRACKING_ID && got[1].value == 7 && got[2].value == 100 &&
+        got[3].value == 200 && got[4].type == EV_KEY && got[4].code == BTN_TOUCH && got[4].value == 1);
+  if (scan) {
+    // the time before the SYN_REPORT. This host's stand-in counter is CLOCK_MONOTONIC's nanoseconds, so the value is the
+    // scan's own time (the low 32 bits; the two clock reads are a few hundred ns apart, 50 ms allowed on a busy machine).
+    // The phone's binary under qemu-aarch64 (make test-arm64: ONEIOS_TEST_EMULATED) reads the emulator's counter, whose
+    // zero is its own: there only the event and the spacing of two frames are checked.
+    const uint32_t off = got[5].value - (uint32_t)scanned;
+    CHECK(got[5].type == SCAN_EV_MSC && got[5].code == SCAN_MSC_TIMESTAMP && (getenv("ONEIOS_TEST_EMULATED") || (rate == 1000000000ull && off < 50000000u)));
+    CHECK(got[6].type == EV_SYN && got[6].code == SYN_REPORT);
+  } else {
+    CHECK(got[5].type == EV_SYN && got[5].code == SYN_REPORT);
+  }
+  // A move whose time cannot be its scan's (a second old), then one from the future (another clock): both pass, bare.
+  const struct xhd_vinput move[2] = { { EV_ABS, ABS_MT_POSITION_Y, 180 }, { EV_SYN, SYN_REPORT, 0 } };
+  CHECK(touch_events(touch, scan_monotonic_ns() - 1500000000ll, move, 2));
+  CHECK(touch_read(client, got, 2, 3000) == 2 && got[0].code == ABS_MT_POSITION_Y && got[0].value == 180 && got[1].type == EV_SYN);
+  CHECK(touch_events(touch, scan_monotonic_ns() + 5000000000ll, move, 2));
+  CHECK(touch_read(client, got, 2, 3000) == 2 && got[0].code == ABS_MT_POSITION_Y && got[1].type == EV_SYN);
+  // Two frames in one read: each gets its own time.
+  struct input_event two[4];
+  memset(two, 0, sizeof two);
+  const int64_t first = scan_monotonic_ns() - 9000000, second = first + 8333333;
+  for (int i = 0; i < 4; i++) {
+    const int64_t at = i < 2 ? first : second;
+    two[i].input_event_sec = at / 1000000000; two[i].input_event_usec = at % 1000000000 / 1000;
+    two[i].type = i % 2 ? EV_SYN : EV_ABS; two[i].code = i % 2 ? SYN_REPORT : ABS_MT_POSITION_Y; two[i].value = i % 2 ? 0 : 170 - i;
+  }
+  CHECK(write(touch, two, sizeof two) == (ssize_t)sizeof two);
+  n = touch_read(client, got, scan ? 6 : 4, 3000);
+  CHECK(n == (scan ? 6u : 4u));
+  if (scan) {
+    // 8333 us apart in the counter's ticks, as the scans were (the event times are whole microseconds)
+    const uint32_t apart = got[4].value - got[1].value;
+    CHECK(got[1].type == SCAN_EV_MSC && got[4].type == SCAN_EV_MSC && apart >= 8333 * (rate / 1000) / 1000 && apart <= 8334 * (rate / 1000) / 1000 + 1);
+    CHECK(got[0].value == 170 && got[2].type == EV_SYN && got[3].value == 168 && got[5].type == EV_SYN);
+  } else {
+    CHECK(got[0].value == 170 && got[1].type == EV_SYN && got[2].value == 168 && got[3].type == EV_SYN);
+  }
+  // crosvm goes: the forwarder ends by itself and says what it did; its last line is still the one boot.sh quotes.
+  close(client);
+  int status = 0;
+  for (int i = 0; i < 100 && waitpid(child, &status, WNOHANG) == 0; i++) usleep(50000);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  close(touch);
+  snprintf(command, sizeof command, "tail -n 1 %s | grep -q '^displayctl touch: crosvm went after 5 frames (1[0-9] events read, 0 overflows, 0 test swipes)'", out);
+  CHECK(system(command) == 0);
+  snprintf(command, sizeof command, "grep -c 'scan time' %s > /dev/null", out);
+  CHECK((system(command) == 0) == (scan != 0));
+  if (scan) {
+    snprintf(command, sizeof command, "grep -q -E '^displayctl touch: scan time: 3 frames went with it \\(the forwarder had each [0-9]+ / [0-9]+ / [0-9]+ us after its scan: least, mean, most\\), 2 without$' %s", out);
+    CHECK(system(command) == 0);
+  }
+  // a device of /dev is never a test's: usage
+  snprintf(command, sizeof command, "%s touch --evdev /dev/null --test-evdev --socket %s > /dev/null 2>&1", displayctl, sock);
+  status = system(command);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 2);
+  unlink(fifo); unlink(out); unlink(sock);
+}
+
 int main(int argc, char **argv)
 {
   if (argc > 2 && !strcmp(argv[1], "--socket")) return as_helper(argv[2]);
@@ -631,10 +1016,14 @@ int main(int argc, char **argv)
   test_copy_formats();
   test_pool_parts();
   test_panel_report();
+  test_scan_time();
   test_hold_first(dir);
+  test_boost(dir);
+  test_boost_stuck(dir);
   test_protocol(dir);
   if (argc > 1) test_displayctl(argv[1], dir);
   if (argc > 1) test_displayctl_pool(argv[1], dir);
+  if (argc > 1) { test_displayctl_touch(argv[1], dir, 1); test_displayctl_touch(argv[1], dir, 0); }
   rmdir(dir);
   printf("%s: %d checks, %d failed\n", failed ? "FAILED" : "ok", checks, failed);
   return failed ? 1 : 0;

@@ -314,6 +314,64 @@ static void test_groups_segments(void)   // the netlink groups, the cut of coale
   CHECK(br_wifi_segment(big, 600, 1448, true, take, &s) == 1 && s.count == 1 && !memcmp(s.frame[0], big, 600));
 }
 
+// take18: UDP datagrams the receive path aggregated (QUIC through Qualcomm's flow aggregation), cut back into datagrams.
+static bool udp_ok(const uint8_t *f, size_t n, bool v6)
+{
+  const uint8_t *ip = f + 14, *udp = ip + (v6 ? 40 : 20);
+  const size_t udp_len = n - 14 - (v6 ? 40 : 20);
+  if ((size_t)(udp[4] << 8 | udp[5]) != udp_len) return false;
+  if (v6) return (size_t)(ip[4] << 8 | ip[5]) == udp_len && sum_ok(sum16(sum16(0, ip + 8, 32) + 17 + (uint32_t)udp_len, udp, udp_len));
+  return (size_t)(ip[2] << 8 | ip[3]) == n - 14 && sum_ok(sum16(0, ip, 20)) && sum_ok(sum16(sum16(0, ip + 12, 8) + 17 + (uint32_t)udp_len, udp, udp_len));
+}
+static size_t make_udp(uint8_t *f, bool v6, size_t payload)
+{
+  (void)make_tcp(f, v6, 0, 0);                                             // the same addresses; then UDP in place of TCP
+  uint8_t *ip = f + 14, *udp = ip + (v6 ? 40 : 20);
+  if (v6) ip[6] = 17; else ip[9] = 17;
+  memset(udp, 0, 8);
+  udp[0] = 0x01; udp[1] = 0xbb; udp[2] = 0xd4; udp[3] = 0x31;              // 443 -> 54321
+  for (size_t i = 0; i < payload; i++) udp[8 + i] = (uint8_t)(i * 13 + 5);
+  return 14 + (v6 ? 40 : 20) + 8 + payload;
+}
+
+static void test_udp_segments(void)
+{
+  static uint8_t big[14 + 40 + 8 + 4000];
+  static sink s;
+  // IPv4: 3700 bytes of 1252-byte datagrams: 1252, 1252, 1196; lengths, identifiers, checksums, the payload in order.
+  size_t n = make_udp(big, false, 3700);
+  memset(&s, 0, sizeof s);
+  CHECK(br_wifi_segment_udp(big, n, 1252, take, &s) == 3 && s.count == 3);
+  CHECK(s.length[0] == 42 + 1252 && s.length[1] == 42 + 1252 && s.length[2] == 42 + 1196);
+  CHECK(udp_ok(s.frame[0], s.length[0], false) && udp_ok(s.frame[1], s.length[1], false) && udp_ok(s.frame[2], s.length[2], false));
+  CHECK(s.frame[0][19] == 0x34 && s.frame[1][19] == 0x35 && s.frame[2][19] == 0x36);
+  CHECK(!memcmp(s.frame[1] + 42, big + 42 + 1252, 1252) && !memcmp(s.frame[2] + 42, big + 42 + 2504, 1196));
+  CHECK(s.frame[2][34] == 0x01 && s.frame[2][35] == 0xbb && s.frame[2][36] == 0xd4 && s.frame[2][37] == 0x31);   // the ports kept
+  // Two datagrams that fit the link together are still two.
+  n = make_udp(big, false, 1000);
+  memset(&s, 0, sizeof s);
+  CHECK(br_wifi_segment_udp(big, n, 500, take, &s) == 2 && s.length[0] == 542 && s.length[1] == 542 && udp_ok(s.frame[1], 542, false));
+  // IPv6.
+  n = make_udp(big, true, 2600);
+  memset(&s, 0, sizeof s);
+  CHECK(br_wifi_segment_udp(big, n, 1350, take, &s) == 2 && s.length[0] == 62 + 1350 && s.length[1] == 62 + 1250);
+  CHECK(udp_ok(s.frame[0], s.length[0], true) && udp_ok(s.frame[1], s.length[1], true));
+  // A datagram larger than the link holds, no size, no payload, not UDP: nothing is handed on.
+  n = make_udp(big, false, 3000);
+  memset(&s, 0, sizeof s);
+  CHECK(br_wifi_segment_udp(big, n, 1480, take, &s) == 0 && br_wifi_segment_udp(big, n, 0, take, &s) == 0 && s.count == 0);
+  CHECK(br_wifi_segment_udp(big, 42, 1252, take, &s) == 0);
+  n = make_tcp(big, false, 3000, 0x10);
+  CHECK(br_wifi_segment_udp(big, n, 1252, take, &s) == 0 && s.count == 0);
+  // What a dropped frame was.
+  CHECK(br_wifi_drop_kind(big, n, 5) == BR_WIFI_DROP_UDP_GSO && br_wifi_drop_kind(big, n, 3) == BR_WIFI_DROP_OTHER_GSO);
+  CHECK(br_wifi_drop_kind(big, n, 0) == BR_WIFI_DROP_IP);
+  n = make_udp(big, true, 3000);
+  CHECK(br_wifi_drop_kind(big, n, 0) == BR_WIFI_DROP_UDP);
+  big[12] = 0x81; big[13] = 0x00;                                         // a VLAN tag
+  CHECK(br_wifi_drop_kind(big, n, 0) == BR_WIFI_DROP_NOT_IP);
+}
+
 // ---- the station against a fake radio ----
 typedef struct { unsigned scans, joins, leaves; int join_rc; struct ow_join join; bool had_bss; br_wifi_bss bss; br_wifi_link link; } fake_radio;
 static int fr_scan(void *ctx) { ((fake_radio *)ctx)->scans++; return 0; }
@@ -730,6 +788,7 @@ int main(void)
   test_dhcp();
   test_bands();
   test_groups_segments();
+  test_udp_segments();
   test_station();
   test_sim();
   test_parcels();

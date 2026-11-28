@@ -20,10 +20,18 @@
 //     devices' region (the pool's place) is then inside crosvm's longer mapping of the guest's RAM, and that mapping
 //     counts; still only the boot video and the count's page are mapped here.
 //   displayctl touch --evdev /dev/input/eventN --socket PATH [--wait S] [--swipe-at S [--swipe-every S]]
-//                    [--keys /dev/input/eventA,... [--screen-file PATH]]
+//                    [--keys /dev/input/eventA,... [--screen-file PATH [--power-blanks]]]
+//                    [--boost PATH=VALUE,... --boost-state FILE]
+//     --boost (vm-boot --touch-boost): a touch raises these lowest clocks, put back 1.5 s after the last one and at every
+//     end (boost.h).
+//     --scan-time (vm-boot --touch-time): each frame goes with the time the touchscreen's driver stamped it with (EV_MSC /
+//     MSC_TIMESTAMP before its SYN_REPORT, in the counter's ticks: scantime.h), which the guest uses as the report's time.
+//     --test-evdev (the host tests): --evdev names a FIFO of the tests' own, read as the touchscreen's events are; nothing
+//     is asked of it, taken or set (no device of /dev or /proc).
 //     --keys (vm-boot --takeover: One UI is down): the side keys' devices, read and never grabbed; power, volume up and
-//     volume down go to the VM as they come (xhd_side_key), and a click of power switches the panel (the helper switches it
-//     while PATH is there) and holds the touches back while it is off.
+//     volume down go to the VM as they come (xhd_side_key) and nothing else: a click of power does not switch the panel (the VM's
+//     iOS owns the screen). --power-blanks (with --screen-file) brings the old behavior back: a click switches the panel (the
+//     helper switches it while PATH is there) and holds the touches back while it is off.
 //     the touch of that VM: the phone's touchscreen to crosvm's multi-touch device (crosvm --input
 //     multi-touch[path=PATH,...] connects to PATH and reads virtio_input_event's from it). AVF's crosvm cannot take the
 //     S25's touchscreen itself: --evdev wants the device's serial name (EVIOCGUNIQ), which sec_touchscreen has none of
@@ -36,6 +44,8 @@
 // The layer goes away when the socket closes; the helper is ended if it does not leave by itself.
 #define _GNU_SOURCE
 #include "xhd.h"
+#include "boost.h"
+#include "scantime.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
@@ -130,7 +140,7 @@ static int usage(void)
                   "       displayctl pool --pid PID --pool-offset N --pool-bytes N --size WxH --stride N --seq-offset N [--fb-offset N] [--vm protected|shared]\n"
                   "                       [--seconds N] [--helper PATH] [-- helper options]\n"
                   "       displayctl touch --evdev /dev/input/eventN --socket PATH [--wait S] [--swipe-at S [--swipe-every S]]\n"
-                  "                        [--keys /dev/input/eventA,... [--screen-file PATH]]\n");
+                  "                        [--keys /dev/input/eventA,... [--screen-file PATH [--power-blanks]]] [--boost PATH=VALUE,... --boost-state FILE] [--scan-time]\n");
   return 2;
 }
 
@@ -620,12 +630,12 @@ static int send_all(int fd, const void *data, size_t size)
 
 // The test swipe (--swipe-at): one finger from the middle of the bottom edge up to the middle of the panel in 20 steps of
 // 16 ms (about a third of a second, as a finger opens the lock screen), then lifted. 0, or -1 when crosvm went.
-static int send_swipe(int client, int xmax, int ymax)
+static int send_swipe(int client, int xmax, int ymax, uint64_t scan_hz)
 {
   const uint32_t x = (uint32_t)(xmax / 2);
   for (int step = 0; step <= 20; step++) {
     const uint32_t y = (uint32_t)(ymax - ymax / 2 * step / 20);
-    struct xhd_vinput f[8];
+    struct xhd_vinput f[9];
     unsigned n = 0;
     if (!step) {
       f[n++] = (struct xhd_vinput){ EV_ABS, ABS_MT_SLOT, 0 };
@@ -637,6 +647,7 @@ static int send_swipe(int client, int xmax, int ymax)
     f[n++] = (struct xhd_vinput){ EV_ABS, ABS_MT_POSITION_Y, y };
     f[n++] = (struct xhd_vinput){ EV_ABS, ABS_Y, y };
     f[n++] = (struct xhd_vinput){ EV_SYN, SYN_REPORT, 0 };
+    if (scan_hz) { const int64_t t = scan_monotonic_ns(); n = scan_stamp(f, n, sizeof f / sizeof *f, t, t, scan_counter(), scan_hz, NULL); }
     if (send_all(client, f, n * sizeof *f)) return -1;
     nap_ms(16);
   }
@@ -685,29 +696,72 @@ static void screen_file(const char *path, int off)
   }
 }
 
+// How long the clocks stay raised after the last touch, and how long they are only read at the start (boost.h).
+#define BOOST_HOLD_S 1.5
+#define BOOST_SETTLE_S 30
+
+// The boost's process: -1 for none, else the end of its pipe a touch is told on (it never blocks).
+static int start_boost(struct boost *b, pid_t *child, const int *other, unsigned n)
+{
+  boost_adopt(b);        // here too: boost_restore_state knows the same clocks
+  int ends[2];
+  if (pipe2(ends, O_CLOEXEC | O_NONBLOCK)) { fprintf(stderr, "displayctl touch: boost: %s\n", strerror(errno)); return -1; }
+  fflush(stdout);
+  *child = fork();
+  if (*child) {
+    close(ends[0]);
+    if (*child > 0) return ends[1];
+    fprintf(stderr, "displayctl touch: boost: %s\n", strerror(errno));
+    close(ends[1]);
+    return -1;
+  }
+  // the pipe's end alone ends it, so that the clocks are put back whatever ended the forwarder; the touchscreen is not its
+  signal(SIGTERM, SIG_IGN);
+  signal(SIGINT, SIG_IGN);
+  signal(SIGHUP, SIG_IGN);
+  close(ends[1]);
+  for (unsigned k = 0; k < n; k++) close(other[k]);
+  _exit(boost_run(b, ends[0]));
+}
+
 static int touch_main(int argc, char **argv)
 {
   const char *evdev = NULL, *path = NULL, *keys_list = NULL, *screen_path = NULL;
+  int power_blanks = 0;
   double wait_s = 60, swipe_at = 0, swipe_every = 0;
+  struct boost boost = { .hold_s = BOOST_HOLD_S, .settle_s = BOOST_SETTLE_S };
+  int scan_time = 0, test_evdev = 0;
   for (int i = 2; i < argc; i++) {
+    if (!strcmp(argv[i], "--scan-time")) { scan_time = 1; continue; }
+    if (!strcmp(argv[i], "--test-evdev")) { test_evdev = 1; continue; }
     if (i + 1 >= argc) return usage();
     if (!strcmp(argv[i], "--evdev")) evdev = argv[++i];
     else if (!strcmp(argv[i], "--socket")) path = argv[++i];
     else if (!strcmp(argv[i], "--keys")) keys_list = argv[++i];
     else if (!strcmp(argv[i], "--screen-file")) screen_path = argv[++i];
+    else if (!strcmp(argv[i], "--power-blanks")) power_blanks = 1;
+    else if (!strcmp(argv[i], "--boost")) { if (boost.n || boost_parse(&boost, argv[++i])) return usage(); }
+    else if (!strcmp(argv[i], "--boost-state")) boost.state = argv[++i];
     else if (!strcmp(argv[i], "--wait")) wait_s = atof(argv[++i]);
     else if (!strcmp(argv[i], "--swipe-at")) swipe_at = atof(argv[++i]);
     else if (!strcmp(argv[i], "--swipe-every")) swipe_every = atof(argv[++i]);
     else return usage();
   }
-  if (!evdev || !path || strncmp(evdev, "/dev/input/event", 16) || strchr(evdev + 16, '/') || wait_s <= 0 || wait_s > 600 ||
-      swipe_at < 0 || swipe_at > 3600 || swipe_every < 0 || (swipe_every && swipe_every < 5) || swipe_every > 3600) return usage();
+  if (!evdev || !path || (test_evdev ? !strncmp(evdev, "/dev/", 5) || !strncmp(evdev, "/proc/", 6) : strncmp(evdev, "/dev/input/event", 16) || strchr(evdev + 16, '/')) ||
+      wait_s <= 0 || wait_s > 600 ||
+      swipe_at < 0 || swipe_at > 3600 || swipe_every < 0 || (swipe_every && swipe_every < 5) || swipe_every > 3600 ||
+      !boost.n != !boost.state) return usage();
   signal(SIGPIPE, SIG_IGN);
   int fd = open(evdev, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
   if (fd < 0) { fprintf(stderr, "displayctl touch: %s: %s\n", evdev, strerror(errno)); return 1; }
   char name[80] = "";
   unsigned long props[BITS_OF(INPUT_PROP_CNT)] = { 0 }, abs[BITS_OF(ABS_CNT)] = { 0 }, keys[BITS_OF(KEY_CNT)] = { 0 };
-  if (ioctl(fd, EVIOCGNAME(sizeof name - 1), name) < 0 || ioctl(fd, EVIOCGPROP(sizeof props), props) < 0 ||
+  if (test_evdev) {
+    // the tests' events: a direct multi-touch screen without keys, by fiat
+    strcpy(name, "the tests' events");
+    props[INPUT_PROP_DIRECT / (8 * sizeof(long))] |= 1ul << (INPUT_PROP_DIRECT % (8 * sizeof(long)));
+    for (unsigned code = ABS_MT_SLOT; code <= ABS_MT_POSITION_Y; code++) abs[code / (8 * sizeof(long))] |= 1ul << (code % (8 * sizeof(long)));
+  } else if (ioctl(fd, EVIOCGNAME(sizeof name - 1), name) < 0 || ioctl(fd, EVIOCGPROP(sizeof props), props) < 0 ||
       ioctl(fd, EVIOCGBIT(EV_ABS, sizeof abs), abs) < 0 || ioctl(fd, EVIOCGBIT(EV_KEY, sizeof keys), keys) < 0) {
     fprintf(stderr, "displayctl touch: %s: not an event device (%s)\n", evdev, strerror(errno));
     close(fd);
@@ -727,6 +781,7 @@ static int touch_main(int argc, char **argv)
   struct input_absinfo x = { 0 }, y = { 0 };
   ioctl(fd, EVIOCGABS(ABS_MT_POSITION_X), &x);
   ioctl(fd, EVIOCGABS(ABS_MT_POSITION_Y), &y);
+  if (test_evdev) x.maximum = y.maximum = 4095;
   struct sockaddr_un addr = { .sun_family = AF_UNIX };
   if (strlen(path) >= sizeof addr.sun_path) { close(fd); return usage(); }
   strcpy(addr.sun_path, path);
@@ -742,6 +797,7 @@ static int touch_main(int argc, char **argv)
   fflush(stdout);
   signal(SIGINT, on_signal);
   signal(SIGTERM, on_signal);
+  signal(SIGHUP, on_signal);
   int client = -1;
   struct pollfd listening = { server, POLLIN, 0 };
   for (double deadline = now() + wait_s; client < 0 && !interrupted && now() < deadline;)
@@ -755,7 +811,7 @@ static int touch_main(int argc, char **argv)
   }
   // From here the touchscreen is the VM's: One UI under the layer gets no touches until this ends (the fd's close
   // gives it back even if this is killed).
-  if (ioctl(fd, EVIOCGRAB, 1)) {
+  if (!test_evdev && ioctl(fd, EVIOCGRAB, 1)) {
     fprintf(stderr, "displayctl touch: %s: EVIOCGRAB: %s\n", evdev, strerror(errno));
     close(client);
     close(fd);
@@ -764,11 +820,31 @@ static int touch_main(int argc, char **argv)
   struct input_event ev[64];
   while (read(fd, ev, sizeof ev) > 0) {}         // what One UI was shown already: not the VM's
   printf("displayctl touch: crosvm connected: the touchscreen is the VM's\n");
-  // The side keys (--keys): power, volume up and down to the VM as they come; a click of power switches the panel too
-  // (--screen-file, the helper's), and while it is off the touches are not passed on.
+  // --scan-time: the event times on CLOCK_MONOTONIC for this reader (the clock is the open file's), turned into the counter's
+  // ticks frame by frame. Without that clock, or without the counter's rate, the frames go as before.
+  uint64_t scan_hz = 0;
+  struct scan_stats scan = { 0 };
+  if (scan_time) {
+    int clock = CLOCK_MONOTONIC;
+    if (!test_evdev && ioctl(fd, EVIOCSCLOCKID, &clock)) printf("displayctl touch: scan time: %s gives no CLOCK_MONOTONIC event times (%s): the frames go without it\n", evdev, strerror(errno));
+    else if (!(scan_hz = scan_counter_hz())) printf("displayctl touch: scan time: the counter has no rate: the frames go without it\n");
+    else printf("displayctl touch: scan time: each frame goes with its scan time (the counter at %llu Hz)\n", (unsigned long long)scan_hz);
+  }
+  // The side keys (--keys): power, volume up and down to the VM as they come. A click of power switches the panel only with
+  // --power-blanks (--screen-file, the helper's), and while it is off the touches are not passed on.
   int key_fd[MAX_KEY_DEVICES];
   const unsigned nkeys = open_key_devices(keys_list, key_fd);
   for (unsigned k = 0; k < nkeys; k++) while (read(key_fd[k], ev, sizeof ev) > 0) {}
+  int touched = -1;
+  pid_t boost_child = -1;
+  if (boost.n) {
+    int other[2 + MAX_KEY_DEVICES] = { fd, client };
+    for (unsigned k = 0; k < nkeys; k++) other[2 + k] = key_fd[k];
+    touched = start_boost(&boost, &boost_child, other, 2 + nkeys);
+    if (touched >= 0)
+      printf("displayctl touch: boost: a touch raises %u lowest clocks, for %.1f s after the last one (from %d s on)\n", boost.n, BOOST_HOLD_S, BOOST_SETTLE_S);
+  }
+  double told = 0;
   int screen_off = 0;
   double power_down = 0;
   unsigned long key_events = 0, switches = 0;
@@ -782,8 +858,10 @@ static int touch_main(int argc, char **argv)
   struct pollfd w[2 + MAX_KEY_DEVICES] = { { fd, POLLIN, 0 }, { client, POLLIN, 0 } };
   for (unsigned k = 0; k < nkeys; k++) w[2 + k] = (struct pollfd){ key_fd[k], POLLIN, 0 };
   while (!interrupted && !gone && !lost) {
+    boost_watch(&boost, &boost_child, &touched, now());
     if (next_swipe && now() >= next_swipe && !n) {
-      if (send_swipe(client, x.maximum, y.maximum)) { gone = 1; break; }
+      if (touched >= 0 && write(touched, "t", 1) != 1 && errno == EPIPE) { close(touched); touched = -1; }
+      if (send_swipe(client, x.maximum, y.maximum, scan_hz)) { gone = 1; break; }
       swipes++;
       printf("displayctl touch: test swipe %lu sent (from x %d y %d up to y %d)\n", swipes, x.maximum / 2, y.maximum, y.maximum / 2);
       fflush(stdout);
@@ -804,7 +882,7 @@ static int touch_main(int argc, char **argv)
         if (!m) continue;
         key_events++;
         if (send_all(client, out, m * sizeof *out)) { gone = 1; break; }
-        if (toggle) {
+        if (xhd_power_blanks_panel(toggle, power_blanks)) {
           screen_off = !screen_off;
           switches++;
           if (screen_off) {
@@ -840,6 +918,8 @@ static int touch_main(int argc, char **argv)
       lost = 1;
       break;
     }
+    const int64_t read_ns = scan_hz ? scan_monotonic_ns() : 0;
+    const uint64_t read_counter = scan_hz ? scan_counter() : 0;
     for (size_t k = 0; k < (size_t)r / sizeof *ev; k++) {
       events++;
       // the kernel's buffer overflowed: the frame is lost, up to the next SYN_REPORT
@@ -849,18 +929,38 @@ static int touch_main(int argc, char **argv)
       if (!xhd_touch_event(ev[k].type, ev[k].code, ev[k].value, &v)) continue;
       if (n < sizeof frame / sizeof *frame) frame[n++] = v;
       if (v.type == EV_SYN) {
+        // the frame's time is its SYN_REPORT's (the input core stamps a frame's events alike)
+        if (scan_hz && !screen_off)
+          n = scan_stamp(frame, n, sizeof frame / sizeof *frame, (int64_t)ev[k].input_event_sec * 1000000000 + (int64_t)ev[k].input_event_usec * 1000,
+                         read_ns, read_counter, scan_hz, &scan);
         if (!screen_off && send_all(client, frame, n * sizeof *frame)) { gone = 1; break; }
         if (!screen_off) frames++;
+        // a touch, told once in 100 ms: it never waits for the clocks
+        if (touched >= 0 && !screen_off && n > 1 && now() - told >= 0.1) {
+          told = now();
+          if (write(touched, "t", 1) != 1 && errno == EPIPE) { close(touched); touched = -1; }
+        }
         n = 0;
       }
     }
   }
-  ioctl(fd, EVIOCGRAB, 0);
+  if (!test_evdev) ioctl(fd, EVIOCGRAB, 0);
   close(fd);
   close(client);
   for (unsigned k = 0; k < nkeys; k++) close(key_fd[k]);
+  if (touched >= 0) close(touched);
+  touched = -1;
+  for (int k = 0; k < 40 && (boost_child > 0 || boost.left); k++) {
+    boost_watch(&boost, &boost_child, &touched, now());
+    if (boost_child > 0 || boost.left) nap_ms(50);
+  }
+  if (boost_child > 0 || boost.left) fprintf(stderr, "displayctl touch: boost: not every clock is back yet: its file is boot.sh's\n");
   screen_file(screen_path, 0);      // the panel on again for whatever comes after the VM
   if (nkeys) printf("displayctl touch: %lu side key events to the VM, the panel switched %lu times\n", key_events, switches);
+  if (scan_hz)
+    printf("displayctl touch: scan time: %lu frames went with it (the forwarder had each %llu / %llu / %llu us after its scan: least, mean, most), %lu without\n",
+           scan.stamped, (unsigned long long)scan.least_us, (unsigned long long)(scan.stamped ? scan.sum_us / scan.stamped : 0),
+           (unsigned long long)scan.most_us, scan.bare);
   printf("displayctl touch: %s after %lu frames (%lu events read, %lu overflows, %lu test swipes): the touchscreen is Android's again\n",
          gone ? "crosvm went" : lost ? "the touchscreen went away" : interrupted ? "stopped" : "ended", frames, events, overflows, swipes);
   return 0;

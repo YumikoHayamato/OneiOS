@@ -30,11 +30,17 @@ build/host/xnuloader-crosvm: tools/xnuloader-crosvm.c $(IMAGE_DISKS) build/host/
 	$(CC) $(CFLAGS) -I../xnuhost/src tools/xnuloader-crosvm.c tools/image_disks.c ../xnuhost/src/imageset.c build/host/libxnuloader.a -lpthread -o $@
 build/host/test_loader: tests/test_loader.c build/host/libxnuloader.a $(HDR)
 	$(CC) $(CFLAGS) -fsanitize=address,undefined tests/test_loader.c $(SRC) -o $@
+# the tests' generated kernel (and generated identity tree) as files, for the checks that run xnuloader-crosvm and
+# xnuloader-qemu themselves (tests/test_crosvm_tool.sh)
+build/host/fixture-kernel: tests/fixture_kernel.c tests/fixture.h build/host/libxnuloader.a
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) tests/fixture_kernel.c build/host/libxnuloader.a -o $@
 
-test: build/host/test_loader build/host/xnuloader-inspect
+test: build/host/test_loader build/host/xnuloader-inspect build/host/xnuloader-crosvm build/host/xnuloader-qemu build/host/fixture-kernel
 	build/host/test_loader
 	build/host/xnuloader-inspect board 4 > build/host/board.adt
 	build/host/xnuloader-inspect adt build/host/board.adt > /dev/null
+	sh tests/test_crosvm_tool.sh build/host
 
 build/android/%.o: src/%.c $(HDR)
 	@mkdir -p $(@D)

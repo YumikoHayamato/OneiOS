@@ -369,6 +369,11 @@ int xhd_frame_seq(const uint8_t *page, uint64_t *count)
   return 1;
 }
 
+int xhd_power_blanks_panel(int toggle, int power_blanks)
+{
+  return toggle && power_blanks;
+}
+
 unsigned xhd_side_key(uint16_t type, uint16_t code, int32_t value, double now, double *power_down, int *toggle,
                       struct xhd_vinput out[2])
 {

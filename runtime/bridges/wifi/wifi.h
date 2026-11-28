@@ -29,6 +29,13 @@ bool br_wifi_to_guest(const uint8_t *frame, size_t length, const uint8_t mac[6])
 // frame. Returns the frames given (0: the frame was too long and not TCP: dropped).
 typedef void (*br_wifi_segment_fn)(void *ctx, const uint8_t *frame, size_t length);
 size_t br_wifi_segment(const uint8_t *frame, size_t length, uint16_t mss, bool coalesced, br_wifi_segment_fn fn, void *ctx);
+// take18: a coalesced UDP frame (virtio-net gso type UDP_L4, 5: UDP GRO or the Wi-Fi driver's own flow aggregation) cut
+// back into its datagrams of `size` payload bytes (the last one the rest), each with its lengths and checksums made
+// again. Returns the datagrams given (0: not UDP, IPv6 with extension headers, or a size that does not fit the link).
+size_t br_wifi_segment_udp(const uint8_t *frame, size_t length, uint16_t size, br_wifi_segment_fn fn, void *ctx);
+// A frame for the guest that was not handed on: what it was, for the bridge's counters and its first lines.
+enum { BR_WIFI_DROP_UDP_GSO, BR_WIFI_DROP_OTHER_GSO, BR_WIFI_DROP_UDP, BR_WIFI_DROP_IP, BR_WIFI_DROP_NOT_IP, BR_WIFI_DROP_KINDS };
+unsigned br_wifi_drop_kind(const uint8_t *frame, size_t length, uint8_t gso_type);
 
 // A DHCP message as the log names it (frames.c): whose it is (the client's hardware address), what it asks or gives.
 // A REQUEST never has a yiaddr: the address it asks for is option 50 (SELECTING, INIT-REBOOT) or its ciaddr (RENEWING,

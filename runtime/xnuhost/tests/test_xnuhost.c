@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -15,6 +16,9 @@
 #include "stub_abi.h"
 // The oneios-cpu window's arithmetic, the kernel's own file (gpu/OneiOSAdreno.cpp includes it).
 #include "../../kernel/patches/oneios-hosted/gpu/cpu_window.h"
+#include "../../kernel/patches/oneios-hosted/gpu/frame_stages.h"
+#include "../../kernel/patches/oneios-hosted/gpu/watch.h"
+#include "../../kernel/patches/oneios-hosted/display/vsync_lock.h"
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <errno.h>
@@ -1661,6 +1665,391 @@ static void test_cpu_window(void)
   CHECK(oneios_cpu_percent(5, 0) == 0);
 }
 
+// ---- the event lines (kernel/patches/oneios-hosted/gpu/watch.h, take17 2026-11-26) ----
+static void test_watch(void)
+{
+  // A candidate gap: 150 ms to 5 s, right after frames (the swap before came within 50 ms). 0 as the least: off.
+  CHECK(oneios_hitch_is(739000, 16000, 150000) && oneios_hitch_is(150000, 49999, 150000) && oneios_hitch_is(5000000, 8000, 150000));
+  CHECK(!oneios_hitch_is(149999, 16000, 150000));        // too short: a skipped refresh, the 10 s histogram's
+  CHECK(!oneios_hitch_is(5000001, 16000, 150000));       // the screen at rest
+  CHECK(!oneios_hitch_is(739000, 50000, 150000));        // not after frames: the pause before was long too
+  CHECK(!oneios_hitch_is(739000, 0, 150000));            // the first gap ever has no gap before it
+  CHECK(!oneios_hitch_is(739000, 16000, 0));
+  // A tick's list: largest first, one entry a pid, the smallest going when a larger one comes to a full list.
+  struct oneios_watch_proc list[ONEIOS_WATCH_PROCS];
+  uint32_t count = 0;
+  memset(list, 0, sizeof list);
+  oneios_watch_put(list, &count, 55, "backboardd", 3000);
+  oneios_watch_put(list, &count, 287, "com.apple.WebKit.WebContent", 70000);
+  oneios_watch_put(list, &count, 299, "com.apple.WebKit.GPU", 9000);
+  CHECK(count == 3 && list[0].pid == 287 && list[1].pid == 299 && list[2].pid == 55);
+  CHECK(!strcmp(list[0].name, "com.apple.WebKit.We") && strlen(list[0].name) == sizeof list[0].name - 1);   // cut, and ended
+  oneios_watch_put(list, &count, 55, "backboardd", 8000);   // the same pid: added, and moved up
+  CHECK(count == 3 && list[1].pid == 55 && list[1].us == 11000 && list[2].pid == 299);
+  for (int pid = 1000; count < ONEIOS_WATCH_PROCS; pid++) oneios_watch_put(list, &count, pid, "filler", 600);
+  oneios_watch_put(list, &count, 2000, "small", 500);       // smaller than the smallest: not kept
+  CHECK(count == ONEIOS_WATCH_PROCS && list[ONEIOS_WATCH_PROCS - 1].pid != 2000);
+  oneios_watch_put(list, &count, 2001, "large", 5000);      // larger: takes the smallest one's place, in order
+  CHECK(count == ONEIOS_WATCH_PROCS && list[3].pid == 2001 && list[2].pid == 299 && list[ONEIOS_WATCH_PROCS - 1].us == 600);
+  // A ring of 100 ms ticks, wrapped: a game at 50 % of a core, a freeze of 700 ms in which its process has a whole one
+  // (its time arrives with the tick after the freeze, as a task's does when its thread switches at last).
+  static struct oneios_watch_tick ring[ONEIOS_WATCH_TICKS];
+  memset(ring, 0, sizeof ring);
+  uint64_t head = 0;
+  const uint64_t base = 1000000000ull;
+  for (unsigned i = 0; i < 100; i++, head++) {
+    struct oneios_watch_tick *t = &ring[head % ONEIOS_WATCH_TICKS];
+    memset(t, 0, sizeof *t);
+    t->at_us = base + (uint64_t)(i + 1) * 100000;
+    const int frozen = i >= 80 && i < 87;                  // the ticks ending at +8.1 s to +8.7 s
+    const uint32_t game = frozen ? 0 : i == 87 ? 750000 : 50000;
+    if (game) oneios_watch_put(t->procs, &t->count, 287, "com.apple.WebKit.WebContent", game);
+    oneios_watch_put(t->procs, &t->count, 55, "backboardd", frozen ? 1000 : 20000);
+    t->all_us = game + (frozen ? 1000 : 20000);
+    t->app_submits = frozen ? 0 : 14;
+    t->rs_submits = frozen ? 0 : 6;
+    t->blobs = i == 87 ? 9 : 0;
+  }
+  struct oneios_watch_sum sum;
+  // The gap: from +8.0 s to +8.7 s; the window takes the tick after it too (the kernel asks for 100 ms more).
+  const uint64_t from = base + 8000000, to = base + 8700000;
+  CHECK(oneios_watch_sum_window(ring, head, from, to + 100000, &sum) == 8 && sum.span_us == 800000);
+  CHECK(sum.count == 2 && sum.procs[0].pid == 287 && sum.procs[0].us == 750000 && sum.procs[1].pid == 55 && sum.procs[1].us == 7000 + 20000);
+  CHECK(sum.all_us == 750000 + 27000 && sum.app_submits == 14 && sum.rs_submits == 6 && sum.blobs == 9);
+  CHECK(oneios_hitch_kind(&sum, 700000) == 2);             // one process had a CPU for the gap
+  // The same gap with nothing running: a wait.
+  CHECK(oneios_watch_sum_window(ring, head, from, to, &sum) == 7 && sum.span_us == 700000 && sum.all_us == 7000 && oneios_hitch_kind(&sum, 700000) == 0);
+  // Several processes that share the work: the CPUs busy, no single doer.
+  memset(&sum, 0, sizeof sum);
+  oneios_watch_put(sum.procs, &sum.count, 1, "a", 200000);
+  oneios_watch_put(sum.procs, &sum.count, 2, "b", 180000);
+  sum.all_us = 380000;
+  CHECK(oneios_hitch_kind(&sum, 700000) == 1);
+  // A window older than the ring (it holds the last 6.4 s) takes nothing; an empty or one-tick ring too.
+  CHECK(oneios_watch_sum_window(ring, head, base, base + 500000, &sum) == 0 && sum.all_us == 0);
+  CHECK(oneios_watch_sum_window(ring, 0, from, to, &sum) == 0 && oneios_watch_sum_window(ring, 1, 0, ~0ull, &sum) == 0);
+  // The room: take16's render server with a 1080p video, of the 2 GiB the phone's crosvm gives a context.
+  const uint64_t mib = 1ull << 20, range = 2048 * mib;
+  CHECK(oneios_room_percent(1979 * mib, range) == 96 && oneios_room_percent(605 * mib, range) == 29 && oneios_room_percent(3000 * mib, range) == 100);
+  CHECK(oneios_room_percent(1979 * mib, 0) == 0);          // a client whose capset was not seen
+  CHECK(oneios_room_event(605 * mib, 2028 * mib, range) == 1);     // the video's first seconds
+  CHECK(oneios_room_event(1979 * mib, 1982 * mib, range) == 0);    // it stays there: said once
+  CHECK(oneios_room_event(1982 * mib, 424 * mib, range) == 2);     // the video ends: 1.5 GiB let go
+  CHECK(oneios_room_event(1730 * mib, 1505 * mib, range) == 0 && oneios_room_event(1730 * mib, 1474 * mib, range) == 2);   // an eighth is 256 MiB
+  CHECK(oneios_room_event(1840 * mib, 1850 * mib, range) == 1 && oneios_room_event(1850 * mib, 1840 * mib, range) == 0);   // 90 % is 1843.2
+  CHECK(oneios_room_event(605 * mib, 2028 * mib, 0) == 0);
+  // take20: oneios-frames' gaps: 25 ms up to the hitch lines' least, right after frames; three classes; the longest three.
+  CHECK(oneios_frames_is(25000, 8000, 150000) && oneios_frames_is(149999, 49999, 150000) && !oneios_frames_is(150000, 8000, 150000));
+  CHECK(!oneios_frames_is(24999, 8000, 150000) && !oneios_frames_is(40000, 50000, 150000) && !oneios_frames_is(40000, 0, 150000));
+  CHECK(oneios_frames_is(149999, 8000, 0) && !oneios_frames_is(150000, 8000, 0));   // the hitch lines off: below 150 ms still
+  CHECK(oneios_frames_is(199000, 8000, 200000));                                    // oneios-hitch-ms=200: up to 199 ms here
+  CHECK(oneios_frames_class(25000) == 0 && oneios_frames_class(49999) == 0 && oneios_frames_class(50000) == 1 &&
+        oneios_frames_class(99999) == 1 && oneios_frames_class(100000) == 2);
+  static struct oneios_frame_gap frames[ONEIOS_FRAMES_RING];
+  struct oneios_frame_gap top[ONEIOS_FRAMES_KEPT];
+  memset(frames, 0, sizeof frames);
+  for (uint64_t n = 0; n < 100; n++) frames[n % ONEIOS_FRAMES_RING] = (struct oneios_frame_gap){25000 + n * 1000, 5000000 + n};
+  CHECK(oneios_frames_longest(frames, 0, 0, top) == 0 && top[0].gap_us == 0 && top[2].gap_us == 0);   // none
+  CHECK(oneios_frames_longest(frames, 90, 100, top) == 10 && top[0].gap_us == 124000 && top[0].at_us == 5000099 &&
+        top[1].gap_us == 123000 && top[2].gap_us == 122000);
+  CHECK(oneios_frames_longest(frames, 0, 100, top) == ONEIOS_FRAMES_RING && top[0].gap_us == 124000);   // the ring's last 64
+  frames[95 % ONEIOS_FRAMES_RING].gap_us = 140000;                                  // a longer one in the middle
+  CHECK(oneios_frames_longest(frames, 90, 100, top) == 10 && top[0].gap_us == 140000 && top[0].at_us == 5000095 && top[1].gap_us == 124000);
+  CHECK(oneios_frames_longest(frames, 99, 100, top) == 1 && top[0].gap_us == 124000 && top[1].gap_us == 0);
+  // oneios-wake: a rest is 3 s to 10 minutes; complete with 8 gaps and 8 legs, or a second after its start.
+  CHECK(oneios_wake_is(3000000) && oneios_wake_is(600000000) && !oneios_wake_is(2999999) && !oneios_wake_is(600000001));
+  struct oneios_wake w;
+  memset(&w, 0, sizeof w);
+  CHECK(!oneios_wake_complete(&w, 99000000));                                      // none begun
+  w.at_us = 50000000; w.rest_us = 33000000;
+  CHECK(!oneios_wake_complete(&w, 50500000) && oneios_wake_complete(&w, 51000000));
+  w.gaps = ONEIOS_WAKE_FRAMES; w.legs = ONEIOS_WAKE_FRAMES - 1;
+  CHECK(!oneios_wake_complete(&w, 50100000));
+  w.legs = ONEIOS_WAKE_FRAMES + 3;                                                    // the slots' counter can pass 8
+  CHECK(oneios_wake_complete(&w, 50100000));
+  char wl[100];
+  const uint32_t gaps[3] = {9100, 8333, 25049};
+  CHECK(oneios_wake_list(wl, sizeof wl, gaps, 3) == 12 && !strcmp(wl, "9.1/8.3/25.0"));
+  CHECK(oneios_wake_list(wl, sizeof wl, gaps, 0) == 1 && !strcmp(wl, "-"));
+  CHECK(oneios_wake_list(wl, 6, gaps, 3) == 5 && strlen(wl) == 5);                 // cut, never past the buffer
+  const uint32_t many[12] = {1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000, 11000, 12000};
+  CHECK(oneios_wake_list(wl, sizeof wl, many, 12) > 0 && !strcmp(wl, "1.0/2.0/3.0/4.0/5.0/6.0/7.0/8.0"));   // at most 8
+  // The sum's slow blobs (take20): added per tick as the blobs are.
+  memset(ring, 0, sizeof ring);
+  for (unsigned i = 0; i < 4; i++) { ring[i].at_us = base + (uint64_t)(i + 1) * 100000; ring[i].blobs = 10; ring[i].slow_blobs = i; }
+  CHECK(oneios_watch_sum_window(ring, 4, base, base + 500000, &sum) == 3 && sum.blobs == 30 && sum.slow_blobs == 1 + 2 + 3);
+}
+
+// ---- the frame-stage lines (kernel/patches/oneios-hosted/gpu/frame_stages.h, native-perf 2026-11-26) ----
+static void test_frame_stages(void)
+{
+  // The buckets: under 0.25, 0.5, 1, 2, 4, 8, 16, 32 ms, then longer. An edge belongs to the bucket above it.
+  CHECK(oneios_stage_bucket(0) == 0 && oneios_stage_bucket(249) == 0 && oneios_stage_bucket(250) == 1);
+  CHECK(oneios_stage_bucket(999) == 2 && oneios_stage_bucket(1000) == 3 && oneios_stage_bucket(7999) == 5 && oneios_stage_bucket(8000) == 6);
+  CHECK(oneios_stage_bucket(8333) == 6 && oneios_stage_bucket(16000) == 7 && oneios_stage_bucket(31999) == 7);
+  CHECK(oneios_stage_bucket(32000) == 8 && oneios_stage_bucket(~0ull) == 8);
+  // A round of the phone's kind: 1000 submissions, most at 3 to 6 ms, a tail.
+  struct oneios_stage_hist h = { 0 }, was = { 0 }, now;
+  for (unsigned i = 0; i < 700; i++) oneios_stage_add(&h, 3000 + i);          // 3.0 to 3.7 ms: under 4
+  for (unsigned i = 0; i < 250; i++) oneios_stage_add(&h, 6000);              // under 8
+  for (unsigned i = 0; i < 45; i++) oneios_stage_add(&h, 12000);              // under 16
+  for (unsigned i = 0; i < 5; i++) oneios_stage_add(&h, 40000);               // longer
+  oneios_stage_read(&h, &now);
+  CHECK(now.count == 1000 && now.max == 40000 && now.bucket[4] == 700 && now.bucket[5] == 250 && now.bucket[6] == 45 && now.bucket[8] == 5);
+  CHECK(now.sum == 700ull * 3000 + 699 * 700 / 2 + 250ull * 6000 + 45ull * 12000 + 5ull * 40000);
+  char text[120];
+  int n = oneios_stage_text(text, sizeof text, &now, &was, 8);
+  CHECK(!strcmp(text, "+0/+0/+0/+0/+700/+250/+45/+0 longer +5 mean 4584 us") && n == (int)strlen(text));
+  // The next round counts from the last reading; with five buckets shown the rest is "longer".
+  was = now;
+  for (unsigned i = 0; i < 10; i++) oneios_stage_add(&h, 100);
+  oneios_stage_add(&h, 5000);
+  oneios_stage_read(&h, &now);
+  oneios_stage_text(text, sizeof text, &now, &was, 5);
+  CHECK(!strcmp(text, "+10/+0/+0/+0/+0 longer +1 mean 545 us"));
+  // Nothing new: zeros and no division by zero. A buffer too short cuts the text and still ends it.
+  was = now;
+  oneios_stage_text(text, sizeof text, &now, &was, 8);
+  CHECK(!strcmp(text, "+0/+0/+0/+0/+0/+0/+0/+0 longer +0 mean 0 us"));
+  char tight[12];
+  memset(tight, 'x', sizeof tight);
+  n = oneios_stage_text(tight, sizeof tight, &now, &was, 8);
+  CHECK(n == 11 && strlen(tight) <= 11);
+  CHECK(oneios_stage_text(tight, 0, &now, &was, 8) == 0);
+  // shown outside 1..8 is taken as the nearest
+  oneios_stage_text(text, sizeof text, &now, &was, 0);
+  CHECK(!strcmp(text, "+0 longer +0 mean 0 us"));
+  oneios_stage_text(text, sizeof text, &now, &was, 99);
+  CHECK(!strcmp(text, "+0/+0/+0/+0/+0/+0/+0/+0 longer +0 mean 0 us"));
+
+  // The transport's histograms: 12 buckets by powers of two from 32 us; their change as the lines print it.
+  uint32_t legs[ONEIOS_LEG_BUCKETS] = { 0 }, legs_was[ONEIOS_LEG_BUCKETS] = { 0 };
+  uint64_t shown[ONEIOS_LEG_SHOWN];
+  for (unsigned i = 0; i < ONEIOS_LEG_BUCKETS; i++) legs[i] = i + 1;          // 1 under 32 us ... 12 over 32.8 ms
+  CHECK(oneios_leg_delta(legs, legs_was, shown) == 78);
+  CHECK(shown[0] == 1 + 2 + 3 + 4 + 5 && shown[1] == 6 && shown[2] == 7 && shown[3] == 8 && shown[4] == 9 && shown[5] == 10 && shown[6] == 11 &&
+        shown[7] == 12);
+  uint64_t kicks[ONEIOS_KICK_SHOWN];
+  CHECK(oneios_kick_delta(legs, legs_was, kicks) == 78);
+  CHECK(kicks[0] == 1 && kicks[5] == 6 && kicks[6] == 7 + 8 + 9 + 10 + 11 + 12);
+  // The counters are 32 bits: a wrap between two readings is still the small difference.
+  legs_was[3] = 0xfffffff0u; legs[3] = 0x10;
+  oneios_leg_delta(legs, legs_was, shown);
+  CHECK(shown[0] == 1 + 2 + 3 + 0x20 + 5);
+
+  // The gaps between swaps at 120 Hz (a refresh is 8.3 ms): 0-5 ms early, 6-11 one refresh, 12-20 one skipped,
+  // 21-39 more, 40+ a pause.
+  uint64_t gap[ONEIOS_GAP_STEPS] = { 0 }, gap_was[ONEIOS_GAP_STEPS] = { 0 }, classes[ONEIOS_GAP_CLASSES];
+  gap[2] = 3; gap[5] = 1; gap[6] = 10; gap[8] = 1000; gap[11] = 7; gap[12] = 2; gap[16] = 50; gap[20] = 4; gap[21] = 1; gap[25] = 6; gap[39] = 2;
+  gap[40] = 12;
+  CHECK(oneios_gap_classes(gap, gap_was, 120, classes) == 3 + 1 + 10 + 1000 + 7 + 2 + 50 + 4 + 1 + 6 + 2 + 12);
+  CHECK(classes[0] == 4 && classes[1] == 1017 && classes[2] == 56 && classes[3] == 9 && classes[4] == 12);
+  // The same gaps at 60 Hz (16.7 ms): up to 11 ms early, 12-24 one refresh, 25-39 one skipped; nothing can be "more" under 40 ms.
+  oneios_gap_classes(gap, gap_was, 60, classes);
+  CHECK(classes[0] == 3 + 1 + 10 + 1000 + 7 && classes[1] == 2 + 50 + 4 + 1 && classes[2] == 6 + 2 && classes[3] == 0 && classes[4] == 12);
+  // No rate given: 60. Only what came since the last reading counts.
+  uint64_t unknown[ONEIOS_GAP_CLASSES];
+  oneios_gap_classes(gap, gap_was, 0, unknown);
+  CHECK(!memcmp(unknown, classes, sizeof classes));
+  memcpy(gap_was, gap, sizeof gap);
+  gap[8] += 5;
+  CHECK(oneios_gap_classes(gap, gap_was, 120, classes) == 5 && classes[1] == 5 && classes[0] + classes[2] + classes[3] + classes[4] == 0);
+  // The rate while moving: 1130 gaps in 9.96 s of gaps are 113.4 a second; no gaps, no rate.
+  CHECK(oneios_gap_rate_tenths(1130, 9960000) == 1134 && oneios_gap_rate_tenths(0, 0) == 0 && oneios_gap_rate_tenths(120, 1000000) == 1200);
+}
+
+// ---- the refresh tick on the panel's grid (kernel/patches/oneios-hosted/display/vsync_lock.h, native-perf 2026-11-26) ----
+// A deterministic jitter for the simulations: a tick handled 0 to `most` ticks of the counter after its place.
+static uint64_t vsync_jitter(uint32_t *seed, uint64_t most)
+{
+  *seed = *seed * 1664525u + 1013904223u;
+  return most ? (*seed >> 8) % (most + 1) : 0;
+}
+
+// A writer for the reader test below: every record's fields all hold the same number, which only goes up.
+static void *vsync_stress_writer(void *arg)
+{
+  struct { uint64_t words[ONEIOS_VSYNC_WORDS]; volatile int stop; } *sh = arg;
+  for (uint64_t n = 1; !sh->stop; n++) {
+    struct oneios_vsync_panel in = { .at = n, .period_q8 = n, .written = n, .phase = (int64_t)n };
+    oneios_vsync_write(sh->words, &in);
+  }
+  return NULL;
+}
+
+static void test_vsync_lock(void)
+{
+  const uint64_t hz = 19200000, nominal = 159999;                      // the S25's counter, 1/120 s as the kernel rounds it
+  struct oneios_vsync_state st = { 0 };
+  uint64_t told = 0;
+  // No record: the tick is the caller's free-running one, the compositor is told the nominal period.
+  CHECK(oneios_vsync_next(&st, NULL, 1000000, 1000000 + nominal, nominal, hz, &told) == 1000000 + nominal && told == nominal);
+  CHECK(!st.locked && st.sent == 1 && st.on_grid == 0 && st.gained == 0 && st.lost == 0);
+
+  // A panel 0.3 % slower than the guest's timer (8358 us a refresh), its grid written a moment ago.
+  const uint64_t period_q8 = 160480ull * 256 + 77;                     // 160480.30 ticks
+  struct oneios_vsync_panel p = { .at = 50000000, .period_q8 = period_q8, .written = 50000100, .phase = 0 };
+  CHECK(oneios_vsync_usable(&p, 50000200, hz));
+  // From anywhere in a period the first tick lands on the grid, half a period to one and a half away.
+  for (uint64_t off = 0; off < 160480; off += 7919) {
+    const uint64_t now = 50000000 + 3 * 160480 + off, next = oneios_vsync_on_grid(&p, now);
+    const uint64_t k = (next - p.at + 80240) / 160480;                 // the nearest grid point's number
+    const int64_t miss = (int64_t)(next - (p.at + ((k * period_q8 + 128) >> 8)));
+    CHECK(next - now >= 80240 && next - now <= 240721 && miss >= -1 && miss <= 1);
+  }
+  // On it, a tick handled a little late is followed by the next grid point: one period later, to a tick of the counter.
+  uint32_t seed = 7;
+  uint64_t tick = oneios_vsync_on_grid(&p, 50000200), least = ~0ull, most = 0;
+  for (int i = 0; i < 2000; i++) {
+    const uint64_t now = tick + vsync_jitter(&seed, 4000);            // up to 0.2 ms late
+    const uint64_t next = oneios_vsync_next(&st, &p, now, tick + nominal, nominal, hz, &told);
+    p.written = now;                                                   // the publisher keeps it fresh
+    if (next - tick < least) least = next - tick;
+    if (next - tick > most) most = next - tick;
+    tick = next;
+  }
+  CHECK(least >= 160480 && most <= 160481 && told == 160480 && st.locked && st.gained == 1 && st.lost == 0 && st.on_grid == 2000);
+  // 2000 ticks later the tick is still on the panel's grid; the free-running timer would have slipped 2000 x 481 ticks, 6 periods
+  const uint64_t k = (tick - p.at + 80240) / 160480;
+  const int64_t miss = (int64_t)(tick - (p.at + ((k * period_q8 + 128) >> 8)));
+  CHECK(miss >= -1 && miss <= 1 && 2000ull * (160480 - nominal) / 160480 == 5);
+  // A tick that fires very late (a stalled vCPU: 0.7 and 3.2 periods) skips to the grid's next point at least half a period on.
+  uint64_t now = tick + 112336, next = oneios_vsync_next(&st, &p, now, now + nominal, nominal, hz, &told);
+  CHECK(next == tick + 2 * 160480 + 1 || next == tick + 2 * 160480);
+  now = tick + 513537; next = oneios_vsync_next(&st, &p, now, now + nominal, nominal, hz, &told);
+  CHECK(next - now >= 80240 && next - now <= 240721 && (next - p.at + 80240) / 160480 == k + 4);
+
+  // The phase moves the tick off the grid by that much, either way.
+  struct oneios_vsync_panel q = { .at = 50000000, .period_q8 = 160000ull * 256, .written = 50000000, .phase = 40000 };
+  CHECK(oneios_vsync_on_grid(&q, 50000000) == 50000000 + 160000 + 40000);   // the point at +40000 is too near: the next one
+  q.phase = -40000;
+  CHECK(oneios_vsync_on_grid(&q, 50000000) == 50000000 + 120000);
+  q.phase = 100000;
+  CHECK(oneios_vsync_on_grid(&q, 50000000) == 50000000 + 100000);
+  // A grid point in the future (surfaceflinger's next deadline) or long past is the same grid.
+  q.phase = 0; q.at = 50000000 + 7 * 160000;
+  CHECK(oneios_vsync_on_grid(&q, 50000000 + 10) == 50000000 + 160000);
+  q.at = 50000000 - 3000 * 160000ull;
+  CHECK(oneios_vsync_on_grid(&q, 50000000 + 10) == 50000000 + 160000);
+
+  // What is not usable, each for one reason, and the tick then runs free and says so once.
+  struct oneios_vsync_panel bad = p;
+  bad.written = now; CHECK(oneios_vsync_usable(&bad, now, hz));
+  bad.written = now - 3 * hz; CHECK(!oneios_vsync_usable(&bad, now, hz));                    // stale: the publisher ended
+  bad.written = now + hz; CHECK(!oneios_vsync_usable(&bad, now, hz));                        // written in this side's future
+  // written a moment after this side read its `now` (the publisher's turn fell between the tick's two reads): still the panel's
+  bad.written = now + 1; CHECK(oneios_vsync_usable(&bad, now, hz));
+  bad.written = now + hz / 4; CHECK(oneios_vsync_usable(&bad, now, hz));
+  bad.written = now + hz / 4 + 1; CHECK(!oneios_vsync_usable(&bad, now, hz));
+  bad.written = now - 2 * hz - hz / 4; CHECK(oneios_vsync_usable(&bad, now, hz));            // two seconds and the slack: the last usable age
+  bad.written = now - 2 * hz - hz / 4 - 1; CHECK(!oneios_vsync_usable(&bad, now, hz));
+  { // and such a record keeps the tick on the grid: nothing is given up
+    struct oneios_vsync_state keep = { 0 };
+    struct oneios_vsync_panel fresh = p;
+    fresh.written = now;
+    oneios_vsync_next(&keep, &fresh, now, now + nominal, nominal, hz, &told);
+    fresh.written = now + 160480 + 500;                                  // written after the next tick's `now` was read
+    oneios_vsync_next(&keep, &fresh, now + 160480, now + 160480 + nominal, nominal, hz, &told);
+    CHECK(keep.locked && keep.gained == 1 && keep.lost == 0 && keep.on_grid == 2);
+  }
+  bad = p; bad.written = now; bad.period_q8 = (hz / 250) * 256; CHECK(!oneios_vsync_usable(&bad, now, hz));   // 250 Hz
+  bad.period_q8 = (hz / 20) * 256; CHECK(!oneios_vsync_usable(&bad, now, hz));               // 20 Hz
+  bad.period_q8 = 0; CHECK(!oneios_vsync_usable(&bad, now, hz));
+  bad = p; bad.written = now; bad.at = now + 61 * hz; CHECK(!oneios_vsync_usable(&bad, now, hz));
+  bad.at = now - 61 * hz; CHECK(!oneios_vsync_usable(&bad, now, hz));
+  bad = p; bad.written = now; bad.phase = (int64_t)hz; CHECK(!oneios_vsync_usable(&bad, now, hz));
+  bad.phase = -(int64_t)hz; CHECK(!oneios_vsync_usable(&bad, now, hz));
+  CHECK(!oneios_vsync_usable(NULL, now, hz) && !oneios_vsync_usable(&p, now, 0));
+  // 60 Hz and 24 Hz panels are displays; so is 240
+  bad = p; bad.written = now; bad.period_q8 = (hz / 60) * 256; CHECK(oneios_vsync_usable(&bad, now, hz));
+  bad.period_q8 = (hz / 24) * 256; CHECK(oneios_vsync_usable(&bad, now, hz));
+  bad.period_q8 = (hz / 240) * 256; CHECK(oneios_vsync_usable(&bad, now, hz));
+  const uint64_t lost_before = st.lost;
+  p.written = now - 5 * hz;                                             // the publisher went away
+  CHECK(oneios_vsync_next(&st, &p, now, now + nominal, nominal, hz, &told) == now + nominal && told == nominal && !st.locked && st.lost == lost_before + 1);
+  CHECK(oneios_vsync_next(&st, &p, now + nominal, now + 2 * nominal, nominal, hz, &told) == now + 2 * nominal && st.lost == lost_before + 1);
+  p.written = now + 2 * nominal;                                        // and came back
+  next = oneios_vsync_next(&st, &p, now + 2 * nominal, now + 3 * nominal, nominal, hz, &told);
+  CHECK(st.locked && st.gained == 2 && told == 160480 && next - (now + 2 * nominal) >= 80240 && next - (now + 2 * nominal) <= 240721);
+
+  // The whole thing as a session runs it: the panel at 119.64 Hz, the publisher writing the panel's next deadline four times
+  // a second (the deadline a few periods ahead, as surfaceflinger gives it), the kernel ticking with up to 0.3 ms of lateness.
+  // Every tick stays within a tick of the counter of the panel's grid, and there is one tick for each refresh.
+  struct oneios_vsync_state run = { 0 };
+  struct oneios_vsync_panel shared = { 0 };
+  const uint64_t start = 900000000ull;
+  uint64_t t = start, written_at = 0, worst = 0, ticks = 0;
+  seed = 99;
+  tick = start + nominal;
+  while (t < start + 30 * hz) {
+    now = tick + vsync_jitter(&seed, 5760);
+    if (now - written_at >= hz / 4) {                                   // the publisher's turn came before this tick
+      const uint64_t n = (now - start) * 256 / period_q8 + 3;
+      shared = (struct oneios_vsync_panel){ .at = start + ((n * period_q8 + 128) >> 8), .period_q8 = period_q8, .written = now, .phase = 0 };
+      written_at = now;
+    }
+    next = oneios_vsync_next(&run, &shared, now, tick + nominal <= now ? now + nominal : tick + nominal, nominal, hz, &told);
+    if (run.on_grid > 1) {
+      const uint64_t n = ((tick - start) * 256 + period_q8 / 2) / period_q8;
+      const int64_t off = (int64_t)(tick - (start + ((n * period_q8 + 128) >> 8)));
+      if ((uint64_t)(off < 0 ? -off : off) > worst) worst = (uint64_t)(off < 0 ? -off : off);
+    }
+    tick = next; t = now; ticks++;
+  }
+  CHECK(worst <= 1 && run.gained == 1 && run.lost == 0);
+  CHECK(ticks >= 30ull * hz * 256 / period_q8 - 2 && ticks <= 30ull * hz * 256 / period_q8 + 2);     // 3589 refreshes, 3589 ticks
+  // The same 30 s with the free-running timer: 3600 ticks for 3589 refreshes, eleven frames with no refresh of their own.
+  CHECK(30 * hz / nominal - 30ull * hz * 256 / period_q8 == 11);
+
+  // The record across the two sides: read whole or not at all.
+  uint64_t words[ONEIOS_VSYNC_WORDS] = { 0 };
+  struct oneios_vsync_panel in = { .at = 123456789, .period_q8 = period_q8, .written = 123456000, .phase = -777 }, out = { 0 };
+  CHECK(!oneios_vsync_read(words, &out));                               // nothing written yet
+  oneios_vsync_write(words, &in);
+  CHECK(words[ONEIOS_VSYNC_MAGIC] == ONEIOS_VSYNC_PANEL_MAGIC && words[ONEIOS_VSYNC_SEQ] == 2);
+  CHECK(oneios_vsync_read(words, &out) && out.at == in.at && out.period_q8 == in.period_q8 && out.written == in.written && out.phase == -777);
+  in.at += 160480; oneios_vsync_write(words, &in);
+  CHECK(words[ONEIOS_VSYNC_SEQ] == 4 && oneios_vsync_read(words, &out) && out.at == in.at);
+  words[ONEIOS_VSYNC_SEQ] = 5;                                          // the writer is in it (or died there): not read
+  CHECK(!oneios_vsync_read(words, &out));
+  oneios_vsync_write(words, &in);                                       // the next whole write heals it
+  CHECK(words[ONEIOS_VSYNC_SEQ] == 6 && oneios_vsync_read(words, &out));
+  words[ONEIOS_VSYNC_MAGIC] = ONEIOS_VSYNC_PANEL_MAGIC + (1ull << 32);  // another version's record
+  CHECK(!oneios_vsync_read(words, &out));
+  // The seqlock steps (the kernel's record, the phone's record, the phone's read of the kernel's): begin makes the sequence odd and
+  // end even, a reader that sees the sequence move between its loads refuses the fields, the odd one is not opened.
+  uint64_t rec[3] = { 0, 0, 0 };
+  uint64_t sq = oneios_rec_begin(&rec[0]);
+  CHECK(sq == 1 && rec[0] == 1 && oneios_rec_open(&rec[0]) == 0);
+  oneios_rec_end(&rec[0], sq);
+  CHECK(rec[0] == 2 && oneios_rec_open(&rec[0]) == 2 && oneios_rec_shut(&rec[0], 2));
+  sq = oneios_rec_begin(&rec[0]);
+  CHECK(sq == 3 && !oneios_rec_shut(&rec[0], 2));                       // the writer started again after the reader's open
+  oneios_rec_end(&rec[0], sq);
+  CHECK(rec[0] == 4 && !oneios_rec_shut(&rec[0], 2) && oneios_rec_shut(&rec[0], 4));
+  // A writer and a reader on two threads (x86 shows no reordering; this shows no torn record of the arithmetic and the loop): the
+  // reader takes only whole records, all four fields of one write, and sees many of them.
+  {
+    struct stress { uint64_t words[ONEIOS_VSYNC_WORDS]; volatile int stop; } *sh = calloc(1, sizeof *sh);
+    pthread_t writer;
+    pthread_create(&writer, NULL, vsync_stress_writer, sh);
+    uint64_t seen = 0, torn = 0, last = 0;
+    for (long i = 0; i < 3000000 && seen < 20000; i++) {
+      struct oneios_vsync_panel got;
+      if (!oneios_vsync_read(sh->words, &got)) continue;
+      seen++;
+      if (got.at != got.period_q8 || got.at != got.written || got.at != (uint64_t)got.phase) torn++;
+      if (got.at < last) torn++;                                        // and never an older record than the one before
+      last = got.at;
+    }
+    sh->stop = 1;
+    pthread_join(writer, NULL);
+    CHECK(seen > 100 && torn == 0);
+    free(sh);
+  }
+  CHECK(ONEIOS_VSYNC_PANEL_OFFSET + 8 * ONEIOS_VSYNC_WORDS <= ONEIOS_VSYNC_GUEST_OFFSET && ONEIOS_VSYNC_GUEST_OFFSET + 8 * ONEIOS_TICK_WORDS <= ONEIOS_VSYNC_PAGE_BYTES);
+}
+
 // ---- the deferred queue's joins (stub_abi.h xs_queue_join, host-overhead 2026-11-15) ---------------
 static struct xs_op qop(uint32_t kind, uint64_t va, uint64_t size, uint32_t prot, uint64_t offset)
 {
@@ -2733,6 +3122,9 @@ int main(void)
   test_fault_access();
   test_queue_join();
   test_cpu_window();
+  test_frame_stages();
+  test_watch();
+  test_vsync_lock();
   test_perf();
   test_discard();
   test_ramfix(dir);

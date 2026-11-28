@@ -30,7 +30,7 @@ DISPLAY_LIBS := -landroid -lnativewindow -lm
 $(A)/liboneios-display.so: src/jni.c src/xhd.c $(XHD_H)
 	@mkdir -p $(A)
 	$(ANDROID_CC) -std=gnu11 $(CFLAGS) $(WARN) -fPIC -shared -Wl,-soname,liboneios-display.so $(ANDROID_SO_LDFLAGS) src/jni.c src/xhd.c $(DISPLAY_LIBS) -o $@
-$(A)/displayctl: src/displayctl.c src/xhd.c $(XHD_H)
+$(A)/displayctl: src/displayctl.c src/xhd.c src/boost.h src/scantime.h $(XHD_H)
 	@mkdir -p $(A)
 	$(ANDROID_CC) -std=gnu11 $(CFLAGS) $(WARN) -static src/displayctl.c src/xhd.c -lm -o $@
 # No android.jar: the source reaches the framework by reflection only.
@@ -41,10 +41,10 @@ $(A)/oneios-display.dex: java/OneiOSDisplay.java
 	$(D8_ENV) $(D8) --release --min-api 30 --output $(A)/dex $(A)/classes/OneiOSDisplay.class
 	cp $(A)/dex/classes.dex $@
 
-$(H)/test_display: tests/test_display.c src/xhd.c $(XHD_H)
+$(H)/test_display: tests/test_display.c src/xhd.c src/boost.h src/scantime.h $(XHD_H)
 	@mkdir -p $(H)
 	$(CC) -std=gnu11 -O1 -g $(WARN) -Isrc -fsanitize=address,undefined tests/test_display.c src/xhd.c -lpthread -lm -o $@
-$(H)/displayctl: src/displayctl.c src/xhd.c $(XHD_H)
+$(H)/displayctl: src/displayctl.c src/xhd.c src/boost.h src/scantime.h $(XHD_H)
 	@mkdir -p $(H)
 	$(CC) -std=gnu11 -O1 -g $(WARN) src/displayctl.c src/xhd.c -lm -o $@
 
@@ -57,6 +57,13 @@ test: $(H)/test_display $(H)/displayctl $(H)/modes/TestModes.class
 	$(H)/test_display $(H)/displayctl
 	$(JAVA) -cp $(H)/modes TestModes
 
+# The phone's displayctl (arm64, static) through the same tests, run by qemu-aarch64 (QEMU=): its counter reads
+# (CNTVCT_EL0, CNTFRQ_EL0: src/scantime.h) are the emulator's, so the tests check the events and their spacing only.
+QEMU ?= qemu-aarch64
+test-arm64: $(H)/test_display $(A)/displayctl
+	printf '#!/bin/sh\nexec $(QEMU) $(abspath $(A)/displayctl) "$$@"\n' > $(H)/displayctl-arm64.sh && chmod +x $(H)/displayctl-arm64.sh
+	ONEIOS_TEST_EMULATED=1 $(H)/test_display $(abspath $(H)/displayctl-arm64.sh)
+
 clean:
 	rm -rf build
-.PHONY: all test clean
+.PHONY: all test test-arm64 clean
