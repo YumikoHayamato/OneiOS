@@ -1,7 +1,7 @@
 # take23 (2026-11-28): identity a + e, the new boot order, the clocks' orchestrator
 
-Made on the PC from take22's two sessions; nothing of it has run on the phone. The owner's copy of the Images, the
-Italian README and the whole analysis: `/mnt/giochi/Linux/oneios/take23/` (README.txt, analysis/analysis-take23.txt).
+Made on the PC from take22's two sessions; nothing of it has run on the phone. The Images, the Italian README and the
+whole analysis (with the sessions' log lines) are the owner's own copy, not in this repository.
 The kernel is take22's, unchanged. The plug-in is `ci/metal-upgrade` 72dc37c, the apps `ci/apps` 94ab61c.
 
 ## Loader (`runtime/loader`)
@@ -41,5 +41,7 @@ The kernel is take22's, unchanged. The plug-in is `ci/metal-upgrade` 72dc37c, th
 
 ## Recipes
 
-`scripts/take23/mk-addon.sh` (trust list and merged addon), `scripts/take23/images.sh` (the ten Images: seven RAM sizes, -plain, -diag, -gpuirq),
-`docs/take23/t8.py` (clocks, load and frames of a session: thermal.txt, serial.txt, perf.txt).
+`OUT=out/take23 scripts/take22/mk-addon.sh` (trust list and merged addon, as take22's), `scripts/take23/images.sh` (the ten
+Images: seven RAM sizes, -plain, -diag, -gpuirq), `docs/take23/t8.py` (clocks, load and frames of a session from
+thermal.txt, serial.txt, perf.txt), `docs/take23/coreui-memclass.py`, `docs/take23/sim/pick-drive.sh` (the Image choice's
+shell against a fake pool).

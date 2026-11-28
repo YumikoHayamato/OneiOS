@@ -49,10 +49,11 @@ pub const MAX_RAM_MIB: u32 = 8192;
 /// The choice, in the takeover, right before the pool's top-up (takeover_script's `need=N` line): `cands` the largest first,
 /// the main Image last. It leaves RAM, NEED, ARENA and KIMG for the lines apply_pick rewrote. A candidate is taken when
 /// (a) the module's table holds its pages (pool_size_max: `hugepool load --system-reserve-mb`), (b) Android keeps KEEP MiB
-/// available once the pool has them (MemAvailable now, less 2 MiB a page the pool still lacks, plus 2 MiB a page it has
-/// too many, less the 32 MiB of the VM outside the pool), (c) its file is the one that was pushed, and (d) the pages come
-/// (the module's acquire, mode 3, 120 s at most). Pages the pool has beyond the chosen Image's go back to Android (the
-/// module's shrink at a lower pool_want). None taken: the session ends before crosvm starts, One UI comes back (the trap).
+/// available once the pool has them (MemAvailable now, less 2 MiB a page the pool still lacks, less the 32 MiB of the VM
+/// outside the pool), (c) its file is the one that was pushed, and (d) the pages come
+/// (the module's acquire, mode 3, 120 s at most). Pages the pool has beyond the chosen Image's stay in it (the module's
+/// shrink has never run in a session of ours: not asked for). None taken: the session ends before crosvm starts, One UI
+/// comes back (the trap).
 pub fn pick_block(cands: &[Candidate], keep_mib: u32) -> String {
     let mut list = String::new();
     for c in cands {
@@ -71,7 +72,8 @@ while read cram cneed carena cfile csha; do
   [ -n "$csha" ] || continue
   ma=$(sed -n 's/^MemAvailable: *\([0-9]*\).*/\1/p' /proc/meminfo); ma=$((${ma:-0} / 1024))
   pa=$(pool_n pool_avail)
-  left=$((ma - 2 * (cneed - pa) - 32))
+  more=$((cneed - pa)); [ $more -gt 0 ] || more=0
+  left=$((ma - 2 * more - 32))
   if [ -n "$PMAX" ] && [ $cneed -gt $PMAX ]; then
     echo "pick: $cram MiB: no: it takes $cneed pool pages and the module's table holds $PMAX (hugepool load --system-reserve-mb)"; continue
   fi
@@ -101,13 +103,9 @@ if [ -z "$RAM" ]; then
   echo "pick: no Image fits: memory $(mem_line); $(stat_line)"
   end "refused memory: no Image of the list fits with $KEEP MiB left to Android"; exit 1
 fi
-# the pages the pool has beyond this VM's go back to Android (a lower want makes the module shrink)
-if [ "$(pool_n pool_avail)" -gt $((NEED + 8)) ]; then
-  pool_settle 30
-  before=$(pool_n pool_avail)
-  echo $NEED > $P/pool_want 2>/dev/null; sleep 1 </dev/null; pool_settle 30
-  echo "pick: the pool had $before free pages, the VM takes $NEED: want $NEED now, $(pool_n pool_avail) free ($(mem_line))"
-fi
+# Pages the pool has beyond this VM's stay in it: giving them back would be the module's shrink (a lower pool_want), which no
+# session of ours has run; they are not counted as Android's above either.
+spare=$(( $(pool_n pool_avail) - NEED )); [ $spare -le 0 ] || echo "pick: $spare pages (2 MiB each) stay unused in the pool"
 echo "pick: the VM runs the Image of $RAM MiB ($KIMG)"
 "##;
 
@@ -346,6 +344,9 @@ mod tests {
             }
         }
         assert!(!b.contains("__"));
+        // the pool is never asked to shrink: its want is only ever raised to a candidate's pages
+        assert_eq!(b.matches("> $P/pool_want").count(), 1);
+        assert!(b.contains("[ \"$(pool_n pool_want)\" -ge $cneed ] || echo $cneed > $P/pool_want"));
     }
 
     #[test]
