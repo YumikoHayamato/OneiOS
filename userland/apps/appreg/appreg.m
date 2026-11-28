@@ -22,6 +22,9 @@
 //   url          registerApplication: with the bundle where the addon wrote it (take21's failing way, kept as a probe)
 // take23: before those, the bundles are also copied into /private/var/oneios/appsview and that folder is shown over /Applications
 // (view_on below says why: the kernel's view of the staged apps is the OS volume's, so take22's copies were never seen there).
+// take24: take23's own mount was refused on the phone (errno 1: the platform sandbox refuses a mount on /Applications), so the
+// kernel mounts that folder at boot (hosted 0091, oneios-apps-view); this tool keeps the folder's copies and reports what it sees:
+//   oneios-appreg: view: /Applications/OneiOS2048.app is visible already (the kernel's view): /Applications lists 54 entries ...
 // ONEIOS_APPREG_VIEW=0 leaves the view out. The rebuild way is asked only when the bundle is visible in /Applications.
 //   oneios-appreg: view: /private/var/oneios/appsview over /Applications: entries 52 -> 54 (readdir), 52 -> 54 (NSFileManager), Settings 1, ours 1: kept
 // ONEIOS_APPREG_STAGE=0 in the environment (appreg.conf: env=) skips the copy and the first two ways: take21's
@@ -201,7 +204,12 @@ static BOOL view_on(NSString *first) {
   NSFileManager *fm = [NSFileManager defaultManager];
   NSString *in_apps = [kAppsDir stringByAppendingPathComponent:first];
   if (visible(in_apps)) {
-    say(@"view: %@ is visible already", in_apps);
+    // take24: the kernel's own view (hosted 0091: /private/var/oneios/appsview over /Applications, mounted at boot). What
+    // /Applications lists through the two views, for the log: Apple's apps must all still be there (52 before the two of ours).
+    BOOL settings = NO;
+    const int n = count_readdir(kAppsDir.fileSystemRepresentation, &settings);
+    say(@"view: %@ is visible already (the kernel's view): /Applications lists %d entries (readdir), %lu (NSFileManager), Settings %d, Weather %d", in_apps,
+        n, (unsigned long)[fm contentsOfDirectoryAtPath:kAppsDir error:nil].count, settings, visible(@"/Applications/Weather.app"));
     return YES;
   }
   BOOL settings_before = NO;
@@ -214,7 +222,11 @@ static BOOL view_on(NSString *first) {
   char source[MAXPATHLEN];
   strlcpy(source, kViewDir.fileSystemRepresentation, sizeof source);
   if (mount("bindfs", kAppsDir.fileSystemRepresentation, MNT_RDONLY | MNT_UNION, source) != 0) {
-    say(@"view: mount bindfs %s over /Applications refused: %s (errno %d)", source, strerror(errno), errno);
+    // take23 on the phone: errno 1; iOS's log names the platform sandbox profile as the one that refuses a mount on
+    // /Applications (no entitlement of ours lifts it). So the view is the kernel's to mount (hosted 0091); this try
+    // stays for a kernel without it, and says so.
+    say(@"view: mount bindfs %s over /Applications refused: %s (errno %d); errno 1 is the platform sandbox (take23): the view needs the kernel's mount (hosted 0091)",
+        source, strerror(errno), errno);
     return NO;
   }
   BOOL settings_after = NO;
