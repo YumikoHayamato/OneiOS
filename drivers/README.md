@@ -7,7 +7,7 @@ These sources are built into the kernel (not loaded later). Each talks to its ho
 
 | Folder | What | From |
 |---|---|---|
-| `bridge/` | `oneios_bridge_proto.h` (the message protocol, shared with xnuhost), `OneiOSBridge.c` (the guest end of the `oneios,bridge` virtio-mmio device), `oneios_bridge.h` (the API the drivers below use) | new; the transport follows UniXNU-droidvm's `DroidVMVirtioNet.c` |
+| `bridge/` | `oneios_bridge_proto.h` (the message protocol, shared with xnuhost), `OneiOSBridge.c` (the guest end of the `oneios,bridge` virtio-mmio device, and its second transport: the same messages as frames on a serial port, for the native path's VM of crosvm), `oneios_bridge_stream.h` (those frames, shared with `runtime/bridges/devices/bridge_stream.c`; host-tested by `runtime/bridges/tests/test_stream.c`), `oneios_bridge.h` (the API the drivers below use) | new; the transport follows UniXNU-droidvm's `DroidVMVirtioNet.c` |
 | `haptics/` | `OneiOSVibrator.cpp` (the `vibrator` IOService and the closed-loop node), `OneiOSButtonHaptics.cpp` (off by default, `oneios-button-haptics=1`: a stand-in `AppleSPUHapticsAudioDriver` with the "Button Haptics Asset Interface", so that ButtonResolver gets ready; `docs/hardware.md` 5), `oneios_haptic.c` (the Actuator: the audio archive's Actuator IOAudio2Device and the stream node, requests to the host), `oneios_actuator.h` (samples to requests; host test `test_actuator.c`) | iOSPlus10 `2700-laurel-pmi632-haptics.patch`: the iOS side as is, the PMI632 motor replaced by the host |
 | `bluetooth/` | bluetoothd's transport: `oneios_bt_sk.c` (the kernel control `com.apple.uart.sk.bluetooth` and its Skywalk kernel pipe: what iOS 27's bluetoothd opens; after UniXNU/QcaBluetooth's `qbt_transport.c`, APSL-2.0), `oneios_bt_ctl.c` (iOS 16's kernel control), `oneios_bt_dev.c` (`/dev` nodes), `oneios_bt_h4.c` (framing, answers), `oneios_bt_ios.c` (core), `oneios_bt.c` (start: the result line at the board's probe, the core, the controls and the nodes after the root mount), `OneiOSBluetooth.cpp` (device-tree nub) | iOSPlus10 `2600-laurel-bluetooth-wcn3990.patch`: the iOS side as is, UART/firmware/power replaced by the host |
 | `brightness/` | `OneiOSBacklight.cpp` (the backlight service CoreBrightness drives; the host's light readings), `oneios_als_hid.h` and `OneiOSALSDevice.cpp` (the light sensor as a HID device; built into the hosted kernel's HID archive, `kernel/patches/oneios-hosted/hid`, not into this one) | iOSPlus10 `2201-laurel-backlight-panel-power.patch`, `9005-laurel-backlight-calibration.patch`: the iOS side as is, the DSI panel replaced by the host |
@@ -47,6 +47,11 @@ Boot arguments: `oneios-bridge=0`, `oneios_haptic=0`, `oneios_haptic_ui=0`, `one
 
 - `/arm-io/bridge`: `compatible = "oneios,bridge"`, `reg` (one 4 KiB virtio-mmio window), `interrupts` (its SPI),
   `dma-coherent`. Host device: `br_bridge_create()`.
+  Or, in a VM of crosvm (`xnuloader-crosvm --bridge`, `docs/native.md` "The bridge, the remembered Wi-Fi network and the
+  power key"): `compatible = "oneios,bridge-uart"` and `reg` = the absolute address and size of an ns16550 (crosvm's
+  second serial port, `0x2f8`), polled; the phone's end is `bridgectl serve` (`br_stream_serve()`). Log: `ONEIOS BRIDGE:
+  the serial transport: an ns16550 at 0x2f8, polled`, then `ONEIOS BRIDGE: on: host protocol 1, channels 0x23`, or
+  `off: no answer to 20 hellos on the serial port` when nothing serves it.
 - `/arm-io/cpufreq`, cpu nodes: `cpu/README.md`. `/arm-io/net`, `/arm-io/virtio-snd`: as booter's
   `runtime/loader/src/machine.c` already names them.
 - Bluetooth node: `docs/hardware.md` section 4, "Missing".

@@ -1,0 +1,316 @@
+OneiOS take20, userland/metal/patches/NativeMetal/0018: with oneios-prewarm=1, the render server keeps its render pipeline states, returns
+the kept state for an equal descriptor at once, and makes the descriptors of earlier boots again 20 s after its first pipeline.
+Upstream: none (OneiOS). Applies alone and with any of the others.
+What: newRenderPipelineStateWithDescriptor:options:reflection:error: (every form of the call goes there) asks keptState() first and
+keeps what it made (keepState()), only in backboardd and only with ONEIOS_PREWARM=1, never for a creation that asks for reflection
+or with FailOnBinaryArchiveMiss. A state is kept under its descriptor: the functions' library content (length and an FNV-1a print
+of the first and last 64 KiB), their names and constant values, every color attachment, the vertex descriptor, the depth/stencil
+formats, the sample count, the topology and the raster flags (each function's constant words sorted); a descriptor with linked functions, preloaded libraries, tessellation
+or vertex amplification is not kept. At most ONEIOS_PREWARM_MAX (1024) states. Each kept descriptor is appended once to
+<cache>/prewarm.log in the journal's R-line form (written by a serial queue, off the render thread). 20 s after the render server's
+first pipeline a utility-QoS thread reads prewarm.log and the journal (pipelines.log of a log-gpu=1 boot), rebuilds each descriptor
+(functions from QuartzCore's default.metallib or the libraries the journal's L lines name, constant values from the line) and makes
+it, one every 4 ms, pausing while the render server makes pipelines of its own; those states are kept, so the boot's own later
+creations of the same descriptors are returned at once. A log over 1 MiB is written again with each descriptor once.
+Why: take19's second session (-loggpu, the journal): of backboardd's 586 render pipeline creations, 26 compiled (25.0 ms mean, 47 ms
+at most) and 560 found every artifact in the runtime's memo or its disk cache, and still took 1.3 ms (94, hit/miss/wr 0/0/0) to
+4.5 ms (366, 1/1/0; up to 25 ms) each on the render thread, in bursts at each first use of a view after the boot (39 in 11 s at a
+note's menu, 44 during the Home screen's lag, 55 for Maps): at 120 Hz, 4 ms is half a frame. The disk cache keeps the artifacts
+across boots (take19's store: 52 entries read at boot, take18's 1670 kept), so a boot can make these pipelines before they are
+asked for. NativeMetal 0017 keeps the clients' caches; this keeps the render server's states.
+Risk: medium, hence off by default. A kept state shared by two callers (Metal pipeline states are immutable; Core Animation keeps
+its own map of them). A descriptor field the key does not hold would make two descriptors look equal: the key holds every field the
+journal's R line holds and the raster flags, and leaves out the descriptors with features it does not hold. The boot's extra work:
+about 600 pipelines x 1-5 ms on a background thread 20 s after the start, and their GPU memory (shader binaries) for the boot.
+Switch: boot argument oneios-prewarm=1 (ONEIOS_PREWARM=1, Switches.inc); oneios-prewarm-max=N (ONEIOS_PREWARM_MAX). Off without it:
+nothing of this runs. Removable: yes (ONEIOS_METAL_SKIP=render-pipelines-kept-and-made-at-boot).
+iOS's log (backboardd): `native-metal: prewarm: N of M descriptors made in S ms (K refused, D already kept)` once a boot, `native-metal:
+kept states: H returned, C made` every 1000 returns; the A/B: the journal's creation count and times at the same views (log-gpu=1).
+Checked on the PC: applies on b0d6a07 alone, after 0001-0017 and with each neighbour left out; the new section and the hooks pass
+clang++ -fsyntax-only -fobjc-arc against stand-in declarations of the Foundation/Metal types it uses (those stand-ins are this
+patch's own reading of the APIs: not Apple's headers). Read in the frontend: newLibraryWithFile: sets the library's bytes and
+length (the key's print); a function's constantsText lists the indexed then the named constants in the constant values object's
+own order (hence the sorted words). The CI is its first compile; nothing of it has run.
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index b21ef41..b7bf6f0 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -4841,2 +4841,5 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
+  if(reflection)*reflection=nil;
++ // OneiOS NativeMetal 0018: an equal descriptor's state kept from before (made again at boot, or earlier in this boot), at once
++ id oneiosKeptState(MTLRenderPipelineDescriptor *,MTLPipelineOption);   // the 0018 section at the end of this file
++ if(!reflection)if(id kept=oneiosKeptState(d,options)){if(error)*error=nil;return (id<MTLRenderPipelineState>)kept;}
+  auto *p=new NBRenderDescriptor();
+@@ -4890,2 +4893,4 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
+  if(dumpDescribes())state.dumpInfo=renderDumpInfo(d);
++ void oneiosKeepState(MTLRenderPipelineDescriptor *,id);   // OneiOS 0018
++ if(!reflection)oneiosKeepState(d,state);
+  return (id<MTLRenderPipelineState>)state;
+@@ -5460 +5465,267 @@ extern "C" size_t native_bridge_metal_formats(char *out,size_t size) {
+ }
++
++// ---- OneiOS NativeMetal 0018 (take20): the render server's pipeline states kept and made again at boot (ONEIOS_PREWARM=1)
++// take19's second session (-loggpu, the journal): of backboardd's 586 render pipeline creations 560 compiled nothing (the runtime's
++// memo or its disk cache had every artifact) and still took 1.3-5.1 ms each on the render thread (hit/miss/wr 0/0/0: 94 at 1.3 ms;
++// 1/1/0 and 0/1/0: 449 at 3.9-4.5 ms, up to 25 ms), in bursts at each first use of a view after the boot (39 in 11 s at a note's
++// menu): at 120 Hz a 4 ms creation in a frame is half its budget. Two parts, both only in the render server and only with the switch:
++//   1. Kept states: a successful creation is kept under its descriptor (the functions' library content, names and constant values,
++//      every attachment, the vertex descriptor, the raster state), and a creation of an equal descriptor returns the kept state at once.
++//      Not for a creation that asks for reflection, nor one with linked functions, preloaded libraries, tessellation or amplification:
++//      those are made as before. At most ONEIOS_PREWARM_MAX (1024) kept.
++//   2. Made again at boot: each kept state's descriptor goes to <cache>/prewarm.log (the journal's R line, once per descriptor); 20 s
++//      after the render server's first pipeline a thread of utility QoS reads prewarm.log and the journal (pipelines.log, log-gpu=1
++//      sessions), rebuilds each descriptor (functions from QuartzCore's default.metallib or a library the journal's L lines name) and
++//      makes it, one at a time, pausing while the render server makes its own: the boot's later creations of those descriptors are kept
++//      states. The disk cache already holds their artifacts, so the boot pays the 1-5 ms each on a background thread, once.
++// iOS's log: `native-metal: prewarm: N of M descriptors made in S ms (K refused, D already kept)` once a boot, and `native-metal: kept
++// states: H returned, C made` every 1000 creations. ONEIOS_PREWARM unset or 0 (the default): nothing of this runs.
++#include <fstream>
++#include <sstream>
++#include <pwd.h>
++static bool prewarmOn() {static const bool on=[](){const char *v=getenv("ONEIOS_PREWARM");return v && !strcmp(v,"1") && !strcmp(getprogname(),"backboardd");}();return on;}
++static std::mutex &gKeptLock=*new std::mutex;   // never destroyed (see gAskedLock)
++static std::unordered_map<std::string,id> &gKept=*new std::unordered_map<std::string,id>;
++static std::unordered_map<const void *,std::string> &gLibraryPrints=*new std::unordered_map<const void *,std::string>;
++static std::unordered_set<std::string> &gRecorded=*new std::unordered_set<std::string>;
++static std::atomic<uint64_t> gKeptHits{0},gKeptMade{0},gLastAsked{0};
++static std::atomic<bool> gPrewarmStarted{false};
++static size_t keptMost() {static const size_t most=[](){const char *v=getenv("ONEIOS_PREWARM_MAX");long n=v?atol(v):1024;return (size_t)(n>0 && n<16384?n:1024);}();return most;}
++// A library's content print: its length and an FNV-1a hash of its first and last 64 KiB (two NBLibrary objects over the same file
++// print the same; one over other bytes does not), kept per object (gKeptLock held).
++static std::string libraryPrint(NBLibrary *library) {
++ if(!library || !library.bytes || !library.length)return std::string();
++ auto it=gLibraryPrints.find((__bridge const void *)library);if(it!=gLibraryPrints.end())return it->second;
++ const uint8_t *b=library.bytes;const size_t n=library.length,edge=n<65536?n:65536;uint64_t h=1469598103934665603ull;
++ for(size_t i=0;i<edge;i++)h=(h^b[i])*1099511628211ull;
++ for(size_t i=n-edge;i<n;i++)h=(h^b[i])*1099511628211ull;
++ char text[48];snprintf(text,sizeof text,"%zu.%016llx",n,(unsigned long long)h);
++ return gLibraryPrints[(__bridge const void *)library]=text;
++}
++// A function's constant values as the key holds them: the "name:type:hex" words sorted, so that the order the constant values
++// object enumerates them in (Core Image's, Core Animation's, the made-again thread's) does not matter.
++static std::string sortedWords(const std::string &text) {
++ std::istringstream in(text);std::vector<std::string> words;std::string word;while(in>>word)words.push_back(word);
++ std::sort(words.begin(),words.end());std::string out;for(const std::string &w:words){if(!out.empty())out+=" ";out+=w;}
++ return out;
++}
++// The descriptor's text for the journal's R line (samples, topology, depth/stencil, label, attachments, vertex descriptor, both
++// functions); `sorted`: with each function's constant words sorted (the key's form).
++static std::string prewarmLine(MTLRenderPipelineDescriptor *d,NBFunction *vf,NBFunction *ff,bool sorted=false) {
++ char head[160];
++ snprintf(head,sizeof head,"R t=0 us=0 ok=1 samples=%lu topo=%lu ds=%lu/%lu label=",(unsigned long)d.rasterSampleCount,(unsigned long)d.inputPrimitiveTopology,
++     (unsigned long)d.depthAttachmentPixelFormat,(unsigned long)d.stencilAttachmentPixelFormat);
++ std::string line=head;line+=d.label.length?d.label.UTF8String:"-";
++ for(unsigned i=0;i<8;i++) {
++  MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];if(a.pixelFormat==MTLPixelFormatInvalid)continue;
++  snprintf(head,sizeof head," c%u=%lu:%lu:%d:%lu:%lu:%lu:%lu:%lu:%lu",i,(unsigned long)a.pixelFormat,(unsigned long)a.writeMask,(int)a.blendingEnabled,
++      (unsigned long)a.sourceRGBBlendFactor,(unsigned long)a.destinationRGBBlendFactor,(unsigned long)a.rgbBlendOperation,(unsigned long)a.sourceAlphaBlendFactor,
++      (unsigned long)a.destinationAlphaBlendFactor,(unsigned long)a.alphaBlendOperation);
++  line+=head;
++ }
++ if(MTLVertexDescriptor *v=d.vertexDescriptor)for(unsigned i=0;i<31;i++) {
++  MTLVertexAttributeDescriptor *a=v.attributes[i];if(a.format==MTLVertexFormatInvalid)continue;
++  MTLVertexBufferLayoutDescriptor *l=v.layouts[a.bufferIndex<31?a.bufferIndex:0];
++  snprintf(head,sizeof head," a%u=%lu:%lu:%lu:%lu:%lu:%lu",i,(unsigned long)a.format,(unsigned long)a.offset,(unsigned long)a.bufferIndex,(unsigned long)l.stride,
++      (unsigned long)l.stepFunction,(unsigned long)l.stepRate);
++  line+=head;
++ }
++ line+=" | v ";line+=vf.name.UTF8String?:"-";line+=" ";line+=sorted?sortedWords(vf.constantsText):vf.constantsText;
++ line+=" | f ";line+=ff?(ff.name.UTF8String?:"-"):"-";line+=" ";line+=ff?(sorted?sortedWords(ff.constantsText):ff.constantsText):std::string();
++ for(char &c:line)if(c=='\n')c=' ';
++ return line;
++}
++// The key a state is kept under: the line, the functions' library prints and the raster state the line leaves out. Empty: not kept
++// (a feature the line does not say, or a function not of a library of bytes). gKeptLock held.
++static std::string keptKey(MTLRenderPipelineDescriptor *d,std::string *line) {
++ NBFunction *vf=[(id)d.vertexFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.vertexFunction:nil;
++ NBFunction *ff=[(id)d.fragmentFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.fragmentFunction:nil;
++ if(!vf || (d.fragmentFunction && !ff))return std::string();
++ if(d.vertexLinkedFunctions.functions.count || d.vertexLinkedFunctions.privateFunctions.count || d.fragmentLinkedFunctions.functions.count ||
++    d.fragmentLinkedFunctions.privateFunctions.count || d.vertexPreloadedLibraries.count || d.fragmentPreloadedLibraries.count)return std::string();
++ if(d.maxTessellationFactor!=16 || d.tessellationPartitionMode!=MTLTessellationPartitionModePow2 || d.maxVertexAmplificationCount>1)return std::string();
++ const std::string vp=libraryPrint(vf.library),fp=ff?libraryPrint(ff.library):std::string("-");
++ if(vp.empty() || fp.empty())return std::string();
++ *line=prewarmLine(d,vf,ff);
++ const std::string key=prewarmLine(d,vf,ff,true);
++ char raster[96];
++ snprintf(raster,sizeof raster," @%s/%s a2c=%d a2o=%d rast=%d icb=%d",vp.c_str(),fp.c_str(),(int)d.alphaToCoverageEnabled,(int)d.alphaToOneEnabled,
++     (int)d.rasterizationEnabled,(int)d.supportIndirectCommandBuffers);
++ return key+raster;
++}
++// The render server's cache directory: the journal's when it is on, else the one NativeAdrenoMetalPlugin.mm opens the device in
++// (the user's ~/Library/Caches/com.apple.backboardd/m2v, its marker 0x6814).
++static std::string prewarmPath() {
++ static const std::string path=[](){
++  if(!gJournalPath.empty())return gJournalPath.substr(0,gJournalPath.rfind('/'))+"/prewarm.log";
++  const passwd *user=getpwuid(getuid());
++  const std::string home=user && user->pw_dir && user->pw_dir[0]?user->pw_dir:"/var/mobile";
++  return home+"/Library/Caches/com.apple.backboardd/m2v/prewarm.log";
++ }();
++ return path;
++}
++static void prewarmRecord(const std::string &line) {
++ static dispatch_queue_t queue=dispatch_queue_create("oneios.prewarm.record",DISPATCH_QUEUE_SERIAL);
++ const std::string copy=line,path=prewarmPath();
++ dispatch_async(queue,^{if(FILE *f=fopen(path.c_str(),"a")){fwrite(copy.data(),1,copy.size(),f);fputc('\n',f);fclose(f);}});
++}
++static void prewarmStart();
++static thread_local bool tPrewarming;   // the made-again thread's own creations do not hold it back
++// The creation's hooks (newRenderPipelineStateWithDescriptor:options:reflection:error: declares them where it calls them): the kept
++// state of an equal descriptor, or nil; and the state it made, to keep.
++id oneiosKeptState(MTLRenderPipelineDescriptor *d,MTLPipelineOption options) {
++ if(!prewarmOn() || (options & MTLPipelineOptionFailOnBinaryArchiveMiss))return nil;
++ if(!tPrewarming)gLastAsked=nowUs();
++ if(!gPrewarmStarted.exchange(true))prewarmStart();
++ std::string line;std::lock_guard<std::mutex> lock(gKeptLock);
++ const std::string key=keptKey(d,&line);if(key.empty())return nil;
++ auto it=gKept.find(key);if(it==gKept.end())return nil;
++ const uint64_t hits=++gKeptHits;
++ if(hits%1000==0)NBLOG(@"native-metal: kept states: %llu returned, %llu made",(unsigned long long)hits,(unsigned long long)gKeptMade.load());
++ return it->second;
++}
++void oneiosKeepState(MTLRenderPipelineDescriptor *d,id state) {
++ if(!prewarmOn() || !state)return;
++ std::string line;bool record=false;
++ {std::lock_guard<std::mutex> lock(gKeptLock);
++  const std::string key=keptKey(d,&line);if(key.empty() || gKept.size()>=keptMost())return;
++  if(!gKept.emplace(key,state).second)return;
++  gKeptMade++;record=gRecorded.insert(line).second;}
++ if(record)prewarmRecord(line);
++}
++// The made-again part. One R line's descriptor (the journal's format, prewarmLine's): its fields into d, its functions' names and
++// constants out. False: a line this cannot read.
++struct PrewarmLine {std::string vertex,vertexConstants,fragment,fragmentConstants;};
++static bool prewarmParse(const std::string &text,MTLRenderPipelineDescriptor *d,PrewarmLine *out) {
++ const size_t v=text.find(" | v "),f=text.find(" | f ");if(v==std::string::npos || f==std::string::npos || f<v)return false;
++ if(text.find(" ok=1 ")==std::string::npos)return false;
++ const std::string fields=text.substr(0,v);
++ auto stage=[](const std::string &part,std::string *name,std::string *constants) {
++  const size_t space=part.find(' ');*name=part.substr(0,space);*constants=space==std::string::npos?std::string():part.substr(space+1);
++  const size_t bar=constants->find(" | ");if(bar!=std::string::npos)constants->resize(bar);
++  while(!constants->empty() && constants->back()==' ')constants->pop_back();
++ };
++ stage(text.substr(v+5,f-v-5),&out->vertex,&out->vertexConstants);
++ stage(text.substr(f+5),&out->fragment,&out->fragmentConstants);
++ if(out->vertex.empty() || out->vertex=="-")return false;
++ std::istringstream words(fields);std::string word;
++ while(words>>word) {
++  const size_t eq=word.find('=');if(eq==std::string::npos)continue;
++  const std::string k=word.substr(0,eq),value=word.substr(eq+1);
++  unsigned long n[9]={};
++  if(k=="samples")d.rasterSampleCount=strtoul(value.c_str(),nullptr,10);
++  else if(k=="topo")d.inputPrimitiveTopology=(MTLPrimitiveTopologyClass)strtoul(value.c_str(),nullptr,10);
++  else if(k=="ds"){if(sscanf(value.c_str(),"%lu/%lu",&n[0],&n[1])==2){d.depthAttachmentPixelFormat=(MTLPixelFormat)n[0];d.stencilAttachmentPixelFormat=(MTLPixelFormat)n[1];}}
++  else if(k=="label"){if(value!="-")d.label=[NSString stringWithUTF8String:value.c_str()];}
++  else if(k.size()==2 && k[0]=='c' && k[1]>='0' && k[1]<='7') {
++   if(sscanf(value.c_str(),"%lu:%lu:%lu:%lu:%lu:%lu:%lu:%lu:%lu",&n[0],&n[1],&n[2],&n[3],&n[4],&n[5],&n[6],&n[7],&n[8])!=9)return false;
++   MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[k[1]-'0'];
++   a.pixelFormat=(MTLPixelFormat)n[0];a.writeMask=(MTLColorWriteMask)n[1];a.blendingEnabled=n[2]!=0;a.sourceRGBBlendFactor=(MTLBlendFactor)n[3];
++   a.destinationRGBBlendFactor=(MTLBlendFactor)n[4];a.rgbBlendOperation=(MTLBlendOperation)n[5];a.sourceAlphaBlendFactor=(MTLBlendFactor)n[6];
++   a.destinationAlphaBlendFactor=(MTLBlendFactor)n[7];a.alphaBlendOperation=(MTLBlendOperation)n[8];
++  } else if(k.size()>=2 && k[0]=='a' && isdigit((unsigned char)k[1])) {
++   const unsigned i=(unsigned)atoi(k.c_str()+1);if(i>=31)return false;
++   if(sscanf(value.c_str(),"%lu:%lu:%lu:%lu:%lu:%lu",&n[0],&n[1],&n[2],&n[3],&n[4],&n[5])!=6 || n[2]>=31)return false;
++   if(!d.vertexDescriptor)d.vertexDescriptor=[MTLVertexDescriptor vertexDescriptor];
++   MTLVertexAttributeDescriptor *a=d.vertexDescriptor.attributes[i];a.format=(MTLVertexFormat)n[0];a.offset=n[1];a.bufferIndex=n[2];
++   MTLVertexBufferLayoutDescriptor *l=d.vertexDescriptor.layouts[n[2]];l.stride=n[3];l.stepFunction=(MTLVertexStepFunction)n[4];l.stepRate=n[5];
++  }
++ }
++ return true;
++}
++// "name:type:hex" (or "#index:type:hex") words into constant values; nil for none, and false for a word this cannot read.
++static bool prewarmConstants(const std::string &text,MTLFunctionConstantValues **out) {
++ *out=nil;if(text.empty())return true;
++ MTLFunctionConstantValues *values=[MTLFunctionConstantValues new];
++ std::istringstream words(text);std::string word;
++ while(words>>word) {
++  const size_t c1=word.find(':'),c2=c1==std::string::npos?std::string::npos:word.find(':',c1+1);if(c2==std::string::npos)return false;
++  const std::string name=word.substr(0,c1),hex=word.substr(c2+1);const unsigned long type=strtoul(word.c_str()+c1+1,nullptr,10);
++  if(hex.size()%2 || hex.size()>128)return false;
++  uint8_t bytes[64]={};for(size_t i=0;i<hex.size()/2;i++)bytes[i]=(uint8_t)strtoul(hex.substr(i*2,2).c_str(),nullptr,16);
++  if(!name.empty() && name[0]=='#')[values setConstantValue:bytes type:(MTLDataType)type atIndex:(NSUInteger)strtoul(name.c_str()+1,nullptr,10)];
++  else [values setConstantValue:bytes type:(MTLDataType)type withName:[NSString stringWithUTF8String:name.c_str()]];
++ }
++ *out=values;return true;
++}
++// The descriptor part of an R line (from samples= to its fragment function's constants), the same for the journal's lines and
++// prewarm.log's; empty for a line without one.
++static std::string prewarmLineKey(const std::string &text) {
++ const size_t at=text.find(" samples="),f=text.find(" | f ");
++ if(at==std::string::npos || f==std::string::npos || f<at)return std::string();
++ std::string key=text.substr(at);const size_t callers=key.rfind(" | ");
++ if(callers!=std::string::npos && callers>key.find(" | f "))key.resize(callers);
++ return key;
++}
++static void prewarmStart() {
++ // prewarm.log's descriptors are recorded already (keepState appends only new ones), read once on the render thread (a small file)
++ const std::string path=prewarmPath(),dir=path.substr(0,path.rfind('/'));
++ std::vector<std::string> own;
++ {std::ifstream in(path);std::string text;std::unordered_set<std::string> keys;
++  while(std::getline(in,text))if(!text.compare(0,2,"R ")){const std::string key=prewarmLineKey(text);if(!key.empty() && keys.insert(key).second)own.push_back(text);}
++  std::lock_guard<std::mutex> lock(gKeptLock);for(const std::string &l:own)gRecorded.insert(l);}
++ dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
++  struct Flag {Flag(){tPrewarming=true;} ~Flag(){tPrewarming=false;}} flag;   // GCD's thread serves others after this block
++  // a log grown with lines of earlier builds or kept twice: written again with each descriptor once
++  struct stat st={};
++  if(stat(path.c_str(),&st)==0 && st.st_size>(1<<20)){
++   const std::string fresh=path+".new";
++   if(FILE *f=fopen(fresh.c_str(),"w")){for(const std::string &l:own){fwrite(l.data(),1,l.size(),f);fputc('\n',f);}fclose(f);rename(fresh.c_str(),path.c_str());}
++  }
++  sleep(20);   // the boot's own work first (the lock screen, SpringBoard, the posters)
++  const uint64_t began=nowUs();
++  std::vector<std::string> lines=own;std::vector<std::string> libraries={"/System/Library/Frameworks/QuartzCore.framework/default.metallib"};
++  std::unordered_set<std::string> seen;for(const std::string &l:own)seen.insert(prewarmLineKey(l));
++  {std::ifstream in(dir+"/pipelines.log");std::string text;   // the journal of a log-gpu=1 boot, when there is one
++   while(std::getline(in,text)) {
++    if(!text.compare(0,2,"R ")) {
++     const std::string key=prewarmLineKey(text);
++     if(!key.empty() && seen.insert(key).second)lines.push_back(text);
++    } else if(!text.compare(0,2,"L ")) {
++     const size_t at=text.find(" src=file:"),end=text.find(" fns=");
++     if(at!=std::string::npos && end!=std::string::npos && end>at+10) {
++      const std::string library=text.substr(at+10,end-at-10);
++      if(std::find(libraries.begin(),libraries.end(),library)==libraries.end())libraries.push_back(library);
++     }
++    }
++   }}
++  id<MTLDevice> device=gDeviceObject;if(!device)return;
++  std::vector<id<MTLLibrary>> loaded;
++  for(const std::string &file:libraries){NSError *e=nil;id<MTLLibrary> l=[device newLibraryWithFile:[NSString stringWithUTF8String:file.c_str()] error:&e];if(l)loaded.push_back(l);}
++  unsigned made=0,refused=0,kept=0;size_t done=0;
++  for(const std::string &text:lines) {
++   if(++done>keptMost())break;
++   // the render server first: while it makes pipelines of its own, wait
++   while(nowUs()-gLastAsked.load()<100000)usleep(20000);
++   @autoreleasepool {
++    MTLRenderPipelineDescriptor *d=[MTLRenderPipelineDescriptor new];PrewarmLine p;
++    if(!prewarmParse(text,d,&p)){refused++;continue;}
++    MTLFunctionConstantValues *vc=nil,*fc=nil;
++    if(!prewarmConstants(p.vertexConstants,&vc) || !prewarmConstants(p.fragmentConstants,&fc)){refused++;continue;}
++    bool found=false;
++    for(id<MTLLibrary> library:loaded) {
++     NSError *e=nil;
++     id<MTLFunction> vf=vc?[library newFunctionWithName:[NSString stringWithUTF8String:p.vertex.c_str()] constantValues:vc error:&e]:
++                           [library newFunctionWithName:[NSString stringWithUTF8String:p.vertex.c_str()]];
++     if(!vf)continue;
++     id<MTLFunction> ff=nil;
++     if(p.fragment!="-" && !p.fragment.empty()) {
++      ff=fc?[library newFunctionWithName:[NSString stringWithUTF8String:p.fragment.c_str()] constantValues:fc error:&e]:
++            [library newFunctionWithName:[NSString stringWithUTF8String:p.fragment.c_str()]];
++      if(!ff)continue;
++     }
++     d.vertexFunction=vf;d.fragmentFunction=ff;found=true;break;
++    }
++    if(!found){refused++;continue;}
++    {std::string line;std::lock_guard<std::mutex> lock(gKeptLock);const std::string key=keptKey(d,&line);if(key.empty()){refused++;continue;}
++     if(gKept.count(key)){kept++;continue;}}
++    NSError *e=nil;
++    id<MTLRenderPipelineState> state=[device newRenderPipelineStateWithDescriptor:d error:&e];   // kept by oneiosKeepState
++    if(state)made++;else refused++;
++   }
++   usleep(4000);
++  }
++  NBLOG(@"native-metal: prewarm: %u of %zu descriptors made in %llu ms (%u refused, %u already kept)",made,lines.size(),
++        (unsigned long long)((nowUs()-began)/1000),refused,kept);
++ });
++}

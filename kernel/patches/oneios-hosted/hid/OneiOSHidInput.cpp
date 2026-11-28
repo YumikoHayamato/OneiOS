@@ -165,6 +165,7 @@ struct DeviceState {
 	IOService *device;
 	IORegistryEntry *driver;
 	bool published;
+	unsigned lockKeyDelaySets;      // how often LockKeyDelay was put into the event service's properties (setLockKeyDelay)
 	unsigned clients;
 	uint64_t reports;
 	unsigned long long queued;
@@ -285,6 +286,49 @@ setQueueSize(IORegistryEntry *driver, const char *what)
 	    open ? "; already open: theirs stays 16 KiB until they open again" : "");
 }
 
+// The power key's 150 ms (the owner, 2026-11-25: the lock's click came late). iOS's keyboard service filter
+// (IOHIDKeyboardFilter, in backboardd; read in 24A446's shared cache) holds a Consumer/Power key-down for its
+// "lock key delay" when the HID service conforms to a keyboard (usage page 1, usage 6):
+// IOHIDKeyboardFilter::processLockKeyDelay arms a timer of _lockKeyDelayMS and gives the event back when it fires.
+// The delay is 150 ms unless the service's HIDEventServiceProperties has a number "LockKeyDelay" (its open() reads
+// it), and 0 turns the hold off (filter() skips it). The buttons' device is such a keyboard (its usage pair is (1, 6),
+// which the personality matches), so every press of power reached SpringBoard 150 ms late; an iPhone's own buttons
+// are a Consumer Control service and are never held. In iOS's log of a native session (take9, 12 presses):
+// backboardd's "[com.apple.iohid:connection] ... Event latency:151586510 type:3 sender:0x1000001F9" on each power
+// key-down (151 to 153 ms; 173 the first), none on a volume key. So LockKeyDelay goes into the buttons' event
+// service's HIDEventServiceProperties when its event driver attaches, long before backboardd opens it (a later
+// setProperties of the service's own merges into the dictionary [I]; should the number be gone at a later tick it is put
+// back, at most 4 times, each with its line). oneios-hid-lock-key-delay=N (ms) for another value; 150 is iOS's own.
+static uint32_t oneios_hid_lock_key_delay = 0;
+
+static bool
+hasLockKeyDelay(IORegistryEntry *driver)
+{
+	OSObject *have = driver->copyProperty("HIDEventServiceProperties");
+	OSDictionary *properties = OSDynamicCast(OSDictionary, have);
+	OSNumber *delay = properties ? OSDynamicCast(OSNumber, properties->getObject("LockKeyDelay")) : nullptr;
+	const bool there = delay && delay->unsigned32BitValue() == oneios_hid_lock_key_delay;
+	OSSafeReleaseNULL(have);
+	return there;
+}
+
+static void
+setLockKeyDelay(IORegistryEntry *driver)
+{
+	OSObject *have = driver->copyProperty("HIDEventServiceProperties");
+	OSDictionary *old = OSDynamicCast(OSDictionary, have);
+	OSDictionary *properties = old ? OSDictionary::withDictionary(old) : OSDictionary::withCapacity(1);
+	OSNumber *delay = OSNumber::withNumber((unsigned long long)oneios_hid_lock_key_delay, 32);
+	const bool set = properties && delay && properties->setObject("LockKeyDelay", delay) &&
+	    driver->setProperty("HIDEventServiceProperties", properties);
+	OSSafeReleaseNULL(delay);
+	OSSafeReleaseNULL(properties);
+	OSSafeReleaseNULL(have);
+	IOLog("oneios-hid: buttons: LockKeyDelay %u ms %s the event service's HIDEventServiceProperties (iOS's keyboard "
+	    "filter holds a keyboard's power key-down for 150 ms without it)\n", oneios_hid_lock_key_delay,
+	    set ? "published in" : "NOT published in");
+}
+
 // Called by each NativeHidInput once a second, on its work loop (its tick).
 //
 // backboardd classifies a digitizer by the event service it opened, not by the HID device below it: it drops a
@@ -308,6 +352,7 @@ native_hid_live_checkpoint(IOService *device)
 	if (driver && driver != state->driver) {
 		state->driver = driver;
 		state->published = false;
+		state->lockKeyDelaySets = 0;
 		state->clients = 0;
 		IOLog("oneios-hid: %s: event driver %s attached (registry id 0x%llx)\n", what, driver->getMetaClass()->getClassName(),
 		    driver->getRegistryEntryID());
@@ -358,6 +403,11 @@ native_hid_live_checkpoint(IOService *device)
 		}
 		IOLog("oneios-hid: pen: Digitizer/Stylus, Built-In, DisplayIntegrated, MaxHoverHeight, AccurateMaxDigitizerPressureValue "
 		    "published on the event service; edge wrapper %u\n", native_touch_edge_install[0]);
+	}
+	// The buttons' power key is not held back by iOS's keyboard filter (setLockKeyDelay).
+	if (!touch && !pen && state->lockKeyDelaySets < 5 && (!state->lockKeyDelaySets || !hasLockKeyDelay(driver))) {
+		state->lockKeyDelaySets++;
+		setLockKeyDelay(driver);
 	}
 	// The buttons (oneios-hid-buttons-builtin=1; fix-power-key, docs/hardware.md 5). backboardd lists them as
 	// "eventSource: externalKeyboard; primaryUsagePage: 0x1; primaryUsage: 0x6; transport: Virtual" (the PC boot of
@@ -711,6 +761,7 @@ oneios_hid_input_start(void)
 	PE_parse_boot_argn("oneios-hid", &enabled, sizeof(enabled));
 	PE_parse_boot_argn("oneios-hid-log", &oneios_hid_log, sizeof(oneios_hid_log));
 	PE_parse_boot_argn("oneios-hid-buttons-builtin", &oneios_hid_buttons_builtin, sizeof(oneios_hid_buttons_builtin));
+	PE_parse_boot_argn("oneios-hid-lock-key-delay", &oneios_hid_lock_key_delay, sizeof(oneios_hid_lock_key_delay));
 	PE_parse_boot_argn("oneios-hid-queue-kib", &oneios_hid_queue_kib, sizeof(oneios_hid_queue_kib));
 	PE_parse_boot_argn("oneios-pen", &oneios_pen, sizeof(oneios_pen));
 	if (!enabled || oneios_hid_stage) {

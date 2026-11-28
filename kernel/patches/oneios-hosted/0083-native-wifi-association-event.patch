@@ -1,0 +1,28 @@
+diff --git a/bsd/kern/kern_event.c b/bsd/kern/kern_event.c
+--- a/bsd/kern/kern_event.c
++++ b/bsd/kern/kern_event.c
+@@ -8913,7 +8913,7 @@
+ #endif /* SKYWALK && XNU_TARGET_OS_OSX */
+ 
+ 	/* Verify the message is small enough to fit in one mbuf w/o cluster */
+-#if XNU_HOSTED
++#if XNU_HOSTED || XNU_ONEIOS_NATIVE
+ 	/*
+ 	 * OneiOS (0049): an IEEE 802.11 event of Apple's may fill an mbuf cluster. iOS 27's association event
+ 	 * (APPLE80211_M_ASSOC_DONE) carries a 540-byte record that wifid reads (ten access point records, the
+@@ -8922,12 +8922,13 @@
+ 	 * phone, 2026-11-12). On Apple's hardware this event goes through IO80211Family's user client, which this
+ 	 * kernel's Wi-Fi driver (kernel/patches/oneios-hosted/net) does not have: its events are these kernel
+ 	 * events. After UniXNU-sheng's sheng-wifi-association-event.patch. Every other event keeps the limit.
++	 * The native kernel too (0083): its Wi-Fi driver is the same archive and posts the same event.
+ 	 */
+ 	const u_int32_t kev_maximum = event_msg->vendor_code == KEV_VENDOR_APPLE &&
+ 	    event_msg->kev_class == KEV_IEEE80211_CLASS ? MCLBYTES : MLEN;
+-#else /* !XNU_HOSTED */
++#else /* !(XNU_HOSTED || XNU_ONEIOS_NATIVE) */
+ 	const u_int32_t kev_maximum = MLEN;
+-#endif /* !XNU_HOSTED */
++#endif /* !(XNU_HOSTED || XNU_ONEIOS_NATIVE) */
+ 	total_size = KEV_MSG_HEADER_SIZE;
+ 
+ 	for (i = 0; i < 5; i++) {

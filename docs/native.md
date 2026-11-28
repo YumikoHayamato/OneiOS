@@ -646,6 +646,109 @@ published, which was wrong.
   inside crosvm's mapping of the guest's RAM, which only a shared-RAM VM may do: a protected VM's other mappings are
   lent memory). Not booted yet: it waits for a pool of about 1000 pages.
 
+### The bridge, the remembered Wi-Fi network and the power key in the crosvm VM (2026-11-25; branch native-vm-bridges)
+Four faults the owner reported after take9 to take12, each traced on the PC from the sessions' files
+(`logs/pa3q-vmboot/`), from iOS's own log in a copy of the VM's Data store (`oneios-tool phone pull-data --vm`, then
+`oneios-tool ioslog`), and from 24A446's binaries. **Built and host-tested on the PC; none of it has run on the phone
+yet** (the next session is the owner's). The lines that prove each on the phone are at the end.
+
+**1. The battery showed 0 % (and 2, no haptics): the VM had no bridge channel.** The battery, haptics, thermal and
+brightness drivers of `drivers/` all talk to the phone over the bridge channel, which is xnuhost's virtio-mmio device
+`/arm-io/bridge` ("oneios,bridge"). crosvm's VM has no xnuhost and no such device, so every one of them said so at
+boot (take9, 10 and 12, `serial.txt`): `ONEIOS BRIDGE: off: no /arm-io/bridge in the device tree`, `ONEIOS HAPTIC:
+off: no bridge device`, `ONEIOS BATTERY: off: the host serves no battery channel`, `DroidVMAudio: published Speaker=1
+Mic=1 Actuator=0`. iOS's powerd in the same session: `No Battery to poll.`, `Invalid/no power source information
+received`. The fix is a second transport for the same messages:
+- The kernel (`drivers/bridge/OneiOSBridge.c`): when `/arm-io/bridge` is compatible `"oneios,bridge-uart"`, its `reg`
+  is the absolute address of an ns16550 (crosvm's second serial port, `0x2f8`; the console is the first, patch 0077),
+  and each message goes there as a frame (`drivers/bridge/oneios_bridge_stream.h`: `0x4f 0x42`, the 8-byte header,
+  the payload, a CRC-16). Polled as the console is, never by interrupt: every 10 ms while messages come (and for 2 s
+  after one), every 250 ms otherwise. The hello is sent again every 0.5 s until it is answered; after 20 without an
+  answer the transport is given up (`ONEIOS BRIDGE: off: no answer to 20 hellos on the serial port`) and costs nothing.
+  The drivers above it are unchanged.
+- The loader: `xnuloader-crosvm --bridge` adds that node (and `bridge` to `OUT.disks`).
+- The phone's end: `bridgectl serve /SOCKET` (`runtime/bridges/devices/bridge_stream.c`) listens on a Unix socket and
+  serves control, the battery (`runtime/bridges/battery`: read only, `/sys/class/power_supply`) and haptics
+  (`runtime/bridges/haptics`: the force-feedback device, `sec_vibrator_inputff`). Thermal, brightness and Bluetooth
+  are not offered in its hello, so those drivers stay off as before.
+- `vm-boot`: for an Image with the `bridge` line it pushes `bridgectl` (`--bridgectl FILE`), starts `bridgectl serve
+  $D/bridge.sock` before crosvm and gives crosvm `--serial type=unix-stream,hardware=serial,num=2,path=$D/bridge.sock,
+  input-unix-stream` (only when the socket is there: crosvm does not start without it). `--no-haptics` serves the
+  battery alone. `bridge.txt` is its log; `run.txt` gets `bridge:` lines.
+With the haptic channel served, `drivers/haptics` publishes the Actuator audio device and `/product/haptics` as it does
+under xnuhost (`docs/hardware.md` 5): iOS's haptics then go to the motor instead of "audio only"
+(`setClientPlayerBehavior: Muting haptics ... AudioOnly` in take12's log). [U] That path has never run on the S25
+(`docs/SM8750_PORT.md` 2: the S26's motor refused the sine upload); `bridge.txt` says what the motor did
+(`haptics: effect N played on ...` or `failed on ...`).
+That changes iOS's whole haptic route, not only the motor: under xnuhost the same node once stopped the power key from
+locking until the stand-in button haptics service and the built-in buttons were on (`docs/hardware.md` 5, "The power
+key"), so it relies on `oneios-button-haptics=1 oneios-hid-buttons-builtin=1` staying in the Image's boot arguments
+(they are in take9 to take12's). If anything regresses, `vm-boot --no-haptics` keeps the battery and leaves iOS without
+an actuator as before (`oneios-actuator=0` in the boot arguments does the same in the kernel). The motor's own part can
+be tried before a session, without iOS: `bridgectl haptic-pattern` on the phone (it vibrates: the owner's to run) sends
+several effects in a row through this same backend, which is the "once, then never" question for the S25's motor.
+
+**2. "It vibrated once at the first ringtone preview, then never."** Nothing of iOS can have reached the motor in
+those sessions: the drivers were off (above), `ONEIOS HAPTIC: counters: ... 0 requests to the motor | vibrator service
+0 requests`, and iOS's own haptic server played sound only (`start: client ID ... audio: 1 haptic: 0`, `Muting haptics
+on client ... AudioOnly` in take12's log). [U] what the owner felt once (the speaker at full scale, or an effect of
+Android's own). The phone's kernel log names every effect of the motor's driver (`cs40l26_upload_effect`,
+`cs40l26_playback_effect`), but it holds only a few minutes and its clock stops while the phone sleeps (after take12
+it read 48524 s at an uptime of 69031 s), so it no longer had the sessions when it was read: nothing is known from it.
+(A first reading of it, "no effect in take12's 18 minutes", was wrong for that reason; this branch's third commit
+message still says it.) The fix is 1.
+
+**3. Wi-Fi forgot the network: iOS's join never ended, so iOS never saved it.** iOS's log of take12: wifid started with
+`Fetched 0 known networks from the plist` and `WiFiSecurityCopyPassword ... Error result -25300` (no such keychain
+item), and the join the owner made in Settings ended, although the phone had joined and the link was up, with
+`{ASSOC-} Failed to join(-3905 ...)` and `END REQ [ASSOC] took 30.138668229s (... proc=Preferences ...) err=-3905`
+(a timeout); later `WiFiManagerFlushKnownNetworksCache: Successfully flushed 0 known networks to the plist`. The
+kernel's side of the same join (`serial.txt`, take10 and take12): `ONEIOS WIFI: event 9 for en0, 540 bytes -> 40`:
+the association event (APPLE80211_M_ASSOC_DONE, which wifid waits for) was refused with EMSGSIZE. Patch 0049 gave
+that event room (an mbuf cluster) for the hosted kernel under `#if XNU_HOSTED`; the native kernel is built without
+`XNU_HOSTED`, so its limit was still one mbuf (288 bytes: `mov w10, #0x120` in the built `kern_event.o`). **Patch
+0083** makes that `#if` take `XNU_ONEIOS_NATIVE` too. The link's own events (2, 3, 4: 32 bytes at most) always went
+through, which is why the network worked while iOS thought the join had failed. The Data store was not the cause: it
+is kept, and its checkpoints ran to the session's last seconds.
+
+**4. The power key's click came late: iOS held the key for 150 ms.** In iOS's log of take9 (12 presses of power),
+backboardd logs on every key-down `[com.apple.iohid:connection] ... Event latency:151586510 type:3
+sender:0x1000001F9` (151 to 153 ms; 173 the first; none on a volume key), and its own `finished: firstDown:0.00992s
+ago` for presses that lasted 0.16 s: the down event arrived just before the up. The hold is iOS's keyboard service
+filter (`IOHIDKeyboardFilter::processLockKeyDelay`, read in 24A446's shared cache): a Consumer/Power key-down from a
+service that conforms to a keyboard (usage page 1, usage 6) is kept for `LockKeyDelay` ms, 150 unless the service's
+`HIDEventServiceProperties` names another, 0 for none. The buttons' HID device is such a keyboard; an iPhone's
+buttons are not. `OneiOSHidInput.cpp` now publishes `LockKeyDelay` = 0 in the buttons' event service's
+`HIDEventServiceProperties` when its event driver attaches (`oneios-hid-lock-key-delay=N` for another value). The
+rest of the path was measured in the same log and is short: from SpringBoard's `Lock button down` to
+`_playLockSound` to the Speaker's `StartIO` succeeded is about 13 ms, and `displayctl touch` passes each key on as
+it comes (its panel switch is on the release). [U] the phone's own part after that (crosvm's AAudio stream waking an
+output that Android put in standby): not visible from the PC.
+
+Also seen, not changed: the times in iOS's log of a native session are squeezed about 52 times within a stretch (the
+log's reader takes the VM's 19.2 MHz counter for nanoseconds); the mach times inside the messages are right.
+
+Tested on the PC: `make -C runtime/bridges test` (the new `test_stream`: 65 checks: the frames, the phone's end against
+a guest on a socket pair with a counted motor and a made-up battery, and `bridgectl serve` reached as crosvm reaches
+it), `make -C runtime/loader test` (192 checks; the node), `cargo test -p oneios-phone` (the script: the tool before
+crosvm, the port only with the socket, `--no-haptics`), `oneios-tool kernel drivers --check` against the native and
+the hosted kernel's compile records (17 sources each), `OneiOSHidInput.cpp` and the patched `kern_event.c` compiled
+with the native kernel's own recorded commands (with 0083 the object picks 2048 for an Apple 802.11 event:
+`cmp w8, #0x6; mov w8, #0x800; csel`), `xnuloader-crosvm ... --bridge` on the native collection (the node in
+`OUT.adt`). Not done: a native kernel build and a boot (the kernel's own tree is the lead's; the PC bench has no
+ns16550).
+
+To use it: build the native kernel and its collection again (0083, the HID archive, `drivers/`), `make -C
+runtime/bridges build/android/bridgectl`, the Image with `xnuloader-crosvm ... --bridge`, then `vm-boot` as before.
+What the next session shows:
+
+| Fault | Read (no write) | Says it is fixed |
+|---|---|---|
+| battery | `serial.txt`; `bridge.txt` | `ONEIOS BRIDGE: the serial transport: an ns16550 at 0x2f8`, `ONEIOS BRIDGE: on: host protocol 1, channels 0x23`, `ONEIOS BATTERY: on: IOPMPowerSource published at N%`; `bridge: battery: iOS asks: N%, on power` |
+| haptics | `serial.txt`; `bridge.txt`; during the session, `oneios-tool phone dmesg --grep 'cs40l26_playback_effect'` (the kernel log keeps only minutes) | `Actuator=1`, `ONEIOS HAPTIC: play N: ...`; `haptics: effect N played on /dev/input/event6`; the motor driver's lines right after a tap |
+| Wi-Fi | `serial.txt`; the second session's `wifi.txt` | `ONEIOS WIFI: event 9 for en0, 540 bytes -> 0`; in the next session a `join:` without a touch of Settings (iOS's log: `Fetched 1 known networks from the plist`) |
+| power key | `serial.txt`; iOS's log (`oneios-tool ioslog show data.img --boot last --proc backboardd --grep 'Event latency.*type:3'`) | `oneios-hid: buttons: LockKeyDelay 0 ms published in the event service's HIDEventServiceProperties`; no `Event latency` line of about 150000000 on a power key-down |
+
 ### iOS in the shared-RAM VM (step 9, 2026-11-23)
 - **The pool, minutes after a restart.** At 80 min of uptime neither `acquire` beside One UI nor `grow` with it stopped
   found a new 2 MiB page: with One UI stopped 8.6 GB were free and only 5 free 2 MiB blocks lay outside the CMA areas

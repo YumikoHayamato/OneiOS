@@ -302,3 +302,10 @@
 # core while typing, every key seconds late (take9). Before launchd the key is written as an empty dictionary when
 # missing. And com.apple.navd in 0044's default enabled jobs (the Maps widget's reconnect loop).
 0082-native-dictation-status.patch
+# native-wifi-association-event (2026-11-25): 0049 for the native kernel too. Its Wi-Fi is the same archive (net/,
+# NET_TRANSPORT_PCI) and posts iOS 27's 540-byte association event the same way, but 0049's room for it was under
+# #if XNU_HOSTED only: in the VM the post returned EMSGSIZE ("ONEIOS WIFI: event 9 for en0, 540 bytes -> 40", take10
+# and take12), wifid's join ended in a timeout 30 s later ("{ASSOC-} Failed to join(-3905)", "END REQ [ASSOC] took
+# 30.1 s ... err=-3905") although the link was up, so it never saved the network or its password: the next session knew
+# 0 networks and the owner typed the password again. The #if also takes XNU_ONEIOS_NATIVE. README.md, "0083".
+0083-native-wifi-association-event.patch

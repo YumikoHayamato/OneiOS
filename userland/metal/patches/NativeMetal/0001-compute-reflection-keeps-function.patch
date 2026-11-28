@@ -1,0 +1,30 @@
+OneiOS take18, userland/metal/patches/NativeMetal/0001: a compute pipeline rebuilt with its unset constants zero keeps
+its function until the reflection is read.
+Upstream: Droid-VM/NativeMetal 3c46b5e (wip/hackintosh, HuJK, 2026-11-08, MIT), cherry-picked onto b0d6a07 unchanged;
+also picked by upstream OneiOS 3f65b1d.
+What: newComputePipelineStateWithDescriptor:options:reflection:error: retries a kernel that reads an unset function
+constant with those constants zero; the rebuilt function was held only inside the retry's block, ARC released it, and
+the reflection then read the released function (Function::clone at address 0).
+Why: cameracaptured's CCPortrait precompilation died with SIGSEGV at 0 every boot on Droid-VM (symbolized:
+nmb_compute_pipeline_reflection -> compute_descriptor -> Function::function_descriptor).
+Switch: none (a crash fix). Removable: yes (ONEIOS_METAL_SKIP=compute-reflection-keeps-function); depends on nothing.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index b21ef41..0f068f6 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -4808,9 +4808,12 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
+  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
+  const uint64_t pipelineBegan=nowUs();
+  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);
+- // Metal builds a kernel that reads a constant nobody set; the runtime refuses it: once more with those constants zero.
++ // Metal builds a kernel that reads a constant nobody set; the runtime refuses it: once more with those constants zero. The rebuilt
++ // function lives to the end of the call, as the reflection below reads its handle: held in the block alone, it went with the block,
++ // and the reflection read a released function (cameracaptured's CCPortrait kernels: SIGSEGV at 0 in the precompilation, every boot).
++ NBFunction *rebuilt=nil;
+  if(!handle) {
+-  NBFunction *rebuilt=zeroRestFunction((NBFunction *)d.computeFunction);
++  rebuilt=zeroRestFunction((NBFunction *)d.computeFunction);
+   if(rebuilt){p.function=rebuilt.handle;handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);}
+  }
+  gTimePipeline.add(pipelineBegan);

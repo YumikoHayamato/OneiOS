@@ -212,6 +212,13 @@ pub enum Command {
         /// The Wi-Fi's bridge for the phone, for an Image made with --wifi, used in a takeover (runtime/bridges: make)
         #[arg(long, value_name = "FILE", default_value = "runtime/bridges/build/android/wifictl")]
         wifictl: String,
+        /// The bridge channel's phone end, for an Image made with xnuloader-crosvm --bridge (runtime/bridges: make): the phone's
+        /// battery to iOS and iOS's haptics to the phone's motor, over crosvm's second serial port (`bridgectl serve`)
+        #[arg(long, value_name = "FILE", default_value = "runtime/bridges/build/android/bridgectl")]
+        bridgectl: String,
+        /// With such an Image: the battery alone, no haptics (`bridgectl serve --no-haptics`: iOS then has no actuator, as before)
+        #[arg(long)]
+        no_haptics: bool,
     },
     /// One run of runtime/vmprobe's payload as a protected VM under Gunyah with AVF's crosvm: 1 vCPU, no device but
     /// the serial port; it powers off by itself, else crosvm stop after SECONDS. Refused during a session
@@ -556,8 +563,8 @@ pub fn main(cli: Cli) -> i32 {
             HaltpollCommand::Load { ko, out } => haltpoll::load(&adb, &ko, &out),
             HaltpollCommand::Unload => haltpoll::unload(&adb),
         }),
-        Command::VmBoot { image, seconds, thp, out, stop, bridge, swipe_test, pin, droidvm, gpu_floor, cpu_floor, takeover, pin_first, thermal_log, audio_uid, wifictl } => Adb::connect(serial).and_then(|adb| {
-            if stop { vmboot::stop(&adb) } else { vmboot::vm_boot(&adb, &image, &out, &vmboot::Options { seconds, thp, bridge, swipe_test, pin, droidvm, gpu_floor_mhz: gpu_floor, cpu_floor_percent: cpu_floor, takeover, pin_first, thermal_log, audio_uid, wifictl }) }
+        Command::VmBoot { image, seconds, thp, out, stop, bridge, swipe_test, pin, droidvm, gpu_floor, cpu_floor, takeover, pin_first, thermal_log, audio_uid, wifictl, bridgectl, no_haptics } => Adb::connect(serial).and_then(|adb| {
+            if stop { vmboot::stop(&adb) } else { vmboot::vm_boot(&adb, &image, &out, &vmboot::Options { seconds, thp, bridge, swipe_test, pin, droidvm, gpu_floor_mhz: gpu_floor, cpu_floor_percent: cpu_floor, takeover, pin_first, thermal_log, audio_uid, wifictl, bridgectl, haptics: !no_haptics }) }
         }),
         Command::VmProbe { payload, mem, timeout, out, thp, droidvm, shared_ram, thp_shmem } => Adb::connect(serial).and_then(|adb| {
             let crosvm = match droidvm.as_deref() {

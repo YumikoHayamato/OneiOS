@@ -404,5 +404,15 @@ xl_adt_node *xl_machine_tree(const xl_machine *m, const char **error)
     xl_adt_set_str(uart, "compatible", "arm,pl011");
     reg(uart, m->armio_base, m->uart_base, m->uart_size);
   }
+  // The bridge channel on a serial port (drivers/bridge/OneiOSBridge.c, its second transport): absolute, as the console's.
+  if (m->bridge_uart_size) {
+    if (xl_adt_child(io, "bridge")) FAIL("the bridge is a virtio device or a serial port, not both");
+    if (m->uart_size && m->bridge_uart_base < m->uart_base + m->uart_size && m->uart_base < m->bridge_uart_base + m->bridge_uart_size)
+      FAIL("the bridge's serial port is the console's");
+    xl_adt_node *bridge = xl_adt_add(io, "bridge");
+    xl_adt_set_str(bridge, "compatible", "oneios,bridge-uart");
+    const uint64_t absolute[2] = { m->bridge_uart_base, m->bridge_uart_size };
+    xl_adt_set(bridge, "reg", absolute, sizeof absolute);
+  }
   return root;
 }

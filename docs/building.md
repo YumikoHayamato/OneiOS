@@ -221,6 +221,8 @@ runtime/loader/build/host/xnuloader-crosvm out/kernel/native-24A446/kernel.kc ou
   --image /mnt/giochi/Linux/oneios/out-image/24A446
 # -> out/crosvm/kernel.img (an arm64 Linux Image, 137 MiB; its label at 0x100 names the VM), kernel.img.adt, and
 #    kernel.img.disks (the image set's disks on crosvm's PCI, the phone's staged files; without --image: no disk)
+# --bridge (with --image): the battery and haptics, the bridge channel on crosvm's second serial port; vm-boot then needs
+#    runtime/bridges/build/android/bridgectl (make -C runtime/bridges build/android/bridgectl) and starts `bridgectl serve`
 oneios-tool phone hugepool load && oneios-tool phone hugepool grow --want 1536   # once per phone boot, for a VM above ~0.5 GB
 oneios-tool phone vm-boot --image out/crosvm/kernel.img --seconds 900 --thp --out logs/pa3q-vmboot/NAME
 ```

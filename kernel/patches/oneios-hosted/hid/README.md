@@ -104,6 +104,23 @@ xnuhost reads the keys' devices without `EVIOCGRAB` (`runtime/xnuhost/src/input.
 switch's Volume Up + Volume Down watcher sees every press too. iOS also sees both keys of that chord pressed.
 Whether iOS 27 takes Ring Enable = 1 as "ring" is a guess from older releases; nothing sets the bit on this phone.
 
+**The power key is not held back (2026-11-25).** iOS's keyboard service filter (`IOHIDKeyboardFilter`, a HID plug-in in
+backboardd; read in 24A446's shared cache with `ipsw dyld disass`) delays the "lock key": in
+`IOHIDKeyboardFilter::processLockKeyDelay` a key-down of usage page 0x0C is kept back when its usage is 0x19E, or
+when it is 0x30 (Power) **and** `IOHIDServiceConformsTo(service, 1, 6)` (the service is a keyboard); a timer of
+`_lockKeyDelayMS` then gives the event back, with its old time. The constructor sets `_lockKeyDelayMS` to 150;
+`open()` reads a number `LockKeyDelay` from the service's `HIDEventServiceProperties` dictionary; `filter()` skips the
+hold when it is 0. This device's usage pair is (1, 6), so each press of power reached SpringBoard 150 ms late (iOS's
+log of a session in the VM, 12 presses: backboardd's `[com.apple.iohid:connection] ... Event latency:151586510 type:3
+sender:0x1000001F9` on every power key-down, 151 to 153 ms, and none on a volume key; the owner heard the lock's
+click late). An iPhone's own buttons are a Consumer Control service, never held. `OneiOSHidInput.cpp` (`setLockKeyDelay`)
+puts `LockKeyDelay` = 0 into the buttons' event service's `HIDEventServiceProperties` when its event driver attaches,
+long before backboardd opens it, keeping what the dictionary already has (and puts it back, at most 4 times, should a
+later tick find it gone or changed). Log: `oneios-hid: buttons: LockKeyDelay 0 ms
+published in the event service's HIDEventServiceProperties (...)`. `oneios-hid-lock-key-delay=N` (ms) for another value
+(150 is iOS's own). Compiled with the native kernel's recorded IOKit command; not booted. On the phone: that line in the
+console, and in iOS's log no `Event latency` of about 150000000 on a power key-down.
+
 ## Touch
 
 The transport takes the panel's own axis ranges from the device (`ABS_MT_POSITION_X/Y` minimum and maximum, as

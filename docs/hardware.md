@@ -874,6 +874,17 @@ on, not off; the 0 comes from a tap on a button that showed on (Wi-Fi on, not jo
 **To turn it on again: open Control Center and tap the Wi-Fi button once** (it turns blue; wifid logs `Set user auto
 join enabled requested by "..." enabled 1`). The Settings switch off and on, or a tap on a network, also works.
 
+### The native path's VM: the network forgotten in every session (2026-11-25; kernel patch 0083)
+
+0049's room for the 540-byte association event was under `#if XNU_HOSTED`, and the native kernel is built without it:
+`ONEIOS WIFI: event 9 for en0, 540 bytes -> 40` at each join (take10, take12). The supplicant had joined and the link
+was up, but wifid's join ended with a timeout after 30 s (`{ASSOC-} Failed to join(-3905 ...)`, `END REQ [ASSOC] took
+30.1 s ... err=-3905`), and a join that failed is saved nowhere: `Fetched 0 known networks from the plist` at the next
+start and no keychain item (`-25300`), so the owner typed the password in every session. 0083 opens 0049's `#if` to the
+native kernel. `docs/native.md`, "The bridge, the remembered Wi-Fi network and the power key in the crosvm VM";
+`kernel/patches/oneios-hosted/README.md`, "0083". Compiled, not run on the phone yet: there `event 9 ... -> 0`, and the
+second session joins by itself.
+
 ### Missing, unknown
 
 - Seen in a session (2026-11-12): wifid takes en0, scans, lists the networks, joins an open network through the
@@ -1486,6 +1497,12 @@ backlight drivers see that as a brightness of 0 and then a brightness above 0, o
 - Two backends since 2026-11-15 (section 7e): samsung, the evdev device below (the default, unchanged); treble, the
   vibrator HAL `android.hardware.vibrator.IVibrator/default` (`on(ms)`, then `setAmplitude(level / 255)` when its
   capabilities have amplitude control, `off()`; `br_haptic_open_as`).
+- **The native path's VM (2026-11-25)**: crosvm's VM has no "oneios,bridge" device, so until then no request of iOS
+  reached the motor there (`ONEIOS HAPTIC: off: no bridge device`, `Actuator=0`, `0 requests to the motor`; iOS's haptic
+  server played sound only). The channel now goes over crosvm's second serial port to
+  `bridgectl serve` on the phone, which opens this same backend (`br_haptic_open_as`); `vm-boot --no-haptics` leaves the
+  haptic channel out. `docs/native.md`, "The bridge, the remembered Wi-Fi network and the power key in the crosvm VM".
+  [U] Not run on the phone yet; on the S25 the sine upload itself is unproven (`docs/SM8750_PORT.md` 2).
 - Finds the device by its EV_FF bits (`sec_vibrator_inputff` first), sets `FF_GAIN` 10000 once.
 - One effect, updated for every request: `FF_PERIODIC` / `FF_SINE`, period = 1000 / frequency clamped to 4..10 ms
   (6 ms when iOS names none), magnitude = 40 + 215 x intensity / 1000 (an LRA does not move below a floor), length
@@ -2230,6 +2247,10 @@ edge contacts carry the edge flag SpringBoard's gestures need.
 The side keys stay ungrabbed: iOS and the switch's watcher both see every press, including the two of the
 Volume Up + Volume Down chord that ends the session.
 
+iOS holds a keyboard's Power key-down for 150 ms (its keyboard filter's "lock key delay") and the buttons' device is a
+keyboard to it: the device publishes `LockKeyDelay` = 0 since 2026-11-25, so a press of power reaches SpringBoard at
+once (`kernel/patches/oneios-hosted/hid/README.md`, "Buttons"; `oneios-hid-lock-key-delay=150` is iOS's own again).
+
 ### Missing, unknown
 
 - [U] everything on the phone: the touchscreen's axis ranges and rate, whether it reports while One UI's framework
@@ -2247,6 +2268,12 @@ the health HAL (`android.hardware.health.IHealth/default`, `getHealthInfo`).
 
 - **Before this**: iOS showed a near-empty battery with no charging state. [I] nothing published an `IOPMPowerSource`
   under the hosted kernel (none of the classes that do has its hardware here); no log or registry dump confirmed it.
+- **The native path's VM (2026-11-25)**: there the battery read 0 % with no charging state, because crosvm's VM has no
+  "oneios,bridge" device and so no battery channel (`ONEIOS BATTERY: off: the host serves no battery channel`; powerd:
+  `No Battery to poll.`). `bridgectl serve` on the phone now serves `OB_CH_BATTERY` from this same bridge over crosvm's
+  second serial port (`xnuloader-crosvm --bridge`, started by `vm-boot`): the first reading before the service
+  registers, then each change, as under xnuhost. `docs/native.md`, "The bridge, the remembered Wi-Fi network and the
+  power key in the crosvm VM". Host-tested (`runtime/bridges/tests/test_stream.c`); not run on the phone yet.
 - **Route**: `runtime/bridges/battery` reads `/sys/class/power_supply/` in xnuhost (read only, one normal-priority
   thread, every 3 s only while iOS listens); `OB_CH_BATTERY` carries one `struct ob_battery_state`, at once for a
   change of level or charging state, the rest at most every 30 s; `drivers/battery/OneiOSBattery.cpp` publishes it.

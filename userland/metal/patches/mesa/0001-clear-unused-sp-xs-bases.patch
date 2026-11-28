@@ -1,0 +1,62 @@
+OneiOS take18, userland/metal/patches/mesa/0001: tu: clear unused SP_xS_BASEs (gen8, so the Adreno 830 too).
+Upstream: Mesa 78fd465c (Rob Clark, 2026-11-09, MIT, MR 46105), as Droid-VM/UniXNU ac97948 carries it
+(patches/mesa/upstream-78fd465c-tu-clear-unused-sp-xs-bases.patch); applies to our Mesa with offsets (contexts made again).
+ac97948's other patch, upstream 07ea9790 (a 2-slice Adreno 840 entry, chip 0x44050A21), is not taken: it names an Adreno 840
+only, and this phone's GPU is an Adreno 830 (freedreno_devices.py: CHIP.A8XX, chip 0x44050001).
+What: with CHIP >= A8XX a disabled stage's SP_xS_BASE is written (and the 2D blit path writes the HS, DS and GS ones), which
+latches SP_xS_CONFIG/CONST_CONFIG; otherwise the hardware kept the old base addresses and fetched from them.
+Why: upstream traced UCHE faults to left-over SP_GS_BASE/SP_HS_BASE values from another process (gen8 devcoredump).
+Switch: none (a GPU fault fix). Removable: yes (ONEIOS_METAL_SKIP=clear-unused-sp-xs-bases). Turnip's build id changes.
+
+diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
+index 9a1a48a..a0eca08 100644
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -1044,10 +1044,13 @@ r3d_common(struct tu_cmd_buffer *cmd, struct tu_cs *cs, enum r3d_type type,
+          .cs_bindless = CHIP == A6XX ? 0x1f : 0xff,
+          .gfx_bindless = CHIP == A6XX ? 0x1f : 0xff,));
+ 
+-   with_crb (cs, 2 * 5 + 2 * 12) {
++   with_crb (cs, 2 * 5 + 2 * 12 + 2 * 3) {
+       tu6_emit_xs_config<CHIP>(crb, { .vs = vs, .fs = fs });
+       struct tu_pvtmem_config pvtmem = {};
+       tu6_emit_xs<CHIP>(crb, cs->device, MESA_SHADER_VERTEX, vs, &pvtmem, vs_iova);
++      tu6_emit_xs<CHIP>(crb, cs->device, MESA_SHADER_TESS_CTRL, NULL, &pvtmem, 0);
++      tu6_emit_xs<CHIP>(crb, cs->device, MESA_SHADER_TESS_EVAL, NULL, &pvtmem, 0);
++      tu6_emit_xs<CHIP>(crb, cs->device, MESA_SHADER_GEOMETRY, NULL, &pvtmem, 0);
+       tu6_emit_xs<CHIP>(crb, cs->device, MESA_SHADER_FRAGMENT, fs, &pvtmem, fs_iova);
+    }
+ 
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index 96f5aca..492bf5b 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -1875,6 +1875,28 @@ tu6_emit_xs(struct tu_crb &crb,
+ {
+    if (!xs) {
+       /* shader stage disabled */
++      if (CHIP >= A8XX) {
++         switch (stage) {
++         case MESA_SHADER_VERTEX:
++            crb.add(A6XX_SP_VS_BASE());
++            break;
++         case MESA_SHADER_TESS_CTRL:
++            crb.add(A6XX_SP_HS_BASE());
++            break;
++         case MESA_SHADER_TESS_EVAL:
++            crb.add(A6XX_SP_DS_BASE());
++            break;
++         case MESA_SHADER_GEOMETRY:
++            crb.add(A6XX_SP_GS_BASE());
++            break;
++         case MESA_SHADER_FRAGMENT:
++            crb.add(A6XX_SP_PS_BASE());
++            break;
++         case MESA_SHADER_COMPUTE:
++            crb.add(A6XX_SP_CS_BASE());
++            break;
++         }
++      }
+       return;
+    }
+ 

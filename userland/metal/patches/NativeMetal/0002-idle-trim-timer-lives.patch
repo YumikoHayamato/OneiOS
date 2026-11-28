@@ -1,0 +1,47 @@
+OneiOS take18, userland/metal/patches/NativeMetal/0002: the 2 s idle trim of the runtime's kept memory runs.
+Upstream: the fix of Droid-VM/NativeMetal 46fdc91 (UniXNU line, rponeawa, 2026-11-11: the memory pressure source held
+only by a local never delivered an event) as the board's 935c468 (HuJK, 2026-11-16) applies it to this timer.
+What: watchIdleMemory's dispatch timer is a static. The frontend is compiled with ARC; at b0d6a07 the timer was held only
+by a local of its dispatch_once block, so its last reference went when the block returned and libdispatch took it off its
+queue (_dispatch_source_xref_dispose, DQF_RELEASED): nmb_device_trim_memory(device, 2000) never ran in any process. The
+pressure source next to it lives (its handler captures it). Each tick also calls oneios_idle_tick where the image has it
+(userland/metal/Switches.inc: Turnip's freed-BO cache trimmed once a minute, mesa 0003).
+Why: with the trim dead, the kept empty pooled blocks (board metal2vulkan 0013), the spare command pools (0022) and the
+merge scratches (0030) were given back only at a memory pressure rise, never at idle: upstream OneiOS's render server held
+2,600-3,400 blobs under 1 MiB given back only at a pressure rise (50873fe's message), every blob wired guest RAM.
+Switch: boot argument oneios-idle-trim=0 (ONEIOS_IDLE_TRIM=0): no timer, as before. Removable: yes
+(ONEIOS_METAL_SKIP=idle-trim-timer-lives). metal2vulkan 0006 and mesa 0003 act only through this timer.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index b21ef41..b1f2c72 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1166,13 +1166,26 @@ static void watchImportPressure() {
+ // widget renderer its own. A pool whose placements come each frame refills its kept block within the frame, so only blocks no frame
+ // asked for in two seconds go. (Waiting for the process to commit nothing for two seconds never trimmed the render server: the home
+ // screen's clock keeps it drawing.)
++// The timer lives as long as the process (OneiOS; upstream 46fdc91's fix of the pressure source, done for this timer by the
++// board's 935c468): this file is compiled with ARC, and a dispatch source whose last reference goes is taken off its event queue
++// (libdispatch's _dispatch_source_xref_dispose, DQF_RELEASED). Held only by a local of the block below, as before, it was released
++// when the block returned and never fired: no kept block, spare command pool or merge scratch was ever trimmed at idle (the board's
++// metal2vulkan 0013, 0022, 0030), only at a memory pressure rise (whose source lives: its handler holds it). The boot argument
++// oneios-idle-trim=0 (ONEIOS_IDLE_TRIM=0, userland/metal/Switches.inc) starts no timer, as before. Each tick also calls
++// oneios_idle_tick where the image has it (userland/metal/Switches.inc: Turnip's idle trim of its freed-BO cache, once a minute).
++extern "C" void oneios_idle_tick(void) __attribute__((weak));
+ static void watchIdleMemory() {
+  static dispatch_once_t once;
++ static dispatch_source_t timer;
+  dispatch_once(&once,^{
+-  dispatch_source_t timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
++  if(const char *on=getenv("ONEIOS_IDLE_TRIM"))if(!strcmp(on,"0"))return;
++  timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
+   if(!timer)return;
+   dispatch_source_set_timer(timer,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),2*NSEC_PER_SEC,250*NSEC_PER_MSEC);
+-  dispatch_source_set_event_handler(timer,^{if(gDevice)gTrimmedBlocks+=nmb_device_trim_memory(gDevice,2000);});
++  dispatch_source_set_event_handler(timer,^{
++   if(gDevice)gTrimmedBlocks+=nmb_device_trim_memory(gDevice,2000);
++   if(&oneios_idle_tick)oneios_idle_tick();
++  });
+   dispatch_activate(timer);
+  });
+ }

@@ -1,0 +1,48 @@
+OneiOS take18, userland/metal/patches/NativeMetal/0005: the thread CPU samples only where the trace or the journal reads
+them.
+Upstream: none (OneiOS; upstream NativeMetal 935c468 still calls NBCost::now() unconditionally).
+What: threadCpuUs() returns 0 without asking thread_info unless traceWanted() (SHENG_DIAG in backboardd, the only reader:
+tracePush); render pipeline creation takes NBCost::now() (mach_thread_self, thread_info, task_info) only while the pipeline
+journal is on (log-gpu=1), as its second sample already was.
+Why: take17's iOS log has 20,072 "Sandbox: com.apple.WebKit.GPU deny(1) syscall-mig 254" (Sandbox.kext's kobject index
+254 = MIG 3612 thread_info: two at each command buffer's creation and commit) and 416 "deny(1) syscall-mach 27"
+(thread_self_trap, one at each render pipeline): each a refused kernel call and a sandbox violation report (WebKit's iOS GPU
+profile allows neither: gpu-defines.sb syscall-mig-allowed and syscall-mach-allowed). Other processes paid the calls for
+nothing.
+Switch: none (no behaviour changes: the values were read only by the diagnostics). Removable: yes
+(ONEIOS_METAL_SKIP=cpu-samples-only-for-trace).
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index b21ef41..392c4a6 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -217,13 +217,17 @@ static void nbForwardPriority(uint32_t foreground,uint32_t background);
+ // Every diagnostic of this process (the frame trace, the sampler, Turnip's pass stamps and submission ring, the runtime's stage ring) runs only
+ // with SHENG_DIAG set, which the plugin sets from the boot argument sheng-diag=1 before the device opens (NativeAdrenoMetalPlugin.mm).
+ static bool diagOn() {static const bool on=getenv("SHENG_DIAG")!=nullptr;return on;}
++static bool traceWanted() {static const bool on=diagOn() && !strcmp(getprogname(),"backboardd");return on;}
++// The thread's CPU time for the frame trace's records, 0 where no trace is written (OneiOS). Every command buffer's creation and commit,
++// and each wait, asked thread_info: a MIG call to the kernel, which WebKit's GPU process may not make (its sandbox's kernel MIG filter:
++// take17's log has 20,072 'deny(1) syscall-mig 254', thread_info, each a violation report), and whose answer only tracePush reads.
+ static uint32_t threadCpuUs() {
++ if(!traceWanted())return 0;
+  thread_basic_info_data_t info;mach_msg_type_number_t count=THREAD_BASIC_INFO_COUNT;
+  if(thread_info(pthread_mach_thread_np(pthread_self()),THREAD_BASIC_INFO,(thread_info_t)&info,&count)!=KERN_SUCCESS)return 0;
+  return (uint32_t)((uint64_t)(info.user_time.seconds+info.system_time.seconds)*1000000ull+(uint64_t)(info.user_time.microseconds+info.system_time.microseconds));
+ }
+ static uint32_t threadIdLow() {uint64_t id=0;pthread_threadid_np(NULL,&id);return (uint32_t)id;}
+-static bool traceWanted() {static const bool on=diagOn() && !strcmp(getprogname(),"backboardd");return on;}
+ static void tracePush(const TraceRec &rec) {
+  if(!traceWanted())return;
+  const uint32_t at=gTraceHead.fetch_add(1);
+@@ -4851,7 +4855,9 @@ static void computeRefused(id<MTLFunction> function,NSString *why) {
+  std::vector<NmbBinaryArchive *> archives;
+  if(!pipelineArchives(d.binaryArchives,archives,error)){delete p;return nil;}
+  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
+- const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
++ // OneiOS: the cost only for the journal, its one reader (NBCost::now asks mach_thread_self and thread_info: refused in WebKit's GPU
++ // process, take17's 416 'deny(1) syscall-mach 27', one at every render pipeline it made, and as many MIG reports).
++ const uint64_t pipelineBegan=nowUs();const NBCost costBegan=gJournalPath.empty()?NBCost():NBCost::now();
+  uint64_t cacheBefore[10]={};if(!gJournalPath.empty())nmb_device_work_stats(gDevice,cacheBefore);
+  uint32_t programVs=0,programFs=0;nbLastProgram(&programVs,&programFs);   // clear what an earlier creation on this thread left
+  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);gTimePipeline.add(pipelineBegan);

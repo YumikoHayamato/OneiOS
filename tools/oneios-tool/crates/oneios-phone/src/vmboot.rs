@@ -132,6 +132,11 @@ pub struct Disks {
     pub audio: bool,
     /// `wifi` (xnuloader-crosvm --wifi): the kernel's Wi-Fi, crosvm's virtio-net on a tap that `wifictl tap` carries to wlan0
     pub wifi: bool,
+    /// `bridge` (xnuloader-crosvm --bridge): the kernel's bridge channel on crosvm's second serial port, a Unix socket whose
+    /// other end is `bridgectl serve` on the phone: the phone's battery to iOS, iOS's haptics to the phone's motor
+    pub bridge: bool,
+    /// false (vm-boot --no-haptics): `bridgectl serve --no-haptics`, the battery alone
+    pub bridge_haptics: bool,
 }
 
 /// The GPU's PCI address (crosvm's pci-address=), drm2kgsl's host arena in MiB and where the Image expects it.
@@ -161,6 +166,7 @@ fn plain(text: &str) -> bool {
 pub fn parse_disks(text: &str) -> Result<Disks> {
     let (mut swiotlb, mut pool, mut store, mut fb, mut input, mut gpu, mut scanout) = (None, None, None, None, false, None, None);
     let (mut audio, mut wifi) = (false, false);
+    let mut bridge = false;
     let mut blocks = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let words: Vec<&str> = line.split_whitespace().collect();
@@ -185,6 +191,7 @@ pub fn parse_disks(text: &str) -> Result<Disks> {
             ["input", "touch"] => input = true,
             ["audio"] => audio = true,
             ["wifi"] => wifi = true,
+            ["bridge"] => bridge = true,
             ["gpu", pci, mib, pa] => {
                 let ok = pci.len() == 7 && pci.as_bytes()[2] == b':' && pci.as_bytes()[5] == b'.' && plain(pci);
                 if !ok {
@@ -203,11 +210,11 @@ pub fn parse_disks(text: &str) -> Result<Disks> {
                 }
                 scanout = Some((w, h, hz));
             }
-            _ => bail!("a line of the disks list that is not one of swiotlb-mib, pool, store, block, fb, input, gpu, scanout, audio, wifi: {line:?}"),
+            _ => bail!("a line of the disks list that is not one of swiotlb-mib, pool, store, block, fb, input, gpu, scanout, audio, wifi, bridge: {line:?}"),
         }
     }
     let (store, store_gib) = store.context("no store line")?;
-    let d = Disks { swiotlb: swiotlb.context("no swiotlb-mib line")?, pool: pool.context("no pool line")?, store, store_gib, blocks, fb, input, gpu, scanout, audio, wifi };
+    let d = Disks { swiotlb: swiotlb.context("no swiotlb-mib line")?, pool: pool.context("no pool line")?, store, store_gib, blocks, fb, input, gpu, scanout, audio, wifi, bridge, bridge_haptics: true };
     if d.scanout.is_some() && (d.gpu.is_none() || d.fb.is_none()) {
         bail!("a scanout without the GPU or the screen: xnuloader-crosvm gives it with --gpu-scanout and --display");
     }
@@ -490,6 +497,17 @@ pub fn boot_script_with(l: &Label, seconds: u32, thp: bool, sha: &str, disks: Op
     } else {
         (String::new(), String::new())
     };
+    // the bridge channel (an Image of xnuloader-crosvm --bridge): bridgectl serve listens before crosvm starts, crosvm's
+    // second serial port connects to its socket (given only when the socket is there: crosvm does not start without it),
+    // and it ends when crosvm closes the port
+    let (serve_start, serve_serial, serve_end) = match disks {
+        Some(d) if d.bridge => (
+            BRIDGE_START.replace("{flags}", if d.bridge_haptics { "" } else { " --no-haptics" }),
+            "${bsock:+ --serial type=unix-stream,hardware=serial,num=2,path=$bsock,input-unix-stream}",
+            BRIDGE_END,
+        ),
+        _ => (String::new(), "", ""),
+    };
     let (mut touch_find, mut escape_start, mut escape_end) = (String::new(), String::new(), String::new());
     if disks.is_some_and(|d| d.input) {
         // The touchscreen by its name (and INPUT_PROP_DIRECT), never a side key's device (rule: the way back to One UI)
@@ -708,7 +726,7 @@ got=$(sha256sum kernel.img | cut -d' ' -f1)
 {share_check}
 tdev=
 tsock=
-{checks}rm -f serial.txt crosvm.log crosvm.sock fdt.dtb dmesg.txt display.txt touch.txt touch.sock stop.request screen.off wifi.txt wifi.mac
+{checks}rm -f serial.txt crosvm.log crosvm.sock fdt.dtb dmesg.txt display.txt touch.txt touch.sock stop.request screen.off wifi.txt wifi.mac bridge.txt bridge.sock
 {touch_find}
 ulimit -l unlimited 2>/dev/null || echo "ulimit -l unlimited: refused"
 # crosvm holds a file for every GPU buffer of the guest: at 32768 (the shell's) it ran out after 11 minutes of iOS (full2:
@@ -737,13 +755,13 @@ if [ {thp} = 1 ]; then
 fi
 grep -E '^(MemAvailable|SwapFree):' /proc/meminfo | tr -s ' ' | sed 's/^/before /'
 echo "start $(date +%s) up $(cut -d' ' -f1 /proc/uptime)"
-{takeover_stop}{gpu_floor}{cpu_floor}{wifi_start}pool=
+{takeover_stop}{gpu_floor}{cpu_floor}{wifi_start}{serve_start}pool=
 # crosvm logs at info: at debug its GPU renderer wrote a line per submission and fence (take8: 407 MB in 45 minutes,
 # whose copy at the end broke the adb link and left the session's other files empty)
 set -f
 {crosvm_env}$C --log-level info run --disable-sandbox --no-balloon --no-rng --no-usb --hypervisor gunyah \
   {protection} --hugepages --mem size={mem} --cpus num-cores={cpus}{affinity} \
-  --socket $D/crosvm.sock${{tsock:+ --input multi-touch[path=$tsock,width=4095,height=4095,name=oneios-touch]}} --serial type=file,hardware=serial,num=1,path=$D/serial.txt,console \
+  --socket $D/crosvm.sock${{tsock:+ --input multi-touch[path=$tsock,width=4095,height=4095,name=oneios-touch]}} --serial type=file,hardware=serial,num=1,path=$D/serial.txt,console{serve_serial} \
   --dump-device-tree-blob $D/fdt.dtb{blocks} $D/kernel.img </dev/null >$D/crosvm.log 2>&1 &
 pid=$!
 set +f
@@ -757,13 +775,42 @@ fi
 if kill -0 $pid 2>/dev/null; then how=kill; kill -9 $pid; fi
 wait $pid; rc=$?
 thp_restore
-{wifi_end}{gpu_restore}{cpu_restore}{caps_restore}{bridge_end}{escape_end}echo "end $(date +%s) up $(cut -d' ' -f1 /proc/uptime) how $how exit $rc"
+{wifi_end}{gpu_restore}{cpu_restore}{caps_restore}{bridge_end}{escape_end}{serve_end}echo "end $(date +%s) up $(cut -d' ' -f1 /proc/uptime) how $how exit $rc"
 dmesg 2>/dev/null | grep -i -E 'gunyah|folio|gh_|crosvm|scm|memextent' | tail -n 80 > $D/dmesg.txt
 if [ "$pool" = bad ]; then end "refused pool: end how $how exit $rc"; else end "end how $how exit $rc"; fi
 "#,
         thp = if thp { 1 } else { 0 }
     )
 }
+
+/// The bridge channel's start in boot.sh (an Image of xnuloader-crosvm --bridge): `bridgectl serve` listens on bridge.sock
+/// before crosvm starts, which connects its second serial port to it while it makes its devices (as the touch's forwarder
+/// and its socket). crosvm is given the port only when the socket is there: it does not start without it. bridgectl reads
+/// the phone's battery (read only) and drives the motor's force-feedback device; never a side key's device.
+pub const BRIDGE_START: &str = r#"# the bridge channel: the phone's battery to iOS, iOS's haptics to the motor (bridgectl serve, runtime/bridges)
+bsock=; bridged=
+if [ -x $D/bridgectl ]; then
+  rm -f $D/bridge.sock
+  $D/bridgectl serve $D/bridge.sock --wait 120{flags} </dev/null >>$D/bridge.txt 2>&1 &
+  bridged=$!
+  t=0; while [ $t -lt 50 ] && [ ! -S $D/bridge.sock ] && kill -0 $bridged 2>/dev/null; do sleep 0.1 2>/dev/null || sleep 1; t=$((t + 1)); done
+  if [ -S $D/bridge.sock ]; then
+    bsock=$D/bridge.sock; echo "bridge: bridgectl serve ($bridged) is the other end of crosvm's second serial port: $(grep '^serve: listening' $D/bridge.txt | tail -n 1 | sed 's/.*serial port: //'); bridge.txt"
+  else
+    echo "bridge: bridgectl serve did not start (bridge.txt): the VM runs without the battery and the haptics"; kill $bridged 2>/dev/null; bridged=
+  fi
+else
+  echo "bridge: off: no $D/bridgectl"
+fi
+"#;
+
+/// After the VM: bridgectl serve saw crosvm close the port and ended (its motor stopped); one still there 3 s on is ended.
+pub const BRIDGE_END: &str = r#"if [ -n "$bridged" ]; then
+  t=0; while [ $t -lt 3 ] && kill -0 $bridged 2>/dev/null; do sleep 1; t=$((t + 1)); done
+  kill $bridged 2>/dev/null; wait $bridged 2>/dev/null
+  echo "bridge: $(grep '^serve: ' $D/bridge.txt | tail -n 1)"
+fi
+"#;
 
 /// The tap wifictl makes for crosvm's network card.
 pub const WIFI_TAP: &str = "oneios0";
@@ -852,6 +899,10 @@ pub struct Options {
     pub audio_uid: Option<u32>,
     /// wifictl for the phone (runtime/bridges: make), pushed for an Image with the Wi-Fi in a takeover
     pub wifictl: String,
+    /// bridgectl for the phone (runtime/bridges: make), pushed for an Image with the bridge channel (xnuloader-crosvm --bridge)
+    pub bridgectl: String,
+    /// false (--no-haptics): the bridge channel serves the battery alone
+    pub haptics: bool,
 }
 
 /// `phone vm-boot --stop`: ask the running VM's script to stop it now (crosvm stop through its socket).
@@ -873,10 +924,16 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
         bail!("a VM of {} MiB needs --thp and gh_hugepage_reserve's pool (Gunyah's own memory ends near 0.5 GB of 4 KiB pages)", l.ram);
     }
     let list = format!("{image}.disks");
-    let disks = match fs::read_to_string(&list) {
+    let mut disks = match fs::read_to_string(&list) {
         Ok(text) => Some(parse_disks(&text).with_context(|| format!("{list}"))?),
         Err(_) => None,
     };
+    if let Some(d) = disks.as_mut() {
+        d.bridge_haptics = o.haptics;
+    }
+    if disks.as_ref().is_some_and(|d| d.bridge) && !Path::new(&o.bridgectl).is_file() {
+        bail!("the Image has the bridge channel and {} is not there: runtime/build.sh (or make -C runtime/bridges build/android/bridgectl), or name it with --bridgectl", o.bridgectl);
+    }
     if let Some(d) = &disks {
         // --gpu: drm2kgsl's host arena at the RAM's top, the pool below it
         let drm = d.gpu.as_ref().map(|g| g.drm_mib << 20).unwrap_or(0);
@@ -964,6 +1021,15 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
             println!("vm-boot: the screen ({}x{}) on a layer over One UI while the VM runs (touches still go to One UI under it)", f.width, f.height);
         }
     }
+    if disks.as_ref().is_some_and(|d| d.bridge) {
+        // the VM's own copy, root's, as displayctl and wifictl
+        adb.push(&o.bridgectl, &format!("{DIR}/bridgectl"))?;
+        adb.root_ok(&format!("cd {DIR} && chown root:root bridgectl && chmod 755 bridgectl\n"), "bridgectl's owner")?;
+        println!(
+            "vm-boot: the bridge channel: the phone's battery to iOS{} (bridgectl serve on crosvm's second serial port; bridge.txt)",
+            if o.haptics { " and iOS's haptics to the phone's motor" } else { ", no haptics (--no-haptics)" }
+        );
+    }
     fs::create_dir_all(out).with_context(|| format!("cannot make {out}"))?;
     let script = Path::new(out).join("boot.sh");
     if o.pin && o.pin_first + l.cpus > 8 {
@@ -1027,7 +1093,7 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
         }
     };
     println!();
-    for name in ["serial.txt", "crosvm.log", "dmesg.txt", "run.txt", "fdt.dtb", "display.txt", "touch.txt", "thermal.txt", "wifi.txt"] {
+    for name in ["serial.txt", "crosvm.log", "dmesg.txt", "run.txt", "fdt.dtb", "display.txt", "touch.txt", "thermal.txt", "wifi.txt", "bridge.txt"] {
         let path = Path::new(out).join(name);
         let mut child = adb.exec_out(&format!("su -c 'cat {DIR}/{name}'"))?;
         let mut file = fs::File::create(&path)?;
@@ -1037,7 +1103,7 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
     let run = fs::read_to_string(Path::new(out).join("run.txt")).unwrap_or_default();
     for line in run.lines().filter(|l| {
         l.starts_with("disk") || l.starts_with("store:") || l.starts_with("pool:") || l.starts_with("/data:") || l.starts_with("display:")
-            || l.starts_with("touch:")
+            || l.starts_with("touch:") || l.starts_with("bridge:")
     }) {
         println!("vm-boot: {line}");
     }
@@ -1211,6 +1277,49 @@ mod tests {
         let plain = boot_script_with(&l, 3600, true, "ab12", Some(&d), false, true, &Tuning::DEFAULT);
         assert!(!plain.contains("wifictl") && !plain.contains("--net "));
         assert!(parse_disks(&format!("{SCREEN}wifi on\n")).is_err());
+    }
+
+    #[test]
+    fn an_image_with_the_bridge_gets_bridgectl_serve_on_crosvms_second_serial_port() {
+        let d = parse_disks(&format!("{SCREEN}input touch\ngpu 00:0c.0 8 0x15f800000\nscanout 720 1560 120\naudio\nwifi\nbridge\n")).unwrap();
+        assert!(d.bridge && d.bridge_haptics);
+        let l = Label { ram: 2560, cpus: 6, swiotlb: 32, shared: true, gpu: true };
+        let s = boot_script_with(&l, 3600, true, "ab12", Some(&d), false, true, &Tuning { takeover: true, ..Tuning::DEFAULT });
+        // it listens before crosvm starts, which is given the port only when the socket is there
+        let start = s.find("$D/bridgectl serve $D/bridge.sock --wait 120 </dev/null >>$D/bridge.txt 2>&1 &").unwrap();
+        assert!(start < s.find("$C --log-level info run").unwrap());
+        assert!(s.contains("[ ! -S $D/bridge.sock ] && kill -0 $bridged"));
+        assert!(s.contains(
+            "--serial type=file,hardware=serial,num=1,path=$D/serial.txt,console${bsock:+ --serial type=unix-stream,hardware=serial,num=2,path=$bsock,input-unix-stream} \\\n"
+        ));
+        // an old socket and log do not outlive the start; the tool is ended after crosvm and its last line shown
+        assert!(s.contains("wifi.txt wifi.mac bridge.txt bridge.sock\n"));
+        let end = s.find("kill $bridged 2>/dev/null; wait $bridged 2>/dev/null").unwrap();
+        assert!(end > s.find("wait $pid; rc=$?").unwrap() && end < s.find("echo \"end $(date +%s)").unwrap());
+        // the battery alone
+        let mut quiet = parse_disks(&format!("{SCREEN}input touch\ngpu 00:0c.0 8 0x15f800000\nscanout 720 1560 120\nbridge\n")).unwrap();
+        quiet.bridge_haptics = false;
+        let s = boot_script_with(&l, 3600, true, "ab12", Some(&quiet), false, true, &Tuning::DEFAULT);
+        assert!(s.contains("$D/bridgectl serve $D/bridge.sock --wait 120 --no-haptics </dev/null"));
+        // an Image without it: no tool, no second port
+        let none = parse_disks(&format!("{SCREEN}input touch\n")).unwrap();
+        let s = boot_script_with(&l, 3600, true, "ab12", Some(&none), false, true, &Tuning::DEFAULT);
+        assert!(!none.bridge && !s.contains("bridgectl") && !s.contains("num=2") && !s.contains("bsock"));
+        assert!(parse_disks(&format!("{SCREEN}bridge 1\n")).is_err());
+        // and it parses as POSIX sh
+        let s = boot_script_with(&l, 3600, true, "ab12", Some(&d), false, true, &Tuning { takeover: true, ..Tuning::DEFAULT });
+        let path = std::env::temp_dir().join(format!("oneios-vmboot-bridge-{}.sh", std::process::id()));
+        fs::write(&path, &s).unwrap();
+        for shell in ["bash", "sh", "dash"] {
+            let mut c = std::process::Command::new(shell);
+            if shell == "bash" {
+                c.arg("--posix");
+            }
+            if let Ok(o) = c.arg("-n").arg(&path).output() {
+                assert!(o.status.success(), "{shell} -n: {}", String::from_utf8_lossy(&o.stderr));
+            }
+        }
+        fs::remove_file(&path).ok();
     }
 
     #[test]

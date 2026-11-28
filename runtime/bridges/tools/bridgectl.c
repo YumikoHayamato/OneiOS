@@ -9,6 +9,11 @@
 //   bridgectl haptic-hal-heavy-click      ACTIVE one-shot IVibrator.perform(HEAVY_CLICK, STRONG); explicit opt-in required
 //   bridgectl haptic [MS [INTENSITY [HZ]]]   one vibration (default 200 ms, 1000, resonance)
 //   bridgectl haptic-pattern         three taps and a ramp: what an iOS pattern feels like
+//   bridgectl serve /SOCKET [--wait S] [--no-haptics] [--no-battery]
+//                                    the bridge channel of a VM of crosvm (the native path): listens on the Unix socket
+//                                    crosvm's second serial port connects to (vm-boot) and serves the kernel's bridge
+//                                    driver there: the phone's battery to iOS, iOS's haptics to the phone's motor;
+//                                    until crosvm closes it, SIGTERM, or S seconds (120) without a connection
 // The backend: ONEIOS_HW_BACKEND, ONEIOS_HW_BACKEND_<BRIDGE>, ONEIOS_HW_FALLBACK (bridges/hw_backend.h): haptic's is
 // the evdev device (samsung) or the vibrator HAL (treble). Off the phone: ONEIOS_INPUT_DIR, ONEIOS_BINDER.
 //   bridgectl bt                     opens the Bluetooth HAL, sends HCI Reset and Read BD_ADDR, prints the events
@@ -24,8 +29,14 @@
 #define _GNU_SOURCE
 #include "bridges/bridges.h"
 #include "bridges/hw_backend.h"
+#include "bridges/stream.h"
 #include "../hal/hal.h"
 #include <math.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -593,6 +604,86 @@ static int audio_loop(int argc, char **argv)
 }
 
 // The bridges' own lines (why a HAL was not found, the HAL's state), as xnuhost logs them.
+// ---- serve: the bridge channel for a VM of crosvm (the native path; docs/native.md "The bridge in the crosvm VM") ----
+// The kernel's bridge driver reaches the phone through crosvm's second serial port, which crosvm connects to this
+// socket when it makes its devices: so this listens before crosvm starts (vm-boot's script waits for the socket) and
+// serves one connection: the phone's battery to iOS (read only: /sys/class/power_supply, or the health HAL), iOS's
+// haptics to the phone's motor. It ends when crosvm closes the socket (the VM ended), at SIGTERM or SIGINT, or when
+// nothing connected in --wait seconds; the motor is stopped at the end. Never a side key's device: the haptic
+// backend opens the force-feedback device only.
+static volatile int serve_stop;
+static void serve_signal(int sig) { (void)sig; serve_stop = 1; }
+
+static int serve(int argc, char **argv)
+{
+  const char *path = argc > 2 ? argv[2] : NULL;
+  double wait_s = 120;
+  bool haptics = true, battery = true;
+  for (int i = 3; i < argc; i++) {
+    if (!strcmp(argv[i], "--no-haptics")) haptics = false;
+    else if (!strcmp(argv[i], "--no-battery")) battery = false;
+    else if (!strcmp(argv[i], "--wait") && i + 1 < argc) wait_s = atof(argv[++i]);
+    else path = NULL;
+  }
+  struct sockaddr_un addr = { .sun_family = AF_UNIX };
+  if (!path || *path != '/' || strlen(path) >= sizeof addr.sun_path || wait_s <= 0 || wait_s > 3600) {
+    fprintf(stderr, "usage: bridgectl serve /SOCKET [--wait SECONDS] [--no-haptics] [--no-battery]\n");
+    return 2;
+  }
+  strcpy(addr.sun_path, path);
+  struct sigaction act = { .sa_handler = serve_signal };           // no SA_RESTART: poll() ends at the signal
+  sigaction(SIGTERM, &act, NULL);
+  sigaction(SIGINT, &act, NULL);
+  signal(SIGPIPE, SIG_IGN);
+  br_stream_config config = { 0 };
+  if (battery) {
+    // ONEIOS_BATTERY_DIR: the options (as batteryctl); otherwise the phone's paths and variables
+    br_battery_options o = { .dir = getenv("ONEIOS_BATTERY_DIR"), .supplies = getenv("ONEIOS_BATTERY_SUPPLIES") };
+    config.battery = br_battery_open(o.dir ? &o : NULL);
+  }
+  if (haptics) config.haptic = br_haptic_open_as(getenv("ONEIOS_INPUT_DIR"), BR_HW_UNSET, NULL);
+  unlink(path);
+  int server = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (server < 0 || bind(server, (struct sockaddr *)&addr, sizeof addr) || chmod(path, 0600) || listen(server, 1)) {
+    printf("serve: %s: %s\n", path, strerror(errno));
+    if (server >= 0) close(server);
+    if (config.haptic) br_haptic_close(config.haptic);
+    if (config.battery) br_battery_close(config.battery);
+    return 1;
+  }
+  printf("serve: listening on %s for crosvm's second serial port: battery %s, haptics %s\n", path,
+         config.battery ? "served" : battery ? "not served (no battery to read)" : "off (--no-battery)",
+         config.haptic ? "served" : haptics ? "not served (no actuator opened)" : "off (--no-haptics)");
+  int client = -1;
+  struct timespec t0, now;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  while (client < 0 && !serve_stop) {
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if ((double)(now.tv_sec - t0.tv_sec) + (double)(now.tv_nsec - t0.tv_nsec) / 1e9 >= wait_s) break;
+    struct pollfd listening = { server, POLLIN, 0 };
+    if (poll(&listening, 1, 200) > 0) client = accept4(server, NULL, NULL, SOCK_CLOEXEC);
+  }
+  close(server);
+  unlink(path);
+  int rc = 1;
+  if (client < 0) {
+    printf("serve: %s: the VM has no bridge\n", serve_stop ? "stopped before crosvm connected" : "crosvm did not connect in time");
+  } else {
+    printf("serve: crosvm connected: the VM's bridge channel is served here\n");
+    br_stream_stats st;
+    rc = br_stream_serve(client, &config, &serve_stop, &st) ? 1 : 0;
+    close(client);
+    printf("serve: %s: %llu messages from the guest (%llu hello, %llu haptic, %llu battery queries, %llu on channels not served; %llu bad "
+           "frames), %llu battery states to it; %llu bytes in, %llu out\n",
+           rc ? "the stream failed" : serve_stop ? "stopped" : "crosvm closed the port (the VM ended)", (unsigned long long)st.frames_in,
+           (unsigned long long)st.hellos, (unsigned long long)st.haptic, (unsigned long long)st.battery_queries, (unsigned long long)st.unknown,
+           (unsigned long long)st.frames_bad, (unsigned long long)st.battery_states, (unsigned long long)st.bytes_in, (unsigned long long)st.bytes_out);
+  }
+  if (config.haptic) br_haptic_close(config.haptic);                // its counter line; the motor stopped
+  if (config.battery) br_battery_close(config.battery);
+  return rc;
+}
+
 static void say(int level, const char *line) { printf("  %s%s\n", level == 0 ? "error: " : "", line); }
 
 int main(int argc, char **argv)
@@ -605,7 +696,7 @@ int main(int argc, char **argv)
   br_hw_settings_init(&hw);
   if (br_hw_settings_env(&hw, &bad)) { fprintf(stderr, "bridgectl: bad %s (samsung or treble; ONEIOS_HW_FALLBACK 0 or 1)\n", bad); return 2; }
   br_hw_configure(&hw);
-  if (argc < 2) { fprintf(stderr, "usage: bridgectl cpu|haptic-inspect|haptic-hal-inspect|haptic-hal-primitives|haptic-native-inspect|haptic-hal-click|haptic-hal-heavy-click|haptic|haptic-pattern|bt|net|audio|audio-loop ... (see tools/bridgectl.c)\n"); return 2; }
+  if (argc < 2) { fprintf(stderr, "usage: bridgectl cpu|haptic-inspect|haptic-hal-inspect|haptic-hal-primitives|haptic-native-inspect|haptic-hal-click|haptic-hal-heavy-click|haptic|haptic-pattern|serve|bt|net|audio|audio-loop ... (see tools/bridgectl.c)\n"); return 2; }
   if (!strcmp(argv[1], "cpu")) rc = cpu(argc, argv);
   else if (!strcmp(argv[1], "haptic-inspect")) rc = haptic_inspect();
   else if (!strcmp(argv[1], "haptic-hal-inspect")) rc = haptic_hal_inspect();
@@ -615,6 +706,7 @@ int main(int argc, char **argv)
   else if (!strcmp(argv[1], "haptic-hal-heavy-click")) rc = haptic_hal_preset(argc, true);
   else if (!strcmp(argv[1], "haptic")) rc = haptic(argc, argv, false);
   else if (!strcmp(argv[1], "haptic-pattern")) rc = haptic(argc, argv, true);
+  else if (!strcmp(argv[1], "serve")) rc = serve(argc, argv);
   else if (!strcmp(argv[1], "bt")) rc = bt();
   else if (!strcmp(argv[1], "net")) rc = net();
   else if (!strcmp(argv[1], "audio") && argc > 2) rc = audio(argc, argv);

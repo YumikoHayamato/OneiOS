@@ -416,6 +416,28 @@ static void test_machine(void)
   }
   machine_default(&m); m.dev[4] = (xl_device){ XL_DEV_BRIDGE, 0x10000 + (7 << 11), 0x100, true };   // the bridge: not on PCI
   CHECK(xl_machine_tree(&m, &err) == NULL);
+  // the bridge on a serial port (xnuloader-crosvm --bridge): crosvm's second ns16550a, its reg absolute as the console's
+  machine_default(&m);
+  m.uart_base = 0x3f8; m.uart_size = 8; m.uart_ns16550 = true;
+  m.bridge_uart_base = 0x2f8; m.bridge_uart_size = 8;
+  pt = xl_machine_tree(&m, &err);
+  CHECK(pt != NULL);
+  if (pt) {
+    const xl_adt_node *bridge = xl_adt_find(pt, "arm-io/bridge");
+    p = bridge ? xl_adt_get(bridge, "compatible") : NULL;
+    CHECK(p && p->length == 19 && !memcmp(p->value, "oneios,bridge-uart", 19));
+    p = bridge ? xl_adt_get(bridge, "reg") : NULL;
+    if (p && p->length == 16) memcpy(r, p->value, 16);
+    CHECK(p && p->length == 16 && r[0] == 0x2f8 && r[1] == 8);
+    CHECK(bridge && !xl_adt_get(bridge, "droidvm,intid"));
+    xl_adt_free(pt);
+  }
+  m.bridge_uart_base = 0x3f8;                                            // the console's own port: refused
+  CHECK(xl_machine_tree(&m, &err) == NULL);
+  machine_default(&m);                                                   // and never beside the virtio bridge
+  m.dev[4] = (xl_device){ XL_DEV_BRIDGE, 0x10000 + (7 << 11), 0x100, false };
+  m.bridge_uart_base = 0x2f8; m.bridge_uart_size = 8;
+  CHECK(xl_machine_tree(&m, &err) == NULL);
 }
 
 static void test_sidecars(void)

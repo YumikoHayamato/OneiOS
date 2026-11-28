@@ -1254,6 +1254,27 @@ ASSOC_DONE: wifid never learned of the join and Settings stayed at "connecting".
 (`m_getcl`); every other event keeps the limit. It is UniXNU-sheng's `sheng-wifi-association-event.patch`, under
 `#if XNU_HOSTED`. Built (`HOSTED_OUT=radio`); not yet run.
 
+## 0083-native-wifi-association-event.patch (native-vm-bridges, 2026-11-25)
+
+0049 for the native kernel. The native kernel's Wi-Fi is the same archive (`net/`, `NET_TRANSPORT_PCI`) and posts the
+same 540-byte association event as a kernel event, but 0049's room for it was under `#if XNU_HOSTED`, which the native
+build does not define (`CONFIG_XNU_ONEIOS_NATIVE`, `-DXNU_ONEIOS_NATIVE=1`): there the limit stayed one mbuf (`MLEN`,
+288 bytes). On the S25 (take10 and take12, `logs/pa3q-vmboot/`): `ONEIOS WIFI: event 9 for en0, 540 bytes -> 40`
+(EMSGSIZE) at each join. The supplicant had joined and the link's own events (2, 3 and 4) went through, so the network
+worked; wifid, which waits for event 9, ended the join with a timeout 30 s later (iOS's log of take12:
+`{ASSOC-} Failed to join(-3905 ...)`, `END REQ [ASSOC] took 30.138668229s (... proc=Preferences ...) err=-3905`), and a
+join that failed is not saved: `WiFiManagerFlushKnownNetworksCache: Successfully flushed 0 known networks`, and at the
+next session's start `Fetched 0 known networks from the plist` and `WiFiSecurityCopyPassword ... -25300`. The owner
+had to type the password in every session. The patch makes the `#if` of 0049 `XNU_HOSTED || XNU_ONEIOS_NATIVE` (as
+0076 does for the OS layer); the hosted kernel compiles as before.
+
+Tested on the PC: the patched `bsd/kern/kern_event.c` (the native tree's source after the series, with the patch)
+compiled with the native kernel's own recorded command (`oneios-tool kernel compile-command` on its
+`kern_event.o.json`). The object of the kernel that ran take12 has one limit, `mov w10, #0x120`; the new one chooses:
+`cmp w8, #0x1` (KEV_VENDOR_APPLE), `cmp w8, #0x6` (KEV_IEEE80211_CLASS), `mov w8, #0x800`, `csel`. Not built into a
+kernel and not run. On the phone: `ONEIOS WIFI: event 9 for en0, 540 bytes -> 0`, Settings shows the network joined at
+once, and the next session joins it without a touch (`wifi: join:` in `wifi.txt` with nothing typed).
+
 ## net/: the Wi-Fi, en0 on the phone's radio (radio, radio2, 2026-11-12)
 
 No numbered patch: an archive (`oneios-tool kernel gen net`, hooked into `kernel/build-hosted.sh` like `hid/`) whose

@@ -1,0 +1,29 @@
+OneiOS take18, userland/metal/patches/NativeMetal/0012: the IOSurface read-only texture alignment is the written one (16).
+Upstream: Droid-VM/NativeMetal c35508d (wip/hackintosh, lateautumn233, 2026-11-15), verbatim.
+What: the device answers iosurfaceReadOnlyTextureAlignmentBytes: with Metal's iosurfaceTextureAlignmentBytes: (16 on the
+iPad and, by the same framework, here) instead of the linear alignment of RGBA16Float (128 on Turnip).
+Why: correctness. Core Animation refuses a texture over any surface whose rows miss that alignment ("Row bytes (320) not
+128 aligned"): WebKit's 64-byte-aligned BGRA8 layers drew nothing. Such rows take the runtime's shadow path (64-byte
+linear pitch), which reads back exact (upstream's check on the device).
+Switch: none (correctness fix). Removable: yes (ONEIOS_METAL_SKIP=iosurface-read-only-alignment).
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 476f249..75c22af 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -4706,10 +4706,12 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
+ - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format {
+  return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),format);
+ }
+-// SPI: the row alignment a read-only texture over an IOSurface needs. Answered unasked it was 0 (a divisor for its callers); the linear
+-// texture alignment of the widest common format is the same rule this GPU applies to any linear image.
++// SPI: the row alignment a read-only texture over an IOSurface needs. Answered unasked it was 0 (a divisor for its callers); a plane
++// read only is placed by the same rule as a written one (iosurfaceTextureAlignmentBytes, 16 as on Apple's GPUs). Not the linear
++// alignment of RGBA16Float (128): Core Animation refuses a texture over any surface whose rows miss it ("Row bytes (320) not 128
++// aligned"), and WebKit's 64-byte BGRA8 layers then draw nothing.
+ - (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {
+- return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),MTLPixelFormatRGBA16Float);
++ return ((NSUInteger (*)(id,SEL))objc_msgSend)(self,sel_registerName("iosurfaceTextureAlignmentBytes"));
+ }
+ - (uint64_t)registryID {return gRegistryID;}
+ - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}

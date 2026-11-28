@@ -228,7 +228,7 @@ the boot video): the bench of the crosvm VM's disks.
 
 `tools/xnuloader-crosvm.c` is that loader for a VM of Android's crosvm under the phone's Gunyah (`docs/native.md`, "The
 native kernel in crosvm"): `xnuloader-crosvm KERNEL OUT [--cpus N] [--ram-mib N] [--timebase HZ] [--args TEXT]
-[--args-add TEXT] [--swiotlb MIB] [--image DIR [--phone-image DIR] [--phone-data FILE]]` writes one arm64 Linux Image
+[--args-add TEXT] [--swiotlb MIB] [--image DIR [--phone-image DIR] [--phone-data FILE]] [--bridge]` writes one arm64 Linux Image
 (crosvm loads it at the RAM's start, `0x80000000`, and enters it with the MMU off): the Linux header, xnuloader-qemu's
 stub at `0x40`, the label `oneios-crosvm ram-mib=N cpus=N swiotlb-mib=N` at `0x100` (`oneios-tool phone vm-boot` starts
 crosvm with it), and the window at RAM + 32 MiB + the kernel base modulo 32 MiB, ending the pool's MiB + 8 MiB before
@@ -242,6 +242,13 @@ the pool: in a protected VM crosvm reads and writes no other guest memory); the 
 (`--phone-image`, default the staged set `/data/local/tmp/oneios/image`; `--phone-data`, default the VM's own store
 `/data/local/tmp/oneios-vmboot/data.img`). `OUT.adt` is the tree it gave the kernel; `OUT.disks` lists the pool's
 address, the store and crosvm's `--block` values for vm-boot. No display yet.
+
+`--bridge` (2026-11-25): the bridge channel of `drivers/bridge` for that VM, which has no "oneios,bridge" virtio device
+of xnuhost's: `/arm-io/bridge` with `compatible` `oneios,bridge-uart` and, as the console's node, an absolute `reg`,
+crosvm's second ns16550a at `0x2f8` (`xl_machine.bridge_uart_base`/`_size`; refused beside a virtio bridge or on the
+console's own port). The kernel's bridge driver writes its messages there as frames and the phone's end is `bridgectl
+serve` (`docs/native.md`, "The bridge, the remembered Wi-Fi network and the power key in the crosvm VM"). `OUT.disks`
+then has a line `bridge`, by which vm-boot starts that tool and gives crosvm the port as a socket.
 
 ### 2.2 Memory
 

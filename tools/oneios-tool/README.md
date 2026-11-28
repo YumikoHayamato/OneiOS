@@ -1641,6 +1641,18 @@ DIR (`phone-vmboot`), prints the run's disk, store and pool lines and crosvm's l
   bridge (it ends when crosvm's process is gone), asks it to end after 3 s and ends it after 8 s; the VM check also
   refuses while a `displayctl pool` runs. The live console: the poll's status no longer comes from its last command
   (`cat result`, missing while the VM runs: boot 3 printed the console only at the end).
+- The bridge channel (2026-11-25): an Image made with `xnuloader-crosvm --bridge` lists `bridge` (the kernel's bridge
+  driver on crosvm's second serial port; `docs/native.md`, "The bridge, the remembered Wi-Fi network and the power key in
+  the crosvm VM"). vm-boot then pushes `bridgectl` (`--bridgectl FILE`, default `runtime/bridges/build/android/bridgectl`:
+  `make -C runtime/bridges`; refused when the file is not there) into the VM's folder as root's, and the script starts
+  `bridgectl serve $D/bridge.sock --wait 120` before crosvm (after the Wi-Fi's tap), waits up to 5 s for the socket and
+  gives crosvm `--serial type=unix-stream,hardware=serial,num=2,path=$D/bridge.sock,input-unix-stream` only when the
+  socket is there (crosvm does not start with a socket it cannot connect to; without it the VM runs as before, with no
+  battery and no haptics). The tool reads the phone's battery (read only) and drives the motor's force-feedback device,
+  never a side key's device; it ends when crosvm closes the port, and the script ends it 3 s after the VM otherwise.
+  `--no-haptics`: the battery alone (`bridgectl serve --no-haptics`). Its log is `bridge.txt` (copied into DIR); the
+  run's `bridge:` lines are printed with the others. Tested (`cargo test -p oneios-phone`:
+  `an_image_with_the_bridge_gets_bridgectl_serve_on_crosvms_second_serial_port`); not run on the phone.
 - The touch: such an Image also lists `input touch` (the kernel's input bus, `/arm-io/input-pci`; refused without the
   `fb` line). The script then looks the phone's touchscreen up in `/proc/bus/input/devices` by its exact name
   (`sec_touchscreen`, with `B: PROP=2`, INPUT_PROP_DIRECT) and refuses it should its `eventN` be one of the side keys'

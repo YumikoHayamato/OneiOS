@@ -15,6 +15,8 @@ CFLAGS ?= -O2 -g
 WIFI := wifi/frames wifi/station wifi/wlan wifi/sim wifi/aidl_parcel wifi/aidl_binder wifi/supplicant
 CORE := cpu/topology hw/hw_backend hw/hw_log hal/hal haptics/haptic net/net bt/hci bt/hci_sim bt/hidl_parcel bt/hci_hidl audio/backend brightness/brightness battery/battery thermal/thermal $(WIFI)
 DEVICES := devices/bridge_dev devices/virtio_net devices/virtio_snd
+# The bridge channel on a byte stream (bridgectl serve: the native path's VM of crosvm, which has no xnuhost)
+STREAM := devices/bridge_stream
 HDR := $(wildcard include/bridges/*.h hal/*.h bt/*.h audio/*.h brightness/*.h battery/*.h thermal/*.h wifi/*.h ../../drivers/bridge/*.h ../../drivers/net/*.h ../../drivers/haptics/*.h $(XNUHOST)/src/xnuhost.h)
 A := build/android
 H := build/host
@@ -37,12 +39,12 @@ $(A)/libonebridges.a: $(CORE:%=$(A)/%.o) $(DEVICES:%=$(A)/%.o)
 $(A)/oneios-audio: audio/aaudio_helper.c audio/audio_proto.h
 	@mkdir -p $(A)
 	$(ANDROID_CC) -std=gnu11 $(CFLAGS) $(WARN) -Iaudio audio/aaudio_helper.c -laaudio -o $@
-$(A)/bridgectl: tools/bridgectl.c $(CORE:%=$(A)/%.o)
-	$(ANDROID_CC) -std=gnu11 $(CFLAGS) $(WARN) $(INC) -static tools/bridgectl.c $(CORE:%=$(A)/%.o) -lm -o $@
+$(A)/bridgectl: tools/bridgectl.c $(CORE:%=$(A)/%.o) $(STREAM:%=$(A)/%.o)
+	$(ANDROID_CC) -std=gnu11 $(CFLAGS) $(WARN) $(INC) -static tools/bridgectl.c $(CORE:%=$(A)/%.o) $(STREAM:%=$(A)/%.o) -lm -o $@
 # bridgectl on the build host, for the stand-in phone (tools/oneios-tool/tests/phone/hw-backend.sh: haptic).
-$(H)/bridgectl: tools/bridgectl.c $(CORE:%=%.c) $(HDR)
+$(H)/bridgectl: tools/bridgectl.c $(CORE:%=%.c) $(STREAM:%=%.c) $(HDR)
 	@mkdir -p $(H)
-	$(CC) -std=gnu11 -O1 -g $(WARN) $(INC) -fsanitize=address,undefined tools/bridgectl.c $(CORE:%=%.c) -lpthread -lm -o $@
+	$(CC) -std=gnu11 -O1 -g $(WARN) $(INC) -fsanitize=address,undefined tools/bridgectl.c $(CORE:%=%.c) $(STREAM:%=%.c) -lpthread -lm -o $@
 # wifictl: the Wi-Fi bridge without xnuhost (status and scan read only; join takes wlan0 as a session does).
 $(A)/wifictl: tools/wifictl.c $(CORE:%=$(A)/%.o) devices/virtio_net.c
 	$(ANDROID_CC) -std=gnu11 $(CFLAGS) $(WARN) $(INC) -static tools/wifictl.c $(CORE:%=$(A)/%.o) -lm -o $@
@@ -50,6 +52,12 @@ $(A)/wifictl: tools/wifictl.c $(CORE:%=$(A)/%.o) devices/virtio_net.c
 $(H)/test_bridges: tests/test_bridges.c $(CORE:%=%.c) $(DEVICES:%=%.c) $(XNUHOST)/src/virtio.c $(HDR)
 	@mkdir -p $(H)
 	$(CC) -std=gnu11 -O1 -g $(WARN) $(INC) -fsanitize=address,undefined tests/test_bridges.c $(CORE:%=%.c) $(DEVICES:%=%.c) $(XNUHOST)/src/virtio.c -lpthread -o $@
+
+# The bridge channel on a byte stream: the frames both ends share (drivers/bridge/oneios_bridge_stream.h) and the phone's
+# end (devices/bridge_stream.c) against a guest on a socket pair, with a counted motor and a made-up battery.
+$(H)/test_stream: tests/test_stream.c $(CORE:%=%.c) $(STREAM:%=%.c) $(HDR)
+	@mkdir -p $(H)
+	$(CC) -std=gnu11 -O1 -g $(WARN) $(INC) -fsanitize=address,undefined tests/test_stream.c $(CORE:%=%.c) $(STREAM:%=%.c) -lpthread -lm -o $@
 
 # The backend layer (hw/): the settings, the choice, its log lines.
 $(H)/test_hw_backend: hw/test_hw_backend.c hw/hw_backend.c hw/hw_log.c cpu/topology.c $(HDR)
@@ -93,8 +101,9 @@ test-binder: $(H)/test_hidl_binder $(H)/test_aidl_binder $(H)/test_hal_binder
 	mkdir -p $(H)/binderfs; \
 	unshare -Urm sh -c 'mount -t binder binder "$$1" && ASAN_OPTIONS=detect_leaks=0 ONEIOS_HWBINDER="$$1/hwbinder" "$$2" && ASAN_OPTIONS=detect_leaks=0 ONEIOS_BINDER="$$1/binder" "$$3" && ASAN_OPTIONS=detect_leaks=0 ONEIOS_BINDER="$$1/binder" "$$4"' sh $(H)/binderfs $(H)/test_hidl_binder $(H)/test_aidl_binder $(H)/test_hal_binder
 
-test: $(H)/test_bridges $(H)/test_wifi $(H)/test_audio_helper $(H)/test_hw_backend test-binder
+test: $(H)/test_bridges $(H)/test_stream $(H)/bridgectl $(H)/test_wifi $(H)/test_audio_helper $(H)/test_hw_backend test-binder
 	$(H)/test_hw_backend
+	ASAN_OPTIONS=detect_leaks=0 $(H)/test_stream $(H)/bridgectl   # with the tool: `bridgectl serve` reached as crosvm reaches it
 	ASAN_OPTIONS=detect_leaks=0 $(H)/test_bridges   # the devices live as long as xnuhost: the transport has no destroy
 	$(H)/test_wifi
 	$(MAKE) -C brightness test

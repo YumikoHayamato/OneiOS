@@ -10,6 +10,13 @@
 // DroidVMDmaRegion.h, BSD-2-Clause-Patent). Changes: two message queues instead of ethernet frames, a
 // hello exchange, per-channel handlers.
 //
+// The second transport (the native path's VM of crosvm, which has no such device and no xnuhost): the same
+// messages as frames on a serial port (oneios_bridge_stream.h), the node /arm-io/bridge then compatible
+// "oneios,bridge-uart" with the absolute address of an ns16550 in "reg" (crosvm's second port, 0x2f8; the console
+// is its first, kernel patch 0077). Polled as the console is, never by interrupt: the worker reads what the port
+// holds every 10 ms while messages come and every 250 ms when they do not. The phone's end is `bridgectl serve`
+// (runtime/bridges/devices/bridge_stream.c) on the Unix socket crosvm gives the port. docs/native.md.
+//
 // oneios-bridge=0 leaves the device alone.
 #include <stdint.h>
 #include <stdbool.h>
@@ -24,9 +31,11 @@
 #include <pexpert/device_tree.h>
 #include <vm/vm_kern_xnu.h>
 #include "oneios_bridge.h"
+#include "oneios_bridge_stream.h"
 
 extern void IOSleep(unsigned milliseconds);
 extern void delay(int usec);
+extern kern_return_t thread_terminate(thread_t);
 void oneios_power_request(void);     // the graceful-shutdown hook (defined weak below; a guest helper overrides it)
 extern uint64_t kvtophys(vm_offset_t va);
 // ArmCpu (the GIC): a handler for one SPI, run in the primary interrupt context before the EOI; 0 when attached.
@@ -36,6 +45,10 @@ enum {
     OB_SLOTS = 16,                  // messages in flight per direction
     OB_POLL_MS = 10,
     OB_GUARD_MS = 100,              // with the interrupt, the worker looks anyway after this long
+    OBU_IDLE_MS = 250,              // the serial transport with nothing coming: how often its port is read
+    OBU_BUSY_MS = 2000,             // ... and for how long after a message it is read every OB_POLL_MS
+    OBU_HELLO_MS = 500,             // the hello again this long after one that got no answer
+    OBU_HELLO_TRIES = 20,
     VIRTQ_DESC_F_WRITE = 2, VIRTQ_AVAIL_F_NO_INTERRUPT = 1,
 };
 struct ob_desc { uint64_t address; uint32_t length; uint16_t flags, next; };
@@ -54,6 +67,16 @@ static struct {
     volatile uint32_t features;     // optional extended HELLO; zero on old hosts
     struct { oneios_bridge_handler fn; void *context; } listener[OB_CH_COUNT];
 } ob;
+
+// The serial transport's port and its reader. frame is one message on its way out, under ob_tx_lock.
+static struct {
+    uintptr_t registers;            // 0: the transport is the virtio device
+    struct obs_parser rx;
+    uint8_t frame[OBS_MAX_FRAME];
+    volatile uint64_t active_until; // mach_absolute_time() up to which the worker reads every OB_POLL_MS
+    uint64_t rx_bytes, tx_bytes, tx_stuck;
+} obu;
+enum { NS16550_RBR_THR = 0, NS16550_IER = 1, NS16550_FCR = 2, NS16550_LCR = 3, NS16550_MCR = 4, NS16550_LSR = 5, NS16550_LSR_DR = 0x01, NS16550_LSR_THRE = 0x20 };
 
 static LCK_GRP_DECLARE(ob_group, "oneios_bridge");
 static LCK_MTX_DECLARE(ob_tx_lock, &ob_group);
@@ -78,6 +101,39 @@ static void ob_write64(unsigned offset, uint64_t value) {
 }
 static inline void ob_barrier(void) { __asm__ volatile("dmb osh" ::: "memory"); }
 static uint64_t ob_pa(const void *p) { return ob.region_pa + ((vm_offset_t)p - ob.region); }
+
+// The ns16550's registers are a byte each; a trapped access must be a single load or store with a plain base register.
+static uint8_t obu_read8(unsigned reg) {
+    uint32_t value;
+    __asm__ volatile("ldrb %w0, [%1]" : "=r"(value) : "r"(obu.registers + reg) : "memory");
+    return (uint8_t)value;
+}
+static void obu_write8(unsigned reg, uint8_t value) {
+    __asm__ volatile("strb %w0, [%1]\n\tdsb oshst" :: "r"((uint32_t)value), "r"(obu.registers + reg) : "memory");
+}
+static void obu_active(void) {
+    uint64_t span;
+    nanoseconds_to_absolutetime((uint64_t)OBU_BUSY_MS * NSEC_PER_MSEC, &span);
+    obu.active_until = mach_absolute_time() + span;
+}
+
+// One message out of the port, a byte at a time (crosvm takes each at once: its port has no line to wait for; a port
+// that does not take a byte within 2 ms loses the message). Called with ob_tx_lock held.
+static int obu_send(uint16_t channel, uint16_t type, const void *payload, uint32_t length) {
+    const size_t size = obs_encode(obu.frame, channel, type, payload, length);
+    if (!size) return -1;
+    for (size_t i = 0; i < size; i++) {
+        unsigned waited = 0;
+        while (!(obu_read8(NS16550_LSR) & NS16550_LSR_THRE)) {
+            if (++waited > 200) { obu.tx_stuck++; return -1; }
+            delay(10);
+        }
+        obu_write8(NS16550_RBR_THR, obu.frame[i]);
+    }
+    obu.tx_bytes += size;
+    obu_active();
+    return 0;
+}
 
 static bool ob_buffers(void) {
     const uint64_t size = 2 * 4096 + 2 * (uint64_t)OB_SLOTS * OB_MAX_MESSAGE;
@@ -151,6 +207,13 @@ static const char *ob_bring_up(void) {
 
 int oneios_bridge_send(uint16_t channel, uint16_t type, const void *payload, uint32_t length) {
     if (!ob.up || length > OB_MAX_PAYLOAD) { oneios_bridge_counts[2]++; return -1; }
+    if (obu.registers) {
+        lck_mtx_lock(&ob_tx_lock);
+        const int rc = obu_send(channel, type, payload, length);
+        lck_mtx_unlock(&ob_tx_lock);
+        oneios_bridge_counts[rc ? 2 : 0]++;
+        return rc;
+    }
     lck_mtx_lock(&ob_tx_lock);
     volatile uint16_t *used = (volatile uint16_t *)(ob.tx_ring + 2048);
     ob_barrier();
@@ -277,6 +340,77 @@ static void ob_worker(void *parameter, wait_result_t result) {
     }
 }
 
+// The serial transport: what the port holds, a byte at a time, into the frame reader (crosvm keeps what the phone's
+// end wrote until it is read, so nothing is lost between two looks).
+static void obu_rx_poll(void) {
+    for (unsigned taken = 0; taken < 4 * OBS_MAX_FRAME && (obu_read8(NS16550_LSR) & NS16550_LSR_DR); ++taken) {
+        const uint8_t byte = obu_read8(NS16550_RBR_THR);
+        obu.rx_bytes++;
+        if (!obs_push(&obu.rx, byte)) continue;
+        oneios_bridge_counts[1]++;
+        obu_active();
+        ob_dispatch(obu.rx.message, obu.rx.have);
+    }
+}
+
+// Its worker: the hello until the phone's end answers (OBU_HELLO_TRIES of them, OBU_HELLO_MS apart: 10 s), then the
+// port every OB_POLL_MS for OBU_BUSY_MS after a message either way and every OBU_IDLE_MS otherwise. With no answer
+// the transport is given up and the thread ends: a VM started without the phone's end costs nothing.
+static void obu_worker(void *parameter, wait_result_t result) {
+    (void)parameter; (void)result;
+    oneios_bridge_stage = 4;
+    const struct ob_ctl_hello hello = {OB_PROTO_VERSION, 0};
+    uint64_t hello_span, next_hello = 0;
+    unsigned tries = 0;
+    nanoseconds_to_absolutetime((uint64_t)OBU_HELLO_MS * NSEC_PER_MSEC, &hello_span);
+    for (;;) {
+        const uint64_t now = mach_absolute_time();
+        if (!ob.channels && now >= next_hello) {
+            if (tries == OBU_HELLO_TRIES) {
+                ob.up = false;
+                printf("ONEIOS BRIDGE: off: no answer to %u hellos on the serial port (%llu bytes came): no `bridgectl serve` at the phone's end\n",
+                       tries, (unsigned long long)obu.rx_bytes);
+                (void)thread_terminate(current_thread());
+                return;
+            }
+            (void)oneios_bridge_send(OB_CH_CONTROL, OB_CTL_HELLO, &hello, sizeof(hello));
+            ++tries;
+            next_hello = now + hello_span;
+        }
+        obu_rx_poll();
+        IOSleep(mach_absolute_time() < obu.active_until ? OB_POLL_MS : OBU_IDLE_MS);
+    }
+}
+
+// "oneios,bridge-uart": the node's reg is the port's absolute physical address and size, as the console's node has
+// it (crosvm's ports lie below the arm-io window).
+static void obu_start(DTEntry node) {
+    const void *value;
+    unsigned int size;
+    uint64_t reg[2];
+    if (SecureDTGetProperty(node, "reg", &value, &size) != kSuccess || size != sizeof(reg)) {
+        printf("ONEIOS BRIDGE: off: /arm-io/bridge names no serial port (reg)\n");
+        return;
+    }
+    memcpy(reg, value, sizeof(reg));
+    if (reg[1] < 8 || reg[1] > 0x1000 || !(obu.registers = ml_io_map((vm_offset_t)reg[0], (vm_size_t)reg[1]))) {
+        printf("ONEIOS BRIDGE: off: the serial port at %#llx is not mapped\n", (unsigned long long)reg[0]);
+        return;
+    }
+    oneios_bridge_stage = 2;
+    obu_write8(NS16550_IER, 0x00);              // no interrupts: polled
+    obu_write8(NS16550_LCR, 0x03);              // 8-N-1, DLAB clear
+    obu_write8(NS16550_FCR, 0x07);              // FIFOs on, both cleared
+    obu_write8(NS16550_MCR, 0x03);              // DTR, RTS
+    oneios_bridge_stage = 3;
+    ob.up = true;
+    printf("ONEIOS BRIDGE: the serial transport: an ns16550 at %#llx, polled (a VM of crosvm: `bridgectl serve` is the phone's end)\n",
+           (unsigned long long)reg[0]);
+    thread_t thread;
+    if (kernel_thread_start(obu_worker, NULL, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+    else { ob.up = false; printf("ONEIOS BRIDGE: off: no worker thread\n"); }
+}
+
 void oneios_bridge_start(void) {
     static bool tried;
     uint32_t enabled = 1;
@@ -296,6 +430,11 @@ void oneios_bridge_start(void) {
         return;
     }
     oneios_bridge_stage = 1;
+    static const char uart[] = "oneios,bridge-uart";
+    if (SecureDTGetProperty(node, "compatible", &value, &size) == kSuccess && size >= sizeof(uart) && !memcmp(value, uart, sizeof(uart))) {
+        obu_start(node);
+        return;
+    }
     if (SecureDTGetProperty(node, "reg", &value, &size) != kSuccess || size != sizeof(reg)) return;
     memcpy(reg, value, sizeof(reg));
     if (reg[0] < ranges[0] || reg[1] < 0x108 || reg[1] > ranges[2] || reg[0] - ranges[0] > ranges[2] - reg[1]) return;

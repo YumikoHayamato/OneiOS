@@ -6,7 +6,7 @@
 // stub (interrupts masked, x0 = boot_args, a branch to the entry); the kernel's window (xl_boot_place: its segments, the
 // device tree, boot_args) at its physical base, 32 MiB aligned with the kernel's own base as on the bench.
 //   xnuloader-crosvm KERNEL OUT [--cpus N] [--ram-mib N] [--timebase HZ] [--args TEXT] [--args-add TEXT] [--swiotlb MIB]
-//                    [--image DIR [--phone-image DIR] [--phone-data FILE]] [--shared-ram [--gpu | --gpu-scanout] [--audio] [--wifi]]
+//                    [--image DIR [--phone-image DIR] [--phone-data FILE]] [--shared-ram [--gpu | --gpu-scanout] [--audio] [--wifi]] [--bridge]
 // --ram-mib is the VM's (crosvm --mem): the window ends below crosvm's FDT and its restricted DMA pool (--swiotlb, 8 MiB
 // by default, 32 with --display, up to 1024; the RAM's last MIB). Writes OUT (the Image), OUT.adt (the device tree the kernel is given:
 // xnuloader-inspect adt FILE) and, with --image, OUT.disks; prints the layout.
@@ -75,6 +75,12 @@
 // NET_TRANSPORT_PCI); `wifictl tap` on the phone carries its frames and the station's messages between crosvm's tap and
 // wlan0 (runtime/bridges/wifi, as xnuhost's bridge does). /arm-io/net ("oneios,virtio-net-pci") is all of bus 0 of the
 // ECAM, as the sound card's node. OUT.disks then has "wifi".
+// --bridge: the bridge channel (battery, haptics: drivers/bridge, drivers/battery, drivers/haptics) on crosvm's second
+// ns16550a (0x2f8), since this VM has no "oneios,bridge" virtio device: /arm-io/bridge is "oneios,bridge-uart" with the
+// port's absolute address, and the kernel's bridge driver carries its messages there as frames
+// (drivers/bridge/oneios_bridge_stream.h), polled as the console is. vm-boot gives crosvm the port as a Unix socket
+// (`--serial type=unix-stream,hardware=serial,num=2,input-unix-stream`) whose other end is `bridgectl serve` on the
+// phone (runtime/bridges): the phone's battery to iOS, iOS's haptics to the phone's motor. OUT.disks then has "bridge".
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -97,6 +103,7 @@
 #define GICR_STRIDE   0x20000ull        // GICv3 without VLPI: RD_base and SGI_base
 #define UART          0x3f8ull          // crosvm's first ns16550a (serial num=1)
 #define UART_SIZE     0x8ull
+#define BRIDGE_UART   0x2f8ull          // crosvm's second ns16550a (serial num=2): --bridge
 #define PCI_CAM       0x10000ull        // crosvm's CAM (pci-host-cam-generic): bus << 16 | device << 11 | function << 8
 #define PCI_FIRST_DEV 2u                // disk K is 00:(2 + K).0 (pinned; crosvm's pvpanic device takes a free one)
 #define DMA_SLICE     0x110000ull       // a disk's DMA window: its queue page, then 1 MiB of transfer buffer at 64 KiB
@@ -135,7 +142,7 @@ static uint8_t *slurp(const char *path, size_t *size)
 static void usage(void)
 {
   fprintf(stderr, "usage: xnuloader-crosvm KERNEL OUT [--cpus N] [--ram-mib N] [--timebase HZ] [--args TEXT] [--args-add TEXT] [--swiotlb MIB]\n"
-                  "                        [--image DIR [--phone-image DIR] [--phone-data FILE] [--display WxH [--scale 2|3] [--hz N]]] [--shared-ram [--gpu | --gpu-scanout] [--audio] [--wifi]]\n");
+                  "                        [--image DIR [--phone-image DIR] [--phone-data FILE] [--display WxH [--scale 2|3] [--hz N]]] [--shared-ram [--gpu | --gpu-scanout] [--audio] [--wifi]] [--bridge]\n");
   exit(2);
 }
 
@@ -159,7 +166,7 @@ int main(int argc, char **argv)
   unsigned cpus = 1, ram_mib = 2048, swiotlb_mib = 0;
   unsigned display_w = 0, display_h = 0, display_scale = 3, display_hz = 60;
   uint32_t timebase = 19200000;         // the S25's (vm-probe: CNTFRQ_EL0 in the VM)
-  bool shared_ram = false, gpu = false, gpu_scanout = false, audio = false, wifi = false;
+  bool shared_ram = false, gpu = false, gpu_scanout = false, audio = false, wifi = false, bridge = false;
   const char *prime_list_path = NULL;
   for (int i = 3; i < argc; i++) {
     if (!strcmp(argv[i], "--shared-ram")) { shared_ram = true; continue; }
@@ -167,6 +174,7 @@ int main(int argc, char **argv)
     if (!strcmp(argv[i], "--gpu-scanout")) { gpu = gpu_scanout = true; continue; }
     if (!strcmp(argv[i], "--audio")) { audio = true; continue; }
     if (!strcmp(argv[i], "--wifi")) { wifi = true; continue; }
+    if (!strcmp(argv[i], "--bridge")) { bridge = true; continue; }
     if (i + 1 >= argc) usage();
     if (!strcmp(argv[i], "--cpus")) cpus = (unsigned)strtoul(argv[++i], NULL, 0);
     else if (!strcmp(argv[i], "--ram-mib")) ram_mib = (unsigned)strtoul(argv[++i], NULL, 0);
@@ -299,6 +307,12 @@ int main(int argc, char **argv)
   m.uart_base = UART;
   m.uart_size = UART_SIZE;
   m.uart_ns16550 = true;
+  if (bridge) {
+    m.bridge_uart_base = BRIDGE_UART;
+    m.bridge_uart_size = UART_SIZE;
+    printf("xnuloader-crosvm: the bridge: /arm-io/bridge, crosvm's second serial port at 0x%llx (vm-boot: --serial num=2 on a socket, bridgectl serve)\n",
+           (unsigned long long)BRIDGE_UART);
+  }
   m.psci_method = "hvc";
   m.model = "iPhone18,2";
   m.have_chip_id = true;
@@ -457,6 +471,7 @@ int main(int argc, char **argv)
     if (gpu_scanout) fprintf(d, "scanout %u %u %u\n", display_w, display_h, display_hz);
     if (audio) fprintf(d, "audio\n");
     if (wifi) fprintf(d, "wifi\n");
+    if (bridge) fprintf(d, "bridge\n");
     for (unsigned i = 0; i < ndisk; i++) {
       char file[1200];
       if (disks[i].writable) snprintf(file, sizeof file, "%s", phone_data);

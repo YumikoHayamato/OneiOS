@@ -50,6 +50,10 @@ typedef struct {
   // The uart0 node an ns16550a (8250, byte-spaced) instead, its "reg" the absolute physical address: crosvm's serial
   // ports sit at 0x3f8 and the like, below the arm-io window (kernel patch 0077, docs/native.md "A VM under Gunyah")
   bool        uart_ns16550;
+  // A second ns16550a that carries the bridge channel's messages as frames (drivers/bridge/oneios_bridge_stream.h; crosvm's
+  // second port in the VM of the native path, which has no "oneios,bridge" virtio device): node "bridge", compatible
+  // "oneios,bridge-uart", its "reg" the absolute physical address as the console's. Size 0 for none.
+  uint64_t    bridge_uart_base, bridge_uart_size;
   const char *psci_method;                // "hvc" or "smc"
   xl_device   dev[XL_MAX_DEVICES];
   unsigned    ndev;
