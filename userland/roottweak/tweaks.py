@@ -430,6 +430,56 @@ def camera_plugin(cx):
            ('' if cx.rw else '; shown over /System/Library/MediaCapture by the kernel (addon_mounts, hosted 0056)'))
 
 
+# ---- our own apps --------------------------------------------------------------------------------------------------
+def own_apps(cx):
+    """OneiOS's own app bundles (userland/apps/build.sh output) in the Data seed: /private/var/oneios/apps, every
+    Mach-O in the owner trust list, and the registrar oneios-appreg as the oneios-init service "appreg", which
+    registers the bundles with LaunchServices at each boot. Without a new seed the same goes in the boot addon
+    (userland/apps/appsaddon.py, /private/var/ngpu/apps)."""
+    import stat as st
+    source = cx.options.get('apps')
+    if not source:
+        cx.say('off', 'own apps', 'no --apps DIR (the output of userland/apps/build.sh)')
+        return
+    if not os.path.isdir(source):
+        raise TreeError(f'{source}: not a directory')
+    bundles = sorted(n for n in os.listdir(source) if n.endswith('.app') and os.path.isdir(os.path.join(source, n)))
+    registrar = os.path.join(source, 'oneios-appreg')
+    if not bundles or not os.path.isfile(registrar):
+        raise TreeError(f'{source}: no .app bundle or no oneios-appreg (the output of userland/apps/build.sh)')
+    base = f'{ONEIOS}/apps'
+    cx.data.mkdir(base, ROOT, 0o755)
+    for bundle in bundles:
+        top = os.path.join(source, bundle)
+        cx.data.mkdir(f'{base}/{bundle}', ROOT, 0o755)
+        for current, dirs, files in os.walk(top):
+            dirs.sort()
+            rel = os.path.relpath(current, top)
+            for name in dirs:
+                if os.path.islink(os.path.join(current, name)):
+                    raise TreeError(f'{os.path.join(current, name)}: a link in an app bundle')
+                cx.data.mkdir(os.path.normpath(f'{base}/{bundle}/{rel}/{name}'), ROOT, 0o755)
+            for name in sorted(files):
+                host = os.path.join(current, name)
+                if not st.S_ISREG(os.lstat(host).st_mode):
+                    raise TreeError(f'{host}: not a plain file')
+                path = os.path.normpath(f'{base}/{bundle}/{rel}/{name}')
+                with open(host, 'rb') as f:
+                    head = f.read(8)
+                if macho.is_macho(head):
+                    _install_binary(cx, cx.data, host, path, 0o755)
+                else:
+                    with open(host, 'rb') as f:
+                        cx.data.write(path, f.read(), ROOT, 0o644)
+    _install_binary(cx, cx.data, registrar, f'{ONEIOS}/bin/oneios-appreg')
+    env = {'ONEIOS_ROOT': ONEIOS_GUEST, 'PATH': f'{ONEIOS_GUEST}/bin:/usr/bin:/bin:/usr/sbin:/sbin'}
+    cx.data.write(f'{ONEIOS}/services.d/appreg.conf',
+                  _conf([f'{ONEIOS_GUEST}/bin/oneios-appreg', f'{ONEIOS_GUEST}/apps'], keepalive=0, bootstrap=1, env=env), ROOT, 0o644)
+    cx.data.write(f'{ONEIOS}/enabled/appreg', b'', ROOT, 0o644)
+    cx.say('applied', 'own apps', f'{", ".join(bundles)} in {ONEIOS_GUEST}/apps; oneios-appreg registers them at boot '
+           '(service appreg)')
+
+
 # ---- cryptexes and the removable system apps -----------------------------------------------------------------------
 def _copy_tree(cx, tree, source, base):
     """Copies an extracted volume into a tree: files, directories and links, modes from the source."""
@@ -700,5 +750,5 @@ def identity(cx):
                'check target_type in the device profile against the IPSW')
 
 
-ALL = (version, launchd_jobs, launchd_crash_policy, host_services, metal_plugin, camera_plugin, app_cryptex, staged_apps, preferences,
+ALL = (version, launchd_jobs, launchd_crash_policy, host_services, metal_plugin, camera_plugin, own_apps, app_cryptex, staged_apps, preferences,
        data_layout, keybag, feature_flags, identity, kernel_features)

@@ -45,6 +45,8 @@ labels = [
   "com.apple.locationd", "com.apple.bluetoothd",
   "com.apple.audiomxd", "com.apple.mediaplaybackd", "com.apple.mediaremoted", "com.apple.cameracaptured",
   "com.apple.avconferenced",
+  # take19 (the take18 session's iOS log): taken out of vphone's base27 list
+  "com.apple.duetexpertd", "com.apple.email.maild",
 ]
 
 [keep.reasons]
@@ -58,6 +60,8 @@ labels = [
 "com.apple.bluetoothd" = "locationd calls it synchronously (vphone). iOSPlus10 dropped it on iOS 16 for a relaunch loop; on iOS 27 it stays and idles"
 "com.apple.analyticsd" = "without it backboardd spun at 217% CPU after a brightness change: CoreAnalytics::Client::retryXpcMessageHelper_sync makes a new connection for each retry of a synchronous send (__kernelrpc_mach_port_construct_trap in a loop) and the brightness never reached the panel (phone, 2026-11-12, oneios-ubt). vphone's base27 disables it; here the lookups found no service and the clients spun"
 "com.apple.security.cryptexd" = "needs /chosen/manifest-properties in the device tree, or it restarts every 10 s (iOSPlus10 notes 5167-5175)"
+"com.apple.duetexpertd" = "the lock screen's wallpaper gallery: PosterBoard looks up com.apple.proactive.FaceSuggestions.xpc (duetexpertd's) and gets 'No such process', then 'Fetch from gallery service failed' and 'no gallery received? Erroring out', and the gallery loads forever (take18, 2026-11-27); SpringBoard's App Library (com.apple.proactive.appDirectory) and widget suggestions ask it too. In vphone's base27 list for memory and idle CPU: measure its cost (oneios-cpu lines). A Data store made from an older seed gets it from the kernel's oneios-enable-jobs (0044)"
+"com.apple.email.maild" = "Mail's daemon: with it disabled MobileMail's EMRemoteConnection retried without end (164,779 + 138,314 log lines in one take18 session; MobileMail took 1.1-2.6 s of CPU in the hitches around its close). A Data store made from an older seed gets it from oneios-enable-jobs (0044)"
 
 # ---- idle -------------------------------------------------------------------------------------------------
 # Kept running; what each needs from the kernel or the device tree to rest instead of crash-looping.
@@ -100,8 +104,8 @@ labels = [
   "com.apple.assistant_service", "com.apple.assistantd", "com.apple.audioanalyticsd",
   "com.apple.batteryintelligenced", "com.apple.biomesyncd", "com.apple.bookassetd", "com.apple.callintelligenced",
   "com.apple.carkitd", "com.apple.cdpd", "com.apple.cloudtelemetryd", "com.apple.cmfsyncagent", "com.apple.coreidvd",
-  "com.apple.corespeechd", "com.apple.diagnosticextensionsd", "com.apple.diagnosticspushd", "com.apple.duetexpertd",
-  "com.apple.ecosystemanalyticsd", "com.apple.email.maild", "com.apple.eyereliefd", "com.apple.familycircled",
+  "com.apple.corespeechd", "com.apple.diagnosticextensionsd", "com.apple.diagnosticspushd",
+  "com.apple.ecosystemanalyticsd", "com.apple.eyereliefd", "com.apple.familycircled",
   "com.apple.findmy.findmybeaconingd", "com.apple.findmy.findmylocated", "com.apple.finhealthd",
   "com.apple.fitnesscoachingd", "com.apple.fitnessintelligenced", "com.apple.gamed", "com.apple.geoanalyticsd",
   "com.apple.hangtelemetryd", "com.apple.homed", "com.apple.homeeventsd", "com.apple.hybridsearchd",
@@ -173,4 +177,33 @@ labels = [
   "com.apple.deviceaccessd", "com.apple.gamepolicyd", "com.apple.driverkitd", "com.apple.factory.NFQRCoded",
   "com.apple.biometrickitd.pearl", "com.apple.cloudpaird", "com.apple.sirittsd", "com.apple.PerfPowerServices",
   "com.apple.biomed",
+]
+
+[group.prune1]
+default = false
+source = "this repository, 2026-11-26 (docs: daemon pruning, kernel patch 0086): launchd jobs seen running in take15/take16 (serial.txt, the jetsam kill lines give their footprint: 1-5 MiB each) or on demand, for hardware this VM has not (USB PTP, always-on sensors, car and dock accessories), telemetry and diagnostics, Apple Watch, Fitness, Apple Intelligence and repair services. The conservative first list: none is a dependency of SpringBoard, backboardd, Wi-Fi, audio, input, display or locationd as far as the sources here show; none was run on the phone yet. Off by default: --group prune1, or the kernel's oneios-prune-jobs=1 for a Data store that exists. Also see bringup-26 (PerfPowerServices, sirittsd, the Face ID pearl daemon) and fewest (tailspind, spindump, activityawardsd), which hold the same kind of job"
+labels = [
+  "com.apple.ReportMemoryException", "com.apple.ReportSystemMemory", "com.apple.sysdiagnose",
+  "com.apple.sysdiagnose_helper", "com.apple.ptpd", "com.apple.ptpcamerad", "com.apple.aonsensed",
+  "com.apple.callverificationd", "com.apple.caraccessoryd", "com.apple.dockaccessoryd", "com.apple.wcd",
+  "com.apple.activitysharingd", "com.apple.sportsd", "com.apple.homeenergyd", "com.apple.imageplaygroundd",
+  "com.apple.privatecloudcomputed", "com.apple.translationd", "com.apple.bookdatastored",
+  "com.apple.facetimemessagestored", "com.apple.mobilerepaird", "com.apple.corerepaird", "com.apple.feedbackd",
+  "com.apple.atc", "com.apple.backupd"
+]
+
+[group.prune2]
+default = false
+source = "as prune1, the moderate list: each costs a feature or may make a client reconnect in a loop (the Memoji and sticker daemons next to the keyboard's sticker picker, callservicesd and SpringBoard's telephony manager, Health's widgets, the Maps widget's geod, Screen Time's SpringBoard hooks, Safari and networkserviceproxy). Take prune1 first and look at the oneios-cpu lines. --group prune1 --group prune2, or the kernel's oneios-prune-jobs=2 (which includes the first list)"
+labels = [
+  "com.apple.healthd", "com.apple.healthappd", "com.apple.fitcore", "com.apple.fitcore.session",
+  "com.apple.healtheventsd", "com.apple.healthcontentd", "com.apple.healthrecordsd",
+  "com.apple.telephonyutilities.callservicesd", "com.apple.callhistoryd", "com.apple.geod", "com.apple.suggestd",
+  "com.apple.mlhostd", "com.apple.networkserviceproxy", "com.apple.symptomsd.distributed",
+  "com.apple.ScreenTimeAgent", "com.apple.ScreenTimeSettingsAgent", "com.apple.FamilyControlsAgent",
+  "com.apple.ManagedSettingsAgent", "com.apple.sosd", "com.apple.voiced", "com.apple.accessoryd",
+  "com.apple.airplayd", "com.apple.cloudphotod", "com.apple.purplebuddy.budd", "com.apple.parsecd",
+  "com.apple.contacts.donation-agent", "com.apple.cameraispd", "com.apple.appleh16camerad",
+  "com.apple.dietappleh16camerad", "com.apple.dietapplecamerad", "com.apple.realitycamerad",
+  "com.apple.restorecameraispd", "com.apple.stickersd", "com.apple.avatarsd"
 ]

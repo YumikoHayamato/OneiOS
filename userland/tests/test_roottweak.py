@@ -105,7 +105,11 @@ class Policy(unittest.TestCase):
         self.assertFalse(set(chosen) & d.keep)
         self.assertFalse(set(chosen) & set(d.idle))
         # vphone's base list of 134, less generativeexperiencesd (kept) and the four OTA jobs (replace)
-        self.assertEqual(len(d.groups['base']['labels']), 128)          # analyticsd went to keep (2026-11-12)
+        # analyticsd went to keep (2026-11-12); duetexpertd and email.maild too (take19: the wallpaper gallery, Mail's retries)
+        self.assertEqual(len(d.groups['base']['labels']), 126)
+        for label in ('com.apple.duetexpertd', 'com.apple.email.maild'):
+            self.assertIn(label, d.keep)
+            self.assertNotIn(label, chosen)
         for label in ('com.apple.SpringBoard', 'com.apple.backboardd', 'com.apple.CommCenter', 'com.apple.sleepd',
                       'com.apple.generativeexperiencesd', 'com.apple.bluetoothd', 'com.apple.locationd'):
             self.assertIn(label, d.keep)
@@ -120,6 +124,29 @@ class Policy(unittest.TestCase):
         self.assertNotIn('com.apple.weatherd', d.selected(keep=['com.apple.weatherd']))
         with self.assertRaises(config.ConfigError):
             d.selected(groups=['nonesuch'])
+
+    def test_the_prune_groups_are_off_and_the_kernel_has_the_same_lists(self):
+        import re
+        d = config.daemons()
+        chosen = d.selected()
+        for name in ('prune1', 'prune2'):
+            self.assertFalse(d.groups[name].get('default'))
+            self.assertFalse(set(d.groups[name]['labels']) & set(chosen))
+        # what SpringBoard, backboardd, Wi-Fi, audio, input, display and locationd lean on never goes in
+        for label in ('com.apple.liveactivitiesd', 'com.apple.donotdisturbd', 'com.apple.pluginkit.pkd', 'com.apple.coreauthd',
+                      'com.apple.symptomsd', 'com.apple.countryd', 'com.apple.GameController.gamecontrollerd',
+                      'com.apple.mediaparserd', 'com.apple.videocodecd', 'com.apple.nsurlsessiond', 'com.apple.eligibilityd',
+                      'com.apple.usernotificationsd', 'com.apple.mobiletimerd', 'com.apple.systemstatusd', 'com.apple.dasd'):
+            for name in ('prune1', 'prune2'):
+                self.assertNotIn(label, d.groups[name]['labels'])
+        with open(os.path.join(os.path.dirname(__file__), '..', '..', 'kernel', 'patches', 'oneios-hosted',
+                               '0086-prune-jobs.patch')) as f:
+            text = f.read()
+        for n, name in ((1, 'prune1'), (2, 'prune2')):
+            body = re.search(r'oneios_prune_jobs_%d\[\] =\n((?:\+\t    "[^\n]*\n)+)' % n, text).group(1)
+            labels = ''.join(re.findall(r'"([^"]*)"', body)).split(',')
+            self.assertEqual(labels, d.groups[name]['labels'])
+        self.assertEqual(set(d.selected(groups=['prune1'])) - set(chosen), set(d.groups['prune1']['labels']))
 
     def test_a_policy_that_disables_what_it_keeps_is_refused(self):
         raw = {'keep': {'labels': ['a']}, 'replace': {'labels': {}}, 'group': {'g': {'labels': ['a'], 'source': 's'}}}
@@ -332,6 +359,48 @@ class Sealed(Case):
         self.assertEqual((manager['path'], manager['present']), ('/private/var/oneios/bin/oneios-init', True))
         with open(os.path.join(base, 'roottweak-report.txt')) as f:
             self.assertIn('layout sealed', f.read())
+
+    def apps(self):
+        directory = os.path.join(self.top, 'apps')
+        hashes = {}
+        for name, ident in (('OneiOSBench', 'com.oneios.bench'), ('OneiOS2048', 'com.oneios.game2048')):
+            app = os.path.join(directory, name + '.app')
+            os.makedirs(app)
+            data, hashes[f'/private/var/oneios/apps/{name}.app/{name}'] = fakeroot.signed_macho(ident, payload=name.encode())
+            with open(os.path.join(app, name), 'wb') as f:
+                f.write(data)
+            with open(os.path.join(app, 'Info.plist'), 'wb') as f:
+                f.write(b'<plist/>')
+        data, hashes['/private/var/oneios/bin/oneios-appreg'] = fakeroot.signed_macho('com.oneios.appreg')
+        with open(os.path.join(directory, 'oneios-appreg'), 'wb') as f:
+            f.write(data)
+        return directory, hashes
+
+    def test_our_apps_go_to_the_data_volume_with_their_registrar(self):
+        helpers, helper_hashes = self.helpers()
+        apps, hashes = self.apps()
+        self.apply('--helpers', helpers, '--apps', apps)
+        base = os.path.join(self.data, 'oneios')
+        self.assertTrue(os.path.isfile(os.path.join(base, 'apps/OneiOSBench.app/Info.plist')))
+        self.assertEqual(self.entry('data', 'oneios/apps/OneiOSBench.app/OneiOSBench')['mode'], '0755')
+        self.assertEqual(self.entry('data', 'oneios/apps/OneiOSBench.app/Info.plist')['mode'], '0644')
+        self.assertEqual(self.entry('data', 'oneios/bin/oneios-appreg')['mode'], '0755')
+        self.assertIn('appreg', os.listdir(os.path.join(base, 'enabled')))
+        with open(os.path.join(base, 'services.d/appreg.conf')) as f:
+            conf = f.read().splitlines()
+        self.assertEqual(conf[:2], ['arg=/private/var/oneios/bin/oneios-appreg', 'arg=/private/var/oneios/apps'])
+        self.assertIn('bootstrap=1', conf)
+        trust = self.read('owner-trust.json')
+        paths = {f['path']: f['cdhash'] for f in trust['files']}
+        for path, cdhash in hashes.items():
+            self.assertEqual(paths[path], cdhash)
+        self.assertEqual(trust['cdhashes'], sorted(set(hashes.values()) | set(helper_hashes.values())))
+        self.assertEqual(self.states()['own apps'], 'applied')
+
+    def test_without_apps_nothing_is_placed(self):
+        self.apply()
+        self.assertEqual(self.states()['own apps'], 'off')
+        self.assertFalse(os.path.exists(os.path.join(self.data, 'oneios/apps')))
 
     def test_without_helpers_the_services_are_placed_and_nothing_is_enabled(self):
         self.apply()
