@@ -773,6 +773,72 @@ What the next session shows:
   (`displayctl pool --vm shared`: the memfd's offset is the address less 0x80000000). The CPU still draws every
   frame: about 13 frames a second, backboardd at 111 % of a core. Next: the GPU.
 
+### The frame rate in the shared-RAM VM (2026-11-25)
+The owner's report of take12 (`logs/pa3q-vmboot/take12`: 2560 MiB, 6 vCPUs, 720x1560 at 2x, the GPU's scanout, the
+GPU held at 607 MHz and the big cores at 2.84 GHz or more): it looks like 50 frames a second on a 120 Hz panel.
+What the logs and the code say, and what was changed.
+
+- **The guest hands crosvm 70 to 100 frames a second in a swipe.** `oneios-gpu-report`'s "frames" are the render
+  server's fenced submissions; against the display's own `frame N scanned out` lines they were one scanout each in
+  take10 (16,581 frames for the 16,384 scanouts from 16,385 to 32,769) and more than one in take12 (11,192 for the
+  8,192 from 8,193 to 16,385, 4,888 for the 4,096 before: 73 to 84 scanouts per 100 frames; two of its 10 s had 1,552
+  and 2,244 frames, more than 120 a second, so some submissions are not frames shown). Why take12 has more
+  submissions per scanout than take10 is not known. A swipe's 10 s: `frames +1011 mean 6655 us`, 741 under 8 ms,
+  252 at 8 to 16, 18 longer. So crosvm gets well over 60 frames a second; half the rate the owner expects is lost
+  after it.
+- **The cause, inferred (not read during the session): the panel ran at 60 Hz or less.** `oneios-display --takeover` set surfaceflinger's mode specs only when the
+  panel was not in its native size; the S25 at WQHD+ already is, so the specs stayed as One UI left them when its
+  framework was stopped. After the return power saving was on (`settings get global low_power` 1, read at 16:51; whether Samsung's
+  cpufreq_limit of 1689600 in take12's run.txt is the power saver's is a guess) and the policy was `displayManagerPolicy={defaultModeId=2,
+  ... primaryRanges={physical=[10.00 Hz, 60.00 Hz] ...} appRequestRanges={physical=[10.00 Hz, 60.00 Hz] ...}}`
+  (`dumpsys SurfaceFlinger` after the return; the 34 entries of its mode specs history, 16:06:59 to 16:25:14, are all
+  10-60 or 60-60 with mode 2, and surfaceflinger is not restarted by vm-boot's takeover or return: one process, up
+  19 h. The history has no entry after 16:25:14, not even for the return at 16:50, so it is not complete, and the
+  6 minutes before the takeover at 16:31:57 are not covered). The
+  layer's `setFrameRate(120)` cannot leave the app request range, so surfaceflinger latched at most 60 of the
+  guest's 100 frames, unevenly (the guest's tick is its own 120 Hz timer). The helper's line said `active
+  1440x3120 (up to 120 Hz)` and `120 Hz`: the highest rate among the modes of that size and the vote, not the rate
+  the panel was in. **Not read during the session**: the active mode while the VM ran (the session had ended); the
+  policy is from the dump after it. take10 (the day before, cpufreq_limit 1958400: another profile) has no such dump.
+- **The fix** (runtime/display, `OneiOSDisplay.java`): in a takeover the helper sets the specs whenever the panel's
+  size or surfaceflinger's policy is below the native mode's; in the crosvm mode it also holds the rate (range 120
+  to 120: no framework tells surfaceflinger of a touch, and its 250 ms idle timer would lower the rate between
+  gestures; the hosted session's helper keeps ranges from 0),
+  gives One UI's specs back when it leaves, logs the active mode's own rate and the policy, and in the crosvm mode
+  looks at the panel's rate every 5 s (runtime/display/README.md "The panel"). Tested on the PC: `make -C
+  runtime/display test` (173 + 21 checks: the choice with the S25's mode list and take12's policy), the dex built.
+  **Not run on the phone**, and the calls to surfaceflinger (the policy read, the specs given back, the look every
+  5 s) have run nowhere: whether Samsung's surfaceflinger takes a 120 Hz policy from the helper is the test. The lines that prove it there, in `display.txt`: `panel modes: active 1440x3120 at 60 Hz
+  (mode 2; ...); surfaceflinger's policy: default mode 2, the panel at 10 to 60 Hz`, then `asked surfaceflinger for
+  the native mode (id 0) held at 120 Hz`, `the panel is in its native mode 1440x3120 at 120 Hz (mode 0)`, `the panel
+  runs at 120 Hz ...`, at the end `the panel's rate over the session: 120 Hz 100 %` and `surfaceflinger's policy is
+  One UI's again: default mode 2, the panel at 10 to 60 Hz`; and during the session `dumpsys SurfaceFlinger | grep -E
+  "activeMode|renderRate|displayManagerPolicy"` (read only). A test with no new code: power saving off and motion
+  smoothness adaptive before the session, which should leave a policy that reaches 120 Hz.
+- **Second, not changed: the guest's virtio-gpu has no interrupt on crosvm's PCI.** `virtio-gpu: PCI function at
+  0x6f000, notifications x4, polled (no interrupt)` and `interrupt 0 (0)`: the loader gives a PCI function no
+  `droidvm,intid` (runtime/loader `machine.c`), so every wait for a command or a fence (the render server's, and the
+  display's wait for a frame's GPU work before its flush) is the transport's watch looking at the used ring with
+  sleeps of 100 us (`DroidVMVirtioGpu.cpp` `pause()`), each a timer wake-up of an idle vCPU through Gunyah. The
+  hosted path sleeps on the device's interrupt after 300 us. Its share of the 6.6 ms mean frame is not measured (the
+  native kernel prints none of the transport's counters: `droidvm_virtio_gpu_waits`, `_legs`); the GPU's own work is
+  about 2.5 to 3 ms of it (kgsl's busy 22 to 30 % at about 100 frames a second and 607 MHz; it was 1 % only on a
+  still screen). The road: the function's INTx line from crosvm's interrupt map in the loader, `droidvm,intid` on
+  the node, the transport as it is (it acknowledges by reading the ISR); a line that never fires costs every wait
+  its 20 ms guard, and neither QEMU's bench (MMIO transports) nor this PC can show Gunyah delivering it, so it is a
+  phone test of its own, with the transport's counters printed.
+- **Looked at and set aside.** The GPU's clock (607 MHz against the day before's 160 to 222 MHz: the same frame
+  times). crosvm's side of a fence: no timer, its worker waits on the fences' descriptors (crosvm
+  `devices/src/virtio/gpu/mod.rs`); its Android display blits asynchronously by default
+  (`CROSVM_ANDROID_DISPLAY_ASYNC_BLIT`, read from the binary: default on) and answers the guest's fenced flush when
+  the blit has read the frame. Its threads: `v_gpu` waited 4.44 s for a core over 239,424 turns (19 us each) and
+  runs on any core (affinity 0-7; `--pin` moves only the vCPUs), so no fight for cores 0 and 1 (`/proc` of crosvm,
+  read as take12 was ending). `CROSVM_GPU_RT_PRIO` (a realtime `v_gpu`) is not used: no realtime threads. The vCPUs'
+  wake-up: gunyah_halt_poll is loaded (`phone haltpoll status`: halt_poll_ns 200000). The shader priming list: one
+  library in take10 and take12 alike (`oneios-gpu-prime: ... 1 libraries`), so not a difference between the two
+  days; a shader compiled at first use runs before its submission, so it is a gap between frames, not one of the
+  report's frames over 32 ms (222 in take12, 1006 in take10; 81 of take12's 222 fall in a 10 s with a GPU open or a new context).
+
 ## Next
 1. The Gunyah VM fits iOS with gh_hugepage_reserve ("Verdict, revised"). Its road to an iOS guest, each step a
    test on the phone: the native kernel booted by crosvm with its console on the 8250 at `0x3f8` (done: "The native
@@ -814,3 +880,498 @@ What the next session shows:
    not the frame rate.
 4. The phone's ID registers: read by vmprobe run 1 (no FEAT_LVA, 4 KiB only, PAC APA 5).
 5. The Adreno 830's kernel side for XNU with Turnip (references: UniXNU's Adreno740, UniXNU-houji's A750 port).
+
+## Flattening the power gap (2026-11-25)
+
+The native VM must cost more than bare Android, but much of today's gap is waste we can cut.
+
+- **The clock floors are off by default now** (`vm-boot --gpu-floor 0 --cpu-floor 0`; `tools/oneios-tool`). They pinned
+  the GPU at 607 MHz and each CPU cluster at 60% of its top for the whole session to hide a swipe's first-frame stutter,
+  but that stutter was the panel held at 60 Hz (`native-frame-latency`), not the clocks. The residency proves the cost:
+  in take12 (floors on) the perf cluster held ~3.0 GHz and **never** dropped to idle and the GPU sat at 607 MHz while
+  only ~12% busy; in take10 (governor, no floors) the perf cluster averaged 1.37 GHz and was idle (≤1.2 GHz) **84%** of
+  the time and the GPU averaged 282 MHz for the same work — and take12 ran ~8 °C hotter on the big-core zone (63.7 vs
+  55.7 °C mean). So the default is now the governor's own scaling; `--gpu-floor 607` / `--cpu-floor 60` stay as opt-in
+  for an A/B. A real battery-drain number (fuel-gauge `current_now`, or `dumpsys batterystats`) still needs the phone;
+  the residency and temperature are a proxy, not watts.
+- **The virtio-gpu transport's waits sleep on the GPU's interrupt (implemented 2026-11-25, branch `native-gpu-irq`;
+  needs the phone A/B).** Before, the guest's virtio-gpu on crosvm's PCI had no interrupt: the loader gave PCI
+  functions no `droidvm,intid`, so the transport (`DroidVMVirtioGpu.cpp`, vendored under `kits/droidvm`, staged by
+  `kernel/build-native.sh`, not a tracked file) waited on each fence by polling the used ring with 100 µs sleeps (a VM
+  exit each), and a vCPU never deep-idled while anything animated (serial: `virtio-gpu: ... interrupt 0 (0)`). The
+  transport could already sleep on a line: given the node's `droidvm,intid` it attaches that SPI (level), spins 300 µs
+  on a wait, then turns the queue's interrupt on and sleeps on it with a 20 ms guard; in PCI mode its read of the ISR
+  acknowledges the line. crosvm's PCI host gives every function its own level-high line (take12's `fdt.dtb`,
+  `interrupt-map`: 00:0c.0, the GPU, to SPI 4 = INTID 36; the disks 00:02.0-00:06.0 to SPI 5-9, 00:01.0 to 10,
+  00:07.0-00:0a.0 to 11-14: none shared). So:
+  - `xnuloader-crosvm --gpu-intid N` (with `--gpu`/`--gpu-scanout` and `--image`; off by default, existing Images are
+    unchanged) writes `droidvm,intid = N` on `/arm-io/virtio-gpu` (`xl_machine.gpu_intid`; the other PCI functions
+    still get none and poll), prints `GPU interrupt: INTID N (crosvm's SPI N-32)` and adds `gpu-intid N` to
+    `OUT.disks`. No kernel rebuild: the transport reads the property at boot.
+  - `phone vm-boot` checks it before the kernel's GPU starts: once crosvm's tree is whole, beside the
+    `drm2kgsl_host@` check, the script reads the tree as hex words (`od -An -tx1 -v`, `tr`, `sed`, `grep -o -E`) and
+    wants exactly one `interrupt-map` entry for the GPU's device (child address `device << 11`, any pin, any GIC
+    phandle) naming SPI N-32, level-high. Then run.txt says `gpu: the GPU's interrupt is intid 36 (crosvm's SPI 4):
+    its waits sleep on it`; otherwise it says what crosvm gave (`gpu: crosvm routes 00:0c.0 to GIC type ... number
+    ... flags ...`, or no entry, or more than one) and stops the VM (`stop.request`, result `refused pool`): a wrong
+    line could be another device's level interrupt, which the GPU's handler would never acknowledge (a storm).
+  - Tested on the PC: the loader's tests (the property on the PCI GPU node only when set, = N; none on the PCI
+    store; an INTID outside 32-1019 and a line without a PCI GPU refused), vm-boot's tests (the parse and its
+    refusals; the check run by the PC's `sh` on trees as crosvm writes them: the match passes, another SPI, an edge
+    line, no entry and two entries stop the VM), and the check by hand on take12's real `fdt.dtb` (36 passes, 37
+    stops). **Not tested: Gunyah's delivery of crosvm's INTx line to the guest** (the first SPI this kernel attaches
+    in a crosvm VM; QEMU cannot prove it) and toybox's `od`/`sed`/`grep -o -E` on the phone.
+  - What proves it on the phone (take14, `out/crosvm/kernel-hd-wifi-2560-irq.img`): run.txt's `gpu: the GPU's
+    interrupt is intid 36 ...` line; serial.txt's `virtio-gpu: control queue of 256 commands and cursor queue ready,
+    features ..., interrupt 36 (0)` (`0` is attach's kIOReturnSuccess; the line before it still says `polled (no
+    interrupt)`: that text is the vendored transport's, printed before it reads the property); then frames as
+    smooth as take12's or better with less CPU (thermal.txt's perf-cluster clock and idle, the board's temperature).
+    The failure sign: frames far worse than take12's (stalls of ~20 ms on every wait that outlives the 300 µs spin)
+    = the waits run to their 20 ms guard, i.e. Gunyah does not deliver the line; the A/B is then the same image
+    without `--gpu-intid` (`kernel-hd-wifi-2560.img`). The transport's counters (`droidvm_virtio_gpu_waits[6]`
+    interrupts, `[7]` sleeps that ran to their guard) are not printed by anything yet. Should the line not come, the
+    other road stays an adaptive backoff in the vendored transport (see `native-frame-latency` for the frame-rate half).
+
+## What take15's memory lines say, and the jetsam properties' name (2026-11-26)
+
+take15 (`logs/pa3q-vmboot/take15`, 09:15 to 09:35: `kernel-take15-nomic.img`, 3584 MiB, 6 vCPUs, `--touch-boost`, the
+panel at 120 Hz) is the first session with 0084's lines (`oneios-memory`, `oneios-jetsam`, `oneios-band`,
+`oneios-cpu-why`, `oneios-disk`). The times below are the report rounds' (the first round at 09:16:51, one every 10 s);
+which screen a round belongs to is read from its busiest processes and from the touches, not told by the owner.
+
+- **The lag of YouTube at 1080p was memory, not decoding.** While the video played (09:18:52 to 09:20:32, again
+  09:21:32 to 09:22:02 and at 09:24:02) backboardd's own GPU memory went from 734 MiB to 1594 MiB in one 10 s (its
+  blobs of 64 MiB or more from 5 to 20, 373,702 page faults: `serial.txt:1889`, `:1899`, `:2297`, `:2309`, `:2317`),
+  with 206 imported surfaces (265 MiB; 152 blobs of 1 to 4 MiB where there were 4). The VM's wired memory was 2816
+  MiB of 3584 (2851 at its highest) while the GPU's blobs were 2307 MiB (own 1969, imported surfaces 338:
+  `serial.txt:2305`), and `available` fell to 199 MiB, under the idle threshold of 313 and near the critical 139
+  (`serial.txt:2298`). From there the file cache thrashed: the OS's system disk served 106,931 to 151,090 requests of
+  about 4.7 KiB each every 10 s (0.5 to 0.7 GiB read again and again), its callers waited up to 5.3 s for the disk's
+  gate (`serial.txt:2302`, `:2379`), and jetsam killed 544 processes in the session: 428 idle exits, 23 for
+  vm-pageshortage (each with `available` under the critical 35,696 pages), 15 for fc-thrashing, 11 for
+  vm-compressor-thrashing, 67 long-idle exits (the causes by the order of the kernel's own table in
+  `xnu-take15.macho`). The compositor's frames from 09:19:12 to 09:20:22: mean 13.6 to 22.8 ms, up to 23 % over
+  32 ms. The decoders took little: videocodecd 11 to 16 % of a core, WebKit's GPU process 11 to 23 %. At the low
+  resolution (09:20:52 to 09:21:32) the surfaces are small (up to 781 of them in 123 MiB), backboardd stays at 434 to
+  746 MiB, nothing thrashes and it draws about 1,000 frames per 10 s at 4.1 to 5.5 ms. take14 has the same jump (19
+  to 21 blobs of 64 MiB or more, 1499 to 1677 MiB), the first time in the 30 s before its backboardd was killed. **Inferred, not proven:** the 1.0 GiB are the runtime's copies of the video
+  frames (metal2vulkan keeps a shadow image of a two-plane surface, `bridge/patches/0011`; NativeMetal's held imports
+  have "no count or age limit", `NativeBridgeMetalFrontend.mm:1117`); the plug-in's own pool report would say.
+- **The stutter with many GIFs was the CPU and the heat, not memory.** 09:25:22 to 09:25:42: mediaplaybackd 110-119 % of
+  a core with 600,000 unix system calls and 305,000 context switches per 10 s, WebKit 86-98 %, backboardd 81-94 %,
+  WebKit's GPU process 75-77 %, videocodecd 37-52 % (it locked surfaces for the CPU 4,345 times in 10 s: several
+  videos decoding at once, inferred), all six vCPUs at 507-553 % (`serial.txt:5101`-`5130`, `:5159`-`:5163`);
+  `thermal.txt` has both CPU zones at 102 to 105 °C and the prime cluster down from 4.47 to 3.5-3.8 GHz under an
+  unchanged limit. `available` was 487 to 619 MiB, no process was killed between 09:24:22 and 09:28:32, the system
+  disk read 56 to 125 MiB per 10 s. take14 has the same storm at 00:49:02 (mediaplaybackd 104-128 %, 103-105 °C).
+- **The five freezes of the web game are not in the 10 s lines.** 09:30:52 to 09:33:12 (four-way swipes at the screen's
+  middle): no compositor frame over 16 ms in the last run (09:31:52 on), no fence timeout, no kill but long-idle exits,
+  `available` 544 to 635 MiB, the disks quiet. What `thermal.txt` shows: the touch boost ends 1.5 s after the last touch and the
+  game goes on, so about ten times the GPU fell to 160 MHz while 17 to 52 % busy and the prime cluster (vCPUs 4 and
+  5, `boot.sh:263`) to 1.02 GHz; once (09:31:41) the GPU did nothing for two samples. Whether those are the freezes is not known: a zero-code test is the game under `--gpu-floor 607
+  --cpu-floor 40` in place of `--touch-boost`.
+- **The touch boost: faster frames beside it, not proven to be its doing.** The compositor's submissions, all rounds
+  of 150 frames or more: take13 mean 7.5 ms, 24.8 % over 8 ms, 7.7 % over 16 ms; take14 7.0 ms, 24.9 %, 5.8 %; take15
+  5.6 ms, 16.3 %, 4.0 % (4.8 ms, 11.7 %, 2.0 % without its 32 thrashing rounds, which take13 and take14 cannot be
+  split by: they have no memory lines). Other screens, so not like for like; and take15's own split does not confirm
+  it: the 47 rounds with the GPU at 607 MHz in 70 % or more of their samples have 4.6 ms and 9.3 % over 8 ms, the 5
+  rounds under 30 % have 4.2 ms and 9.8 %. Its cost shows only in the clocks: the GPU at 607 MHz in 59 % of take15's
+  samples (1 % in take14), the prime cluster at its 1.96 GHz floor in 43 %; with no touch both are back at their
+  lowest (the idle minute at the end: 222 MHz, 1.02 GHz). Both sessions ran on the charger, so the battery's current
+  says nothing, and take15's heat is its thrashing and its storm (96 and 103-105 °C at the CPUs then, 57-67 °C in the
+  game and in Settings).
+- **Why jetsam took backboardd in take13 and take14: it runs in band 30.** take15's only two band lines:
+  `SpringBoard[32] 180 -> 160 ... by launchd[1]` and `backboardd[54] 180 -> 30 (requested 30, assertion 0) by
+  xpcproxy[54]` (`serial.txt:655`-`656`), and every daemon killed has `requested 30`. The OS image's own list,
+  `/System/Library/LaunchDaemons/com.apple.jetsamproperties.V54.plist`, gives backboardd 170, accountsd and
+  mobileactivationd 180, locationd and healthd 140. launchd finds that file by the sysctl
+  `hw.jetsam_properties_product_type` (its strings; "sysctl hw.jetsam_properties_product_type was not set"), which the
+  kernel answers from `/product` `jetsam-properties-product-type`, else from the root's `target-type` (read in
+  `xnu-take15.macho`: `sysctl_load_jetsam_properties_product_type` looks up "/product" and that property). This VM's
+  tree has neither (`xnuloader-crosvm` sets `model` only; `kernel-take15-nomic.img.adt`), so launchd has no list. In
+  take13 (three times) and take14 (once) backboardd's exit reason was jetsam's code 4, vm-pageshortage
+  (`sheng-exit: backboardd[54] status 0x9 reason ns 1 code 0x4`: take13 `serial.txt:2443`, `:2728`, `:3337`, take14
+  `:2898`). **Inferred:** it was taken because band 30 is the lowest band that is not idle and backboardd, which never
+  leaves it, is its oldest member; in take15 a process of band 0 or 10 was there at each of the 23 kills.
+- **The fix, behind an option: `xnuloader-crosvm --jetsam-product V54`** (`xl_machine.jetsam_product`): the tree's
+  `/product` gets `jetsam-properties-product-type = "V54"` and nothing else changes (no `target-type`, so
+  `hw.targettype` stays empty; the label and `OUT.disks` are the same). Without the option the tree is as before.
+  Tested on the PC: `make -C runtime/loader test` (the property alone and with its NUL, the tree otherwise byte for
+  byte the same, an identity tree's own name kept or replaced, names that are no part of a file name refused; and the
+  tool itself on the generated kernel, `tests/test_crosvm_tool.sh`). **Not run on the phone.** What proves it there:
+  `oneios-band: backboardd[N] 180 -> 170 ... by xpcproxy[N]` and kills with `requested 140` or `180` instead of 30.
+  What to watch, since the list is more than bands (the hosted kernel's tree carries `target-type` V54, the boot
+  contract's `adt.root`, so the list is what the hosted path is meant to run with; whether its sessions loaded it
+  was not read, and the native VM never has): (1) its memory limits are made for a phone with 12 GB
+  whose GPU memory is not the process's (`iconservicesagent` 15 MiB when inactive: here it had 66 MiB of GPU blobs
+  and a footprint of 39 MiB when it was idle-killed): `oneios-jetsam: kill ... cause 7` (per-process-limit) or `2`
+  (highwater) would be new; (2) `RecoverOnCrash` for backboardd, SpringBoard, runningboardd and configd: the image
+  set's root is sealed, so the key is as Apple set it, and launchd restarts the guest after three crashes of one of
+  them in 60 s (`boot-contract.json` notes; `userland/roottweak/tweaks.py` `launchd_crash_policy`), where today a
+  killed backboardd only comes back; (3) `DisableAllowed = false`: four jobs the launch policy disables run all the
+  same (`com.apple.OTATaskingAgent`, `com.apple.diagnosticextensionsd`, `com.apple.mobile.softwareupdated`,
+  `com.apple.symptomsd-diag`: the contract's `force_enabled`); (4) its `System` keys `KernelHighWaterMark` 78 and
+  `UserReclaimableLimit` 62, whose meaning was not read: take15's wired memory was 79 % of the RAM in the 1080p
+  rounds. The Image without the option is the way back.
+- **A smaller list for this VM: `--jetsam-product V54O` (2026-11-27; the script and its tests ran on the PC, nothing ran on
+  the phone, and no os.img has the file yet).** V54's memory limits are a 12 GB phone's (24A446: cameracaptured 4310 MB soft,
+  videocodecd 3060, mediaplaybackd 2300, WebContent 2048 hard, Games 8192) and the VM has 4352 to 4608 MiB.
+  `userland/jetsam_derive.py V54.plist --out-dir DIR` (Python 3.11; `python3 -I userland/tests/test_jetsam_derive.py`) writes
+  `com.apple.jetsamproperties.V54O.plist` from the OS image's own V54 file (`oneios-tool image apfs-copy`; the image is only
+  read), the same bytes every time. Memory limits (keys ending in `HardMemoryLimit` or `SoftMemoryLimit`) of 200 MB or less
+  stay; above that they are 0.4 times, not under 200 MB (2048 becomes 819, 4310 becomes 1724, 8192 becomes 3277); -1 stays;
+  backboardd, SpringBoard, their renderers (SwitchBoard, SBRendererService, PosterBoard, the widget renderers) and every
+  `RecoverOnCrash` entry stay whole; bands and all other keys are untouched; and the `InactiveHardMemoryLimit` of
+  iconservicesagent (15) and MapKit's snapshot service (14), which the last session's per-process-limit kills hit with
+  footprints of 15-46 and 16-20 MiB, is raised to 64. On 24A446's list that is 285 limits in 171 entries (`--threshold 64
+  --floor 64`: 601). **It needs a staged os.img that has the file**: launchd reads
+  `/System/Library/LaunchDaemons/com.apple.jetsamproperties.NAME.plist` of the OS volume (first the same name in
+  `/AppleInternal/Library/LaunchDaemons`; read in its disassembly), the image set never changes that volume and 24A446's
+  os.img has V54 only, so an Image made with `--jetsam-product V54O` today gets no list, as without the option. The
+  binary list is written by Python's plistlib, which launchd has not read yet (`--format xml` is the fallback).
+  - **Putting the file into os.img (nothing of this is built or tested).** `oneios-tool image` only reads APFS, so a writer
+    comes first: an in-place add in `oneios-tool image`, to be checked with `apfs-ls`, `apfs-copy` and apfs-fuse, or a Mac's
+    `hdiutil` (an iOS system volume may not attach read-write there: not tried). The file goes in as 0:0, 0644, like V54's.
+    The volume has no seal flag (`apfs-info`: `sealed: false`; the two cryptex volumes have it), so no root hash changes,
+    and the static trust cache needs nothing: a list is no code. Then `oneios-tool image hashes` of a copy of os.img (the
+    set's is a hard link of `inputs/`); the manifest's two entries, `os.img` and `os.img.hashes` (`phone manifest DIR --out
+    FILE` edits the phone's, or by hand as take18 did for owner-trust.json; `image manifest` redoes the whole set and
+    refuses an os.img that is not the fetch's); every Image again with `xnuloader-crosvm --image SET`, on a set that has
+    the three new files (the kernel checks each 1 MiB chunk of os.img against the hash list in the Image's node; the size,
+    so every `.disks`, stays; `image verify` refuses links, so it wants real files); and one `phone stage image DIR` with
+    `os.img`, `os.img.hashes` and `manifest.json` (not also `phone manifest --stage`, which pushes the same files again):
+    10,359,930,880 bytes over adb, and /data needs about 21 GB free beside the staged file while it runs (the pushed copy in
+    `/data/local/tmp/oneios-stage-tmp` and its `.part`). The Data store and `data.seed` do not depend on os.img.
+  - **Without a new os.img (read in the code, not run).** (1) The GPU addon has a second mount: `native_gpu_addon_prepare`
+    (hosted 0031, the native kernel's 0076) shows `/private/var/ngpu/daemons` over `/System/Library/LaunchDaemons`, before
+    launchd, as it shows `/private/var/ngpu/addons` over `/System/Library/Extensions` (a read-only bindfs union:
+    [gpu.md](gpu.md) "How iOS finds the plug-in"), and the blob that `xnuloader-crosvm --gpu-addon` puts in the Image
+    (NGPUADD2) is a list of relative names that the kernel writes under `/private/var/ngpu` (`userland/metal/build.sh addon`
+    packs `addons/...`). A blob with `daemons/com.apple.jetsamproperties.V54O.plist` besides the plug-in's files would put
+    the file there: no os.img, no seed, no kernel change, if UniXNU's installer (`native_gpu_addon_install`, not in this
+    tree) takes a `daemons/` name. Not read: that; whether the union over LaunchDaemons works on the native kernel (the
+    addon path never ran there, the bench stops before launchd, and a failed mount could hide every job plist); the blob
+    must keep the plug-in's files, since any blob makes the kernel mount `/private/var/ngpu/addons` in place of the seed's
+    folder, so the oldmetal Image cannot have it. (2) launchd's own overlay, `Bootstrap.SupplementalJetsamProperties`
+    (`/System/Cryptexes/Supplemental/System/Library/JetsamProperties/com.apple.jetsamproperties.cryptex.plist`; the link
+    points into `/private/preboot`, which the kernel takes from the Data volume). From the disassembly: it is read after
+    the base list, each label in it replaces that label's whole entry, `Global` is skipped, and only when one byte of
+    the comm page (`0xFFFFFC342`) is not 0. Whether our kernel sets it, and how the file would get into the Data store,
+    was not read.
+- **What would help the 1080p lag, in this order** (the option above is not one of them: it is for the kills of
+  backboardd): a VM with more RAM (an Image with `--ram-mib 4608` needs 2288 pool pages, `vmboot.rs` `(ram - 32 + 1) /
+  2`, and take8's pool reached 2304; with One UI down the phone had 4.7 GB free beside the pool, `run.txt`); a bound
+  on the frames the plug-in keeps (its build is the macOS runner's). The hardware decoder would only take the
+  decoders' 11 to 23 % of a core, and its buffers come out of the guest's RAM: crosvm f7c6ce8 has `--virtio-media
+  kind=decoder,uid=N` (a helper under an app's uid over MediaCodec; on Gunyah it refuses to start without
+  `--pre-alloc media-host-mb=N`) and no `--virtio-mmio-media`. The guest's side exists upstream for the MMIO
+  transport (UniXNU-droidvm `DroidVMVirtioMedia.c`, `DroidVMVTParavirt.cpp`, `DroidVMVTHost.cpp`: VideoToolbox's
+  paravirtualized decoder and encoder) and here as the hosted kernel's codec archive
+  (`kernel/patches/oneios-hosted/codec`). Since take18b (2026-11-26) the native kernel has it, on crosvm's PCI and
+  with this tree's edits for crosvm's decoder (`docs/hardware.md` 7g, `codec/README.md`), behind `xnuloader-crosvm
+  --media` (the node, crosvm's media_host pool, `oneios-codec=1`) and `phone vm-boot --video-decoder` (crosvm's
+  `--virtio-media kind=decoder,uid=N`; the pool is checked in crosvm's tree), all off by default. Still missing: the
+  proof on the phone, and first that the codec services answer crosvm's helper while One UI is stopped.
+
+## What take16's lines say, and the lines take17 adds (2026-11-26)
+
+take16 (`logs/pa3q-vmboot/take16`, 13:24 to 13:36: `kernel-take16-4608-v54.img`, 4608 MiB, 6 vCPUs, the jetsam
+properties V54, the panel at 120 Hz for the whole session, `display.txt`) is the first session at 4608 MiB and with
+the V54 list. The owner: better; the Wi-Fi network was remembered; Voice Memos does not record; the web game lags
+more at its start, then is steady, and freezes when a double tap starts the skateboard and when the player runs into
+a train; YouTube at 1080p holds better, but the picture goes black for a couple of seconds with the sound going on,
+comes back and goes black again; the GIFs lag only much deeper into the page. The report rounds are 63, the first
+at 13:25:17 and one every 10 s (local time; `crosvm.log` is in UTC, an hour behind). Which screen a round belongs to
+is read from its busiest processes.
+
+- **The checks.** No crash exit (`sheng-exit`: none). jetsam: 169 kills, all in band 0: 128 long-idle exits (cause
+  17), 34 idle exits (9), 4 for vm-compressor-thrashing (11: batterytrapd twice, keybagd, callhistoryd) and the three
+  the V54 list's limits made, as the section above foresaw: high-water (2) for MapKit's SnapshotService (19.9 MiB of
+  14) and iconservicesagent (36.6 MiB of 15), per-process-limit (7) for iconservicesagent (18.1 MiB of 15)
+  (`serial.txt:2333`, `:2335`, `:4916`). The bands are the list's: `backboardd[55] 180 -> 170`, `SpringBoard[32] 180
+  -> 160` (`:662`-`663`), and backboardd was never killed. `available` 473 MiB at its lowest (critical 180, idle
+  405, soft 676), wired 3081 MiB at its highest. The pool: `large-page coverage: 4594 / 4594 MB (100.0%)`
+  (`crosvm.log:20`); what was left of it after the run is in no log. `perf.txt` and `pace.txt` hold "No such
+  file": the per-stage counters never ran (`oneios-gpu-stages=1` was not in the Image).
+- **The microphone: its stream was given up at boot, and iOS never started the device.** crosvm opened the phone's
+  output at 12:25:02.21 and its input at 12:25:12.25 UTC (`crosvm.log:58`, `:61`): the input's PREPARE took 10 s, as
+  in take7, the guest's wait for a control request was 2 s, so the boot line is `virtio-snd up: output stream 0,
+  input stream -1 x1` (`serial.txt:159`) with `+1 errors` in the first audio line (`:388`), and no period was taken
+  from the device in the session. That alone makes a recording silent. Apart from it, the Mic device's engine did
+  not run for a recording: the two engines took 68,470 periods in the session and the speaker's own count is 68,459,
+  so the Mic's had 11 periods (55 ms) at the very most (the two counters are not taken at the same point of a
+  start), and each of the 19 half-minute lines has `mic idle`. In the rounds with Voice Memos in
+  front (13:33:27 to 13:33:57, `:4336`, `:4399`, `:4470`) the selectors are the speaker's starts and stops (`last
+  1`, `0`, `2`) with `3 clients (+0 opened)`: the three clients are the ones the audio server opened at boot
+  (`:984`, `+7 selectors, +11 maps`, one count for the three devices). Why iOS did not start the Mic is **not found**:
+  it is in iOS's own log, in the VM's data image, which could not be read (the phone was not on adb when this was
+  written). The host's side: crosvm warned of an empty read four times in the session (`AAudio stream read data
+  not enough. frames read: 0`, `crosvm.log:62`-`65`), so, **inferred**, the phone's input gave frames after its
+  first seconds, with `capture=false` on crosvm's line and One UI stopped; whether they were sound no line says.
+- **The black picture of YouTube at 1080p: the compositor's GPU memory fills the whole GPU address range of its
+  context, is let go at once, and fills again.** crosvm's renderer gives every context 2 GiB of GPU addresses (`VA
+  slices: 64 x 2GB`, `crosvm.log:47`). When the video started backboardd's blobs went from 513+85 MiB to 1730+298
+  MiB in one round (13:28:57, `serial.txt:2296`, `:2356`: 2028 MiB of the 2048; take14's highest was 1906, take15's
+  1987), and then they fell and rose five times in three and a half minutes: 1207 and 841 MiB (13:29:07 and :17),
+  1682 (13:29:27 to :57), 373 (13:30:07), 1281, 1395, 1683, 1688+320 (13:30:17 to :47), 376 (13:30:57), 1648
+  (13:31:37), 1301 (13:31:47), 1585 to 1615 (13:31:57 to 13:32:27), 387 (13:32:37). While they were full the VM's
+  wired memory was 2869 to 3081 MiB and `available` 473 to 648 MiB, under the soft threshold of 676: the memory
+  pressure level is then `warning` (this kernel: under the soft threshold, and `normal` again above 115 % of it, 777
+  MiB), and only the releases took `available` back over that (1027 to 2105 MiB after them). In the rounds of a
+  fill the decoder did little, videocodecd 7 to 19 % of a core (13:28:57 to 13:29:17, 13:30:17, 13:31:37 to :57)
+  against 60 to 80 % in the six rounds it played through, with 343 and 350 swaps and 76 and 99 pauses in the first
+  two (`:2392`, `:2449`), while the speaker's engine took its 2000 periods a round in most of them (`:2399`,
+  `:2460`, `:2593` to `:2895`, `:3707` to `:3884`). **Inferred, not proven:** the picture is
+  black while the plug-in's copies of the video's frames (the section above) are made again after a release, and a
+  release is either (a) the plug-in's answer to the memory warning, which a process is told again every 25 s or so
+  while the level stays (`WARNING_NOTIFICATION_RESTING_PERIOD`), or (b) its answer to an allocation that fails at
+  the range's end. No line says which: no refusal, no fence timeout, and neither the level's changes nor the
+  moments of a release were written. Not memory in the sense of take15: nothing thrashed and nothing was killed
+  for a shortage. **Not fixed in take17:** a bound on the frames kept is the plug-in's (its build is the macOS
+  runner's), a larger slice the host renderer's. The renderer on the phone is Droid-VM's prebuilt
+  `libvirglrenderer.so` (the same file in both prebuilt sets, `dl/droidvm-prebuilt`), which cuts 64 slices of 2 GiB
+  from the 128 GiB range; the copy of Droid-VM's renderer source on the PC (`dl/virglrenderer-src`, fetched
+  2026-11-24, its commit not recorded) cuts 32, "not the bitmask's 64: ... An iPadOS render server at 2048x2732 held
+  1.8 of a 2GB slice at an idle home screen, and the next BO its turnip made found no range: the device was lost",
+  which on this phone would be 4 GiB a context. So a renderer built from that source, or Droid-VM's next prebuilt, is
+  the fix for (b); neither was built or tried here. `NCTX_RELAX_SLICE` in the renderer's environment only widens the
+  host's check of a guest address from the context's slice to the whole range (`kgsl_relax_slice_checks`); the
+  guest's Turnip is still told its slice, so it is not a way to more room. What a session can do without code: the
+  VM's screen is 720 pixels wide, so 720p is all it shows, and at that size the copies fit (take15: 434 to 746 MiB).
+- **The web game's freezes are single long gaps, which the 10 s lines only count.** 13:26:07 to 13:28:37: 417 to 689
+  swaps a round after the first two, 1 to 25 pauses a round, WebKit's web process 25 to 72 % of a core and its GPU
+  process 34 to 77 %, `available` 975 to 1404 MiB (no pressure), the CPU zones at 67 °C on average, no fence
+  timeout. The display's own line has one flush of 739 ms (the round to 13:26:47, `serial.txt:1599`) and one of
+  115 ms (`:1902`): freezes, and nothing says which process had the CPUs in them or whether the GPU's clients
+  submitted. The rounds before the game (to 13:25:47 and :57: SpringBoard, the icon service, Safari's launch) have
+  flushes of 384 and 256 ms (`:1179`, `:1313`), and the game's third round, to 13:26:27, has 14 pauses and 71 swaps
+  more than two refreshes apart (`:1479`); which of these the owner's "more lag at the start" is, they do not say.
+- **The GIFs: the CPU and the heat again, later because of the RAM.** The rounds to 13:32:47 through 13:33:17 and to
+  13:34:17 through 13:34:37: mediaplaybackd 83 to 122 % of a core, WebKit's web process 76 to 100 %, backboardd 44
+  to 96 %, WebKit's GPU process 46 to 80 %, videocodecd 18 to 40 %, the six vCPUs at 366 to 500 % of 600
+  (`serial.txt:4034`, `:4100`, `:4159`, `:4219`, `:4595`, `:4645`, `:4713`); `thermal.txt` has a CPU zone at 100 °C
+  or more in 21 of 32 and 19 of 24 samples of those windows (103.9 and 105.8 °C at the highest; the zones' mean was
+  67 °C in the game and 75 °C in the 1080p rounds). `available` 673 to 1168 MiB: at 3584 MiB take15 was at 487 to
+  619 there. No fix in take17 (the directions are the section above's: the hardware decoder, fewer wake-ups).
+- **Also in the log.** aonsensed is started about every 10 s (some 50 times) and seputil 26 times (71 and 75 in
+  take14 and take15): candidates for the disabled jobs, their labels not checked. The haptics' counter line was cut
+  at the console's 255 bytes (fixed below).
+
+### take17: the microphone's stream, and lines written as things happen
+
+Built on the PC and booted on the bench; **not run on the phone**. The patch and the Images are in
+`/mnt/giochi/Linux/oneios/take17/` (README.txt there has the recipe and the hashes).
+
+- **The microphone's stream (fixed).** The native kernel's transport sets the input up in a thread of its own with a
+  wait of 60 s, one control request at a time; the microphone starts only when its stream is ready; receive chains
+  are posted by slot; a START without an answer in 2 s has its answer waited for (13 s more), a refused one is
+  stopped and started once more. The whole of it, the lines and how to read a recording that fails:
+  `docs/hardware.md` section 6, "The native VM's microphone". `oneios-audio-mic-selftest=3` in the Image records
+  three seconds and then one straight off the transport at boot: it says whether the phone gives sound before
+  iOS's audio stack is asked anything. `vm-boot --mic-capture` passes `capture=true` to crosvm, for a self-test
+  that says digital silence.
+- **Why iOS does not start the Mic: lines, since the cause is not in the logs.** `DroidVMAudio: mic: opened N by
+  NAME[PID]`, `StartIO`, `StopIO`, a refused rate or format, and every 10 s in which the device was touched two
+  `ONEIOS AUDIO: mic: 10 s:` lines (the clients, the selectors seen since boot, the engine's periods; what the
+  device gave and whether it was sound). No `StartIO` line while Voice Memos records is iOS's own decision: then
+  the unified log of that boot is the place (`oneios-tool phone pull-data --vm` before the next boot, `oneios-tool
+  ioslog show DATA.img --boot last`).
+- **`oneios-hitch`** (the web game's freezes): a gap of 150 ms to 5 s between two swaps that came right after
+  frames is two lines, written within 200 ms of its end, with the time of day: how long, whether one process, the
+  CPUs or nothing was busy in it, what the GPU's clients submitted, and the busiest processes with their
+  milliseconds (a sampler thread notes every process's CPU time each 100 ms while swaps come). A freeze with
+  WebKit's web process busy for its whole length is the page's script; with its GPU process busy and no
+  submission, a shader or pipeline being made; with nothing busy, a wait. The names are cut at 16 characters, so
+  both of WebKit's read `com.apple.WebKit[PID]`: the round's `oneios-cpu:` line has the PID with its longer name.
+- **`oneios-gpu-room`, `oneios-pressure`, `oneios-video`** (the black picture): a client's blobs against a context's
+  part of the GPU addresses (2048 MiB, the slice the phone's crosvm cuts; `oneios-gpu-room-mib=N` for another: the
+  kernel sees only the DRM capset, which names the device's whole 128 GiB, said once), a line when a client passes
+  90 % of it and when it lets go of an eighth of it or more, each with the
+  second; the memory pressure level as it changes (kernel patch 0087, which also ends `oneios-memory` with the
+  level); and for each second a video decoder locks surfaces, and five more: the decoders' locks, the swaps,
+  backboardd's blobs against its range, `available` and the level. With the usual Image these give each black
+  picture its second and what came before it (a second of black is `decoder locks +0` or few), but they cannot tell
+  (a) from (b): at 4608 MiB the level is `warning` for the whole time the blobs are full (take16: 473 to 648 MiB
+  available, never back over 777), so a release at 97 % or more with the level `warning` is what both give. The
+  Image with `memorystatus_pressure_threshold_mb=430` tells them apart (the soft threshold just over the idle one,
+  so that those 473 to 648 MiB are no warning; a stock boot argument): the level stays `normal`, and then a picture
+  that stays is (a), the warning's release (the fix: that threshold, or a bound in the plug-in), and `let go` near
+  100 % with the level `normal` and the picture black again is (b), the slice (the fix: a renderer with larger
+  slices).
+- **`oneios-clock`**: the first line of each 10 s report, the time of day in UTC and the seconds since boot, with
+  the sampler's own cost (`the sampler: W walks, C us of CPU, M ms from start to end`). A walk reads each task's own
+  time sums (`recount_task_times`: no lock, no walk of its threads; the first version asked TASK_POWER_INFO, which
+  takes the task's lock and each thread's, ten times a second). `oneios-watch=0` leaves the sampler out.
+- **The haptics' counter line** is two lines now: as one it was over the console's 255 bytes, so take16's log has it
+  without its bridge part and with the next line begun in it (`drivers/haptics/oneios_haptic.c`).
+- **The bench has a sound card**: `xnuloader-qemu --audio` (`AUDIO=1 scripts/qemu/boot-vm.sh`) puts QEMU's
+  `virtio-sound-device` on the next virtio-mmio transport with `-audiodev none`, which plays into nothing and
+  records silence at once.
+
+## take18: the host renderer from source (Droid-VM/virglrenderer 2529a9f, 2026-11-26)
+
+The renderer in crosvm's process (`libvirglrenderer.so`, drm2kgsl in it) was the prebuilt of both Droid-VM package
+lines, virglrenderer cd71ea4 of 2026-09-01. take18 builds Droid-VM's newer source with the NDK,
+`scripts/droidvm/build-virgl.sh` (Android.bp's source list and `prebuilt-intermediates/config.h`, as their AOSP build;
+libepoxy 1.5.10 linked in; no libcutils: its one function, `property_get`, is a 10-line shim over bionic's), and
+`vm-boot` pushes it in the package's place (`--virgl`, `--virgl prebuilt` for the old one: tools/oneios-tool/README.md).
+Built: `/mnt/tkg-build/oneios/dl/droidvm-prebuilt/virgl-2529a9f/libvirglrenderer.so`, 4181576 bytes, sha256
+`3c1b261f09e315af8e4539988f4b3a1abe0c2fa26436bf657fb82c16312fc818` (the same from two clean runs).
+
+Which line: wip/hackintosh 2529a9f (2026-11-13, the line of their XNU guests) = their main line droidvm 899a4e1 plus
+the macOS branch. Over cd71ea4 it has, by commit:
+- 6536a4a: 32 GPU address slices instead of 64 (take17's crosvm.log: `VA slices: 64 x 2GB over VBO 0x2000000000`): a
+  context gets 4 GiB of this phone's 128 GiB range (6 GiB where KGSL grants the 192 GiB rung). This is the fix (b) of
+  "What take16's lines say": backboardd filled its 2048 MiB during 1080p video. take17 never used more than 15 slices
+  at once (slice 14 its highest), so 32 leaves room.
+- 6e0d606 (the Adreno 830's submit IB descriptors kept inline, 82 at most a submission), c64c98a (no chunk count
+  underflow for an empty IB list), 439a492/7e17c8e/0d93dfa (a guest that asks gets its context's GPU faults and resets
+  counted: our guest's Turnip asks, so after a GPU fault it now loses its device instead of drawing nothing;
+  take17's logs have no GPU fault), 735e693/b743904 (a freed guest-allocated BO unbound in every context), 7e84c44
+  (KGSL timestamps per queue with split submissions), d31f45b + the merge (the rate-window power floor), e68e95d and
+  0682b30 (a deadline queue's context at the GPU's top level, and the vCPU threads' uclamp.min at 1024, while it
+  animates at 60 submissions a second or more: our guest's Turnip asks for a deadline queue for a queue of high or
+  realtime priority, `turnip-darwin-deadline-queue.patch` of the kernel base's Mesa list), 5faa56f (the ring of each
+  priority), 899a4e1 (a new thread takes the process's CPUs), 5469ef0 (the chip id as KGSL gives it: 0x44050001 on
+  this phone instead of 0x44050000; the guest's Mesa, mesa-droidvm cecc0e9, has both: `0xffff44050000` and
+  `0x44050001` in one entry, so the device is the same).
+- Off unless asked (unchanged): DRM2KGSL_PRIORITIES, DRM2KGSL_NONCOHERENT, the stream check and the retire delay
+  (their files under /data/local/tmp), CROSVM_DRM2KGSL_DIAG (`1` only).
+- The ABI: `virglrenderer.h`, `virgl_hw.h`, `drm_hw.h`, `msm_proto.h` and `msm_drm.h` are cd71ea4's; only
+  `virgl_protocol.h` has two new opcodes (Windows guests). The build checks that the .so exports all 33 `virgl_*`
+  functions the prebuilt crosvm imports. NEEDED: liblog, libm, libdl, libc (the prebuilt also had libcutils and
+  libc++).
+- Switches: `vm-boot --virgl prebuilt` (all of it back), `--gpu-host-floors off` (the floors and the clamp off:
+  `NCTX_PWR_CONSTRAINT=0 DRM2KGSL_PWR_CONSTRAINT=0 DRM2KGSL_VCPU_UCLAMP_MIN=0`), `--crosvm-env NAME=VALUE`. take19:
+  the default is `--gpu-host-floors deadline` (`NCTX_PWR_CONSTRAINT=0` only: the compositor's deadline constraint and
+  the clamp stay); `--gpu-host-floors on` is take18's session.
+- Not tested on the phone (not touched in this work). On the PC: the build, the link with `-z defs` against API 35's
+  libraries, the export check, and oneios-phone's tests. The first check on the phone is
+  `oneios-tool phone droidvm-crosvm --dir /mnt/tkg-build/oneios/dl/droidvm-prebuilt/f7c6ce8 --virgl
+  /mnt/tkg-build/oneios/dl/droidvm-prebuilt/virgl-2529a9f/libvirglrenderer.so` (no CANNOT LINK), then a session;
+  crosvm.log then says `VA slices: 32 x 4GB` (or 6GB) and `DRM2KGSL_PWR_CONSTRAINT: queues that ask`.
+
+## take18b: crosvm from source (opt-in, Droid-VM/crosvm wip/hackintosh da647254c + samfor12 e7c1316, 2026-11-27)
+
+The VMM stays the package's prebuilt (DroidVM-Prebuilt-Root f7c6ce8, built by Droid-VM from crosvm 0f2db62ae + wip/vpu)
+unless `vm-boot --crosvm FILE` (or `phone droidvm-crosvm --crosvm FILE`) names another; `--crosvm prebuilt` is the
+default. take18b's build (`/mnt/giochi/Linux/oneios/take18/upstream/artifacts/crosvm/crosvm`, sha256 `2009d576...9520`,
+17641416 bytes, stripped; `build-crosvm.sh` there rebuilds it from pinned commits with cargo and the NDK r28c outside
+AOSP; its REPORT.txt is the whole account) is Droid-VM/crosvm wip/hackintosh da647254c (2026-11-18: the 57 commits after
+0f2db62ae, among them da64725's PCI BAR moves, a569df4's simplefb without the cache walk and the virtio-snd/AAudio fixes
+a88e7c1, 13abbc1, 746434e, 1ee4dc8, d7fdd30, 14084603f) with samfor12/crosvm e7c1316 ("rutabaga: reset each resource
+through the component it belongs to") picked on top, the same per-crate features as Droid-VM's
+`crosvm_device_only/Android.bp`. It replaces the package's `crosvm` alone: the package's libvirglrenderer.so (or take18's
+2529a9f, `--virgl`), libgfxstream_backend.so and libvncserver.so stay beside it (RUNPATH `$ORIGIN:$ORIGIN/../../lib64`
+as f7c6ce8's), and libvulkan_freedreno.so too (loaded by `CROSVM_DISPLAY_VULKAN_LIBRARY`, not linked). libc++ and libbase
+are linked in.
+- ctx-0 blobs (the kernel's scanout resources): accepted, as f7c6ce8 does and the main line 82c59c2 does not.
+  `devices/src/virtio/gpu/virtio_gpu.rs` `resource_create_blob`: a blob with a guest handle gets its udmabuf and, for any
+  blob_mem but HOST3D, its iovecs too, so a GUEST blob hands virglrenderer its pages (82c59c2 does it for HOST3D_GUEST
+  only, and virglrenderer then gives EINVAL). e7c1316 touches only `Rutabaga::reset()`.
+- Checked on the PC: every one of its 573 imports resolves against Android 17's own libraries (the arm64 emulator image)
+  and the package's three, at the right symbol versions (5 optional weak hooks of BoringSSL and zstd absent, as allowed);
+  its calls into libvirglrenderer (33), libgfxstream_backend (29), libminijail (33), libcap (5) and libvncserver (25) are
+  f7c6ce8's; under qemu-aarch64 with Android 17's loader `--help`, `version` and `run --help` run (162 `run` options,
+  f7c6ce8's 155 all there); vm-boot's whole command line (GPU with udmabuf, the display service, AAudio, touch, serials,
+  disks, `--virtio-media`) parses and stops where f7c6ce8 stops on a PC, at "failed to open Gunyah device".
+- What changes against f7c6ce8, to watch in its first session: AAudio's output opens in POWER_SAVING unless an endpoint
+  names `performance=` (13abbc1: f7c6ce8 left the platform default), so expect bigger bursts and more latency (the knob is
+  an endpoint table, `host_device=...#performance=low_latency` with `device_table=FILE`, not tried); output through a data
+  callback over a ring, and a START that waits for playback; crosvm raises RLIMIT_NOFILE itself; device workers take the
+  process's CPU set (47cd593ee); BAR moves that overlap are held, not dropped (da647254c). crosvm's PCI placements are its
+  own, so the Image's `--gpu-intid` and `--audio-intid` lines are per crosvm build: vm-boot checks both against the
+  interrupt-map this crosvm writes and stops the VM on a mismatch.
+- Not run on the phone. The first check there is `oneios-tool phone droidvm-crosvm --dir
+  /mnt/tkg-build/oneios/dl/droidvm-prebuilt/f7c6ce8 --crosvm /mnt/giochi/Linux/oneios/take18/upstream/artifacts/crosvm/crosvm`
+  (no CANNOT LINK, its `run --help`), then a session with `vm-boot --crosvm` the same file; `--crosvm prebuilt` (or no
+  switch) is the way back, one push of the package's crosvm.
+## What take17's lines say, and what take18 changes (2026-11-26)
+
+take17 (`logs/pa3q-vmboot/take17`, 19:53 to 20:09 local, 18:53 to 19:09 UTC in the lines: `kernel-take17-4352-v54.img`,
+4352 MiB because the pool reached 2223 pages, 6 vCPUs, the panel at 120 Hz for the whole session) with iOS's own log of
+the boot (`data-take17.img`, boot 9938EF18, `oneios-tool ioslog show ... --boot last`; its userland times are squeezed
+into seconds, so its lines are placed by their order and their processes, not their time). The owner: the lock screen
+and the notification shade drop frames, Settings is smooth; the microphone records nothing; the GIF page was slightly
+better but Safari decoded the images again on the way back up; Apple ID sign-in gives "unknown error"; YouTube at 1080p
+never plays (its ad does), at 720p plays a few seconds and the picture goes black with the sound going on; the web game
+froze a little at its start only. Proven below means a line says it; inferred means the lines fit it and none says it.
+
+- **The microphone: iOS's audio router gave every recording route up, because the Mic device had no input data
+  source.** The transport was right this time: `the microphone's stream 1 (x1): ready after 10048 ms`, the self-test's
+  `599 of 600 periods ... 580 with sound ... largest sample 541` and `199 of 200 ... 495` (`serial.txt:406`-`410`).
+  audiomxd opened the Mic (`DroidVMAudio: mic: opened 1 by audiomxd[100]`, `:767`), set its stream active (selector 6,
+  `seen since the boot: 6`, `:1106`) and never asked StartIO. In iOS's log each recording is the same 30 times (Voice
+  Memos three times, Safari's microphone test the rest): VirtualAudio's PlayAndRecord route (`Category: 'cpar'`, the
+  speaker and `source: 'pmbi'; iPhone Microphone; Built-In Microphone`) fails in
+  `SubPortPolicy.cpp:134 ... "Error getting data size of property [ssrc/inpt/0] on device 37."`, then
+  `RoutingManager.cpp:3665 Routing is not supported: attempt to activate the routes failed` and `Route change failed:
+  nort`; Voice Memos' engine then sees an input of no rate (`AURemoteIO.cpp:1142 failed: -10851 (enable 1, outf< 2 ch,
+  0 Hz ...> inf< 2 ch, 0 Hz ...>)`, `VMAudioServiceErrorDomain Code=7`, "Prepare engine failed"), and Safari's capture
+  does not start (`CoreAudioCaptureUnit::start ... AudioOutputUnitStart failed with error -66637`). Device 37 is the Mic
+  and `ssrc` is kAudioDevicePropertyDataSource, which the Mic device did not have. Read in 24A446 on the PC (CoreAudio in
+  the dyld cache, VirtualAudio.plugin from os.img, with `out/bin/ipsw` and llvm-objdump): VirtualAudio's
+  "Setting sub-ports active on device" reads the input data sources as a list (the size over 4) and throws when the
+  property is missing; the HAL serves `ssrc` from the scope's data source control (class `dsrc`, a selector:
+  HALB_Info::TranslateDeviceAddressToControlAddress), whose items are its `selectors` (`value`, `name`) and, for a
+  multi-selector, whose `value` is an array (HALS_IOA2UCDevice::CopySelectorControlInfo_SelectorMap and
+  _MultiSelectorValue); the HAL sets it by SetControlValue (user client selector 2) or SetMultiControlValue (selector 8,
+  the control ID and the values in, the values taken out); VirtualAudio's built-in mic tables pair `mc01` with the
+  bottom mic, `mc02` front, `mc03` back and `mc04` a second bottom one (the IDs 1835216945.. an iPhone's AVAudioSession
+  shows). **Fixed in take18** (`staged/audio.rs`): the Mic publishes that control (input scope, a multi-selector of
+  `mc01` Bottom, `mc02` Front, `mc03` Back, `mc04` Bottom 2, `mc01` selected) and takes selectors 2 and 8 for it,
+  every ID asked (all of them are the one mono stream), with a line for the first 16 changes:
+  `DroidVMAudio: mic: data sources mc01 (1) set by audiomxd[100], set 1: all of them the one mono stream`. **Not run on
+  the phone.** What may come next, if the route still fails: a second missing property, which iOS's log names in the
+  same way (`Error getting ... property [XXXX/inpt/0] on device N`).
+- **The lock screen and the notification shade: the GPU, at a cap of 607 MHz all session.** `thermal.txt` has
+  `cap 607000000 pwr 8 gmax 607` in all 734 samples (take16: `832000000 pwr 5 gmax 832` in all 546): Samsung's
+  `gpu_max_clock`, which One UI's SSRM writes when the phone is warm and which nothing moves while One UI is down (the
+  cooling devices `kgsl` and `gpu` were at 0: `cool -`). In the rounds of the lock screen and the cover sheet the GPU
+  was at its cap and 89 to 99 % busy (19:55:01 to :08 and 19:59:01 to :09 local) and backboardd's submissions took the
+  host over 32 ms 91 and 165 times a round (`oneios-gpu-stages` at 18:55:03 and 18:59:06: `>32 ms +91 mean 13863 us`,
+  `+165 mean 28809 us`, the swaps 67.9 and 68.5 a second), with SpringBoard, PosterBoard's MercuryPosterExtension and
+  the widgets busy; in Settings' rounds the GPU was 0 to 59 % busy and the same counter 0 to 11. So the cover sheet's
+  poster and materials (blurs) are GPU work that does not fit 8.3 ms at 607 MHz (inferred: which pass costs most is not
+  measured). Not chronod: its crash (`sheng-exit: chronod[99] status 0x6`, `serial.txt:811`; the report
+  `chronod-2026-11-26-195446.ips`: `abort()` in `+[CADisplay displays]`, "Unable to query displays from server
+  (-81182718)") was at boot, before backboardd's display server answered, and chronod[168] ran from then on.
+  **take18:** `vm-boot --takeover` lifts that cap by default (the take15 `--gpu-cap-lift`, never run: the nodes are saved,
+  written the top of their tables, written back at every end; `--keep-gpu-cap` keeps the old way); run.txt then has
+  `gpu: Samsung's cap ... lifted to ...`. The next session's A/B for the materials: Settings, Accessibility, Display &
+  Text Size, Reduce Transparency, on and off on the same screens.
+- **YouTube: the network, then the memory and the GPU.** (1) **The Wi-Fi bridge dropped 15 % of the frames for iOS**:
+  `wifi: closed (48714 frames to the guest, ... 0 cut from coalesced frames, 8599 dropped ...)` (`wifi.txt`; take16
+  5197 of 234227, 2.2 %; take15 7410 of 71414; take14 3541 of 71834). The bridge drops a frame for the guest that is
+  over 1514 bytes and not TCP (`br_wifi_segment`); GRO is off on wlan0 and no TCP frame was cut, so these were,
+  inferred, UDP datagrams that the phone's Qualcomm Wi-Fi datapath aggregates itself (its flow aggregation, gso type
+  UDP_L4, whatever GRO is): QUIC, which YouTube, Google and Cloudflare use. A QUIC download that loses 15 % of its
+  packets slows down to a crawl, which fits "1080p loads forever" and the video's source buffer fed in appends of 1176
+  to 9408 bytes (`SourceBufferPrivateAVFObjC::appendInternal ... data length = 3528`, over 2400 of them) while its
+  audio kept playing. **Fixed in take18** (`runtime/bridges/wifi`): such a frame is cut back into its datagrams
+  (`br_wifi_segment_udp`: each `gso_size` bytes, the UDP length and checksum and the IP length made again; host-tested),
+  and every frame that is still dropped is counted by kind, the first eight with what the receive path gave:
+  `wifi: a frame for iOS not handed on (N of the first 8): ... gso type T size S ...` and, at the end, `wifi: closed: N
+  UDP frames cut into datagrams; dropped: ...`. (2) The memory: at 4352 MiB the warning level began under 638 MiB
+  (`soft 638`) and lasted from 19:03:49 to 19:05:07 with `available` 395 to 560 MiB; 86 of the session's 240 jetsam
+  kills (idle exits) fell in the YouTube rounds. (3) The GPU's room, as take16: backboardd passed 90 % of its 2048 MiB
+  six times (most 1910 MiB, 19:05:14) and let go of 1331, 1224 and 856 MiB (19:03:31, 19:05:07, 19:05:25), with no
+  decoder lock in the seconds after each (`oneios-video` 19:03:31-32, 19:05:08, 19:05:25-29): the black picture.
+  (4) The GPU cap above. Not the sampler: `oneios-clock` puts it at 95 to 23857 us of CPU per 10 s (at most 0.24 % of
+  one core). Not the decoder failing: videocodecd took 6 to 37 surfaces a second with no decoder error in iOS's log
+  (the `VTTileCompressionSession -12782` lines are an encoder's). The `oneios-video` lines said `backboardd GPU 0+0 of 0
+  MiB` in all 219: backboardd has a context per connection and the last one, empty, was taken (fixed: its largest).
+- **The GIFs decoded again on the way back up: Safari's own decoded-image budget and the memory warning.** WebKit's
+  web process (pid 683) used 77 to 100 % of a core and mediaplaybackd 96 to 130 % on the GIF page (19:07:40 to
+  19:08:40), and the level went to warning and back four times there (19:07:32, :38, 19:08:17, :47), each answered in
+  the web process (`Received memory pressure event`, `Memory pressure relief` twice). Inferred: WebKit keeps the
+  decoded frames of images near the view only, within a budget that grows with the device's RAM (4.25 GiB here against
+  an iPhone 17 Pro Max's 12), and drops more on a warning; scrolled back, they are decoded again on the CPU. More RAM,
+  fewer warnings and a hardware decoder (the virtio-media bridge) are the ways out; nothing changed for it in take18.
+- **Apple ID: AuthKit's anisette has no daemon.** akd[142]: `ADIGetIDMSRouting failed! Error: -45017` 208 times, with
+  `failed lookup: name = com.apple.adid ... No such process`: `com.apple.adid` is in the base group of disabled jobs
+  (`userland/config/daemons.toml`). An Image with `oneios-enable-jobs=com.apple.adid` would show the next refusal, which
+  is expected in FairPlay or the attestation (featureaccessd already says `AuthKit BAA signer failed: No attestation
+  headers were added by AuthKit`).
+- **Also in the log.** `oneios-granule`: the 16 KB granule is not offered at stage 1 or stage 2 (noted, not pursued).
+  The web game: one freeze at its start, none at the double taps and the crashes (the owner no longer uses it).

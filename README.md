@@ -73,7 +73,9 @@ iOS's own buffers. This is the owner's answer to the hosted path's trap overhead
 
 - **8 vCPUs, 3.5 GiB**, full boot to SpringBoard (steps 1–9 in `docs/native.md`: disks over virtio-PCI, the boot
   video, the lock screen on the panel, touch, the owner's finger, the real clock, the shared GPU pool).
-- **GPU scanout** shown in the Android display through a Turnip blit, **120 Hz**.
+- **GPU scanout** shown in the Android display through a Turnip blit; the guest draws for **120 Hz** (about 100
+  frames a second in a swipe). The panel itself followed One UI's last policy (60 Hz with power saving, take12);
+  from 2026-11-25 the display helper holds it at 120 Hz in a takeover (not yet run on the phone).
 - **Audio**: virtio-snd over PCI → AAudio, speaker with the volume keys.
 - **Wi-Fi for real**: iOS joins a WPA2 network through the phone's own radio and gets a DHCP lease.
 - **Input**: multi-touch, the on-screen keyboard (the dictation loop that pinned a core is fixed), and the hardware

@@ -241,7 +241,28 @@ space in crosvm's CAM (`0x10000 + device << 11`) with its identity, hash list an
 the pool: in a protected VM crosvm reads and writes no other guest memory); the files are the phone's
 (`--phone-image`, default the staged set `/data/local/tmp/oneios/image`; `--phone-data`, default the VM's own store
 `/data/local/tmp/oneios-vmboot/data.img`). `OUT.adt` is the tree it gave the kernel; `OUT.disks` lists the pool's
-address, the store and crosvm's `--block` values for vm-boot. No display yet.
+address, the store and crosvm's `--block` values for vm-boot. The later options (`--display`, `--shared-ram`, `--gpu`, `--gpu-scanout`,
+`--gpu-intid`, `--audio`, `--wifi`, `--media`, `--prime-list`, `--jetsam-product`, `--identity-tree`, `--identity-groups`, `--memory-class`,
+`--soc-generation`, `--display-corner-radius`) are in the tool's header comment and `docs/native.md`. The PCI
+functions' nodes carry no `droidvm,intid` (their lines are crosvm's PCI host's, not the board's), except the GPU's with
+`--gpu-intid N` (`xl_machine.gpu_intid`: crosvm routes 00:0c.0 to INTID 36, which `phone vm-boot` checks in crosvm's
+tree; `docs/native.md` "Flattening the power gap"), and the sound card's with `--audio-intid N,SLOT` (take18,
+`xl_machine.audio_intid`/`audio_slot`: `droidvm,intid` and `oneios,intid-slot` on `/arm-io/virtio-snd`; take17's tree had
+the card at 00:08.0 on SPI 12, so `--audio-intid 44,8`; vm-boot checks crosvm's map for that slot; the kernel uses the line
+only with `oneios-audio-irq=1`, `docs/hardware.md` section 6, "take18: the control replies by interrupt").
+
+`--media [--media-mib N]` (take18b, 2026-11-26; with `--shared-ram`): the hardware video decoder. `/arm-io/virtio-media-0`
+with `compatible` `oneios,virtio-media-pci` is all of bus 0 of crosvm's ECAM (the kernel's codec archive takes the first
+1af4:1070 function there: crosvm's `--virtio-media kind=decoder`, which crosvm places itself) and carries
+`media-host-pool`, crosvm's `--pre-alloc media-host-mb=N` pool (N = `--media-mib`, default 192, even, 16 to 1024).
+crosvm lays its pools out above the block that `--mem` less them makes, in its own order (drm2kgsl_host, then
+media_host, each 2 MiB aligned: Droid-VM crosvm 0f2db62 `aarch64/src/lib.rs` `pool_specs`), so the pool is the RAM's
+last N MiB and, with `--gpu`, the GPU's `drm-host-pool` moves N MiB down; the kernel's window shrinks by the same. The
+boot arguments get `oneios-codec=1 droidvm-vt-paravirt=1` (the archive is off without the first). `OUT.disks` then has
+`media N POOL-PA`: vm-boot always gives crosvm the pool (the layout needs it) and checks its `media_host@POOL-PA` node,
+and gives the device only with `--video-decoder`. The node has no `droidvm,intid` (the transport polls).
+`xnuloader-qemu --media` (`MEDIA=1 scripts/qemu/boot-vm.sh`) puts the same node on virt's ECAM bus 0, with no pool and no
+device behind it (QEMU has no virtio-media device): the bench of the archive with no decoder present.
 
 `--bridge` (2026-11-25): the bridge channel of `drivers/bridge` for that VM, which has no "oneios,bridge" virtio device
 of xnuhost's: `/arm-io/bridge` with `compatible` `oneios,bridge-uart` and, as the console's node, an absolute `reg`,
@@ -249,6 +270,65 @@ crosvm's second ns16550a at `0x2f8` (`xl_machine.bridge_uart_base`/`_size`; refu
 console's own port). The kernel's bridge driver writes its messages there as frames and the phone's end is `bridgectl
 serve` (`docs/native.md`, "The bridge, the remembered Wi-Fi network and the power key in the crosvm VM"). `OUT.disks`
 then has a line `bridge`, by which vm-boot starts that tool and gives crosvm the port as a socket.
+
+`--identity-tree FILE` (2026-11-27; default none): an Apple device's decoded device tree, as `xnuloader-inspect adt` reads it (24A446's
+iPhone18,2, V54, is `out/kernel-inputs/24A446/devicetree.bin`), the source of `--identity-groups`. On its own it copies nothing: the
+tree of the Image is the one without the option, and the layout says so. The tool reads and checks the file before it writes anything:
+a file that is no device tree, or has no `/product`, is status 2 and no Image (a missing file: status 1, as for `--prime-list`).
+
+`--identity-groups LIST` (needs `--identity-tree`; default none): which properties of that tree the machine's own tree takes
+(`xl_machine.identity_product` is the tree, `identity_groups` the mask). Each group is a switch of its own and off unless named. `LIST` is
+comma-separated group names or the letters `a` to `f`, or `all`; a later `--identity-groups` replaces an earlier one; an unknown word
+(an empty one, a capital, a blank) is status 2. The values are the tree's bytes except where said; a property that is a placeholder
+(`syscfg/DClr`) is skipped; no child node (`iopm`, `camera`, ...) is ever copied; `/product` keeps its `product-name` ("OneiOS
+guest"), `model` and jetsam name. The groups, and what the V54 tree gives them:
+
+- `a` `artwork`, `/product`: every `artwork-*` but `artwork-display-gamut` and `artwork-scale-factor` (V54: `artwork-device-idiom`,
+  `artwork-device-subtype`, `artwork-dynamic-displaymode`), `graphics-featureset-class` and `graphics-featureset-fallbacks` (less `APPLE2`
+  and `MTL2,2`, as in xnuhost's merge). And `artwork-display-gamut`, which is the machine's `P3` and not the tree's, only with this group
+  (xnuhost's merge always writes it). `artwork-scale-factor` is `--scale`'s with `--display`, group or not.
+- `b` `quality`, `/product`: `ui-background-quality`, `ui-weather-quality`.
+- `c` `workgroup`, `/product`: `display-workgroup-interval`, `hid-workgroup-interval`.
+- `d` `ids`, `/product`: `udid-version`, `product-description`, `public-key-accelerator`.
+- `e` `memclass`, `/product`: `device-perf-memory-class`. The tree has 0xc (four bytes) for the iPhone18,2, read as the device's RAM in
+  GiB (not verified), and the VM has less, so the value is the VM's `--ram-mib` / 1024 whole GiB (`xl_machine.vm_ram_mib`: not the
+  kernel's window, which is the RAM less the boot region and the pool), at least 2 and at most the tree's, in the width the tree's
+  property has: 4352 and 4608 MiB, the RAM of the take18 Images, give 4. `--memory-class N` (this group only; refused otherwise) is N
+  instead: 1 to the tree's own (to 16 where the tree has no such property, and then in four bytes). Without the property in the tree
+  and without N nothing is written.
+- `f` `root`, not `/product`: the root gets `target-type` from the tree's root ("V54") and its `compatible` is the tree's first entry
+  (the board name, "V54AP") and then "oneios,xnuhost"; without the group the root has no `target-type` and `compatible` is
+  "oneios,xnuhost" alone. The root's `model` stays "iPhone18,2". The tree needs a `target-type` and a `compatible` (else status 2).
+  xnuhost's merge takes the root the same way (`xl_machine.identity`, unchanged), and its note in `machine.c` says that the first
+  entry is what libMobileGestalt reads as the hardware model and what CoreMotion's, the audio server's and MediaExperience's per-board
+  tables key on; none of that is verified for this VM.
+
+Never copied, with any group: `island-notch-location`, `supports-camera-button`, `supports-burnin-mitigation`, `has-virtualization`,
+`display-corner-radius` (below), the exclaves keys, and the rest of the tree's `/product`. The groups are named for the kind of
+property: what iOS does with each value (which binaries read it) is not verified. `xl_machine.identity` (xnuhost's
+`<image>/identity.adt`: the whole `/product` less a short list) is as it was; `xnuloader-crosvm` has no option for it.
+
+`--soc-generation NAME|none` (default `none`): `/arm-io soc-generation`, a string as Apple's tree has it ("H18" for the iPhone18,2;
+`xl_machine.soc_generation`). It is the one property of the SoC's identity that is written, not arm-io's `compatible`
+"arm-io,t8150", which Apple's kexts would match. Without the option, or with `none`, the tree is byte for byte what it was before this
+option (`H18` adds 40 bytes). `xnuloader-qemu` and xnuhost write none. What iOS does with it is not verified.
+
+`--display-corner-radius PT[,WORD2]` (default none; independent of `--identity-tree`): `/product display-corner-radius`, 8 bytes, two
+little-endian u32: PT (0 to 200, in points) and WORD2 (0 to 65535, default 1). Apple's iPhone18,2 tree has u32 62 and u32 1; what the
+second word means is not verified. Whole decimal numbers only (status 2 otherwise). No group copies Apple's value.
+
+The layout prints a line for each group (on or off, and the property names written, read back from the Image's tree), one for
+`--soc-generation` and one for `--display-corner-radius`.
+
+Tested on the PC. `make -C runtime/loader test`: 935 checks of the library (the list of groups, each of the 64 masks of groups with
+exactly its properties in `/product` and the rest of the tree byte for byte the machine's without them, the root group, the class for
+512 to 65536 MiB with its clamps and widths, the refusals, the corner radius's bytes and range, the generation, xnuhost's merge as it
+was) and 455 of the tool on a generated identity tree (`tests/test_crosvm_tool.sh`). With Apple's tree for 24A446 and the take18
+recipe (take18's 4608 MiB Image: its prime list, GPU addon and boot arguments), compared byte for byte, the random seed aside: no
+option gives take18's `.adt` (522052 bytes) and `.disks`, and `--identity-tree` alone is the same; each group alone adds exactly its
+properties (artwork 6, +320 bytes; quality 2, +80; workgroup 2, +80; ids 3, +136; memclass 1, +40) or, for root, `target-type` "V54"
+and `compatible` "V54AP|oneios,xnuhost" (+48; `/product` untouched), and nothing else differs; `all` is their sum (+704);
+`--display-corner-radius 30` adds the 8 bytes `1e000000 01000000` (+44); `--soc-generation H18` adds 40. Not run on the phone.
 
 ### 2.2 Memory
 

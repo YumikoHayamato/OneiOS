@@ -26,10 +26,14 @@ python3 -I userland/tweak daemons                                           # th
 python3 -I userland/tweak cdhash FILE...                                    # CDHash of signed Mach-O files
 python3 -I userland/tweak boot-check --data DATA_VOLUME [--root OS_TREE]    # after a boot: section 10
 python3 -I userland/tests/test_roottweak.py && python3 -I userland/tests/test_helpers.py
+python3 -I userland/jetsam_derive.py V54.plist --out-dir DIR                # the smaller jetsam list V54O of the image's V54 (docs/native.md)
+python3 -I userland/tests/test_jetsam_derive.py
 ```
 
 (`userland/tweak` is the package's command; `python3 -I -m roottweak` does not find the package, because `-I`
-leaves the current folder out of the module path.)
+leaves the current folder out of the module path. `userland/jetsam_derive.py` is a single file beside the package: it
+changes no tree, it derives the jetsam list `--jetsam-product V54O` names, from the OS image's own V54 file; the image hook
+does not run it, because that list has to be in the OS volume, which the sealed layout never writes.)
 
 Python 3.11 or later, standard library only. Output in `OUT` (the hook puts it in the image set's
 `overlay/userland/`):

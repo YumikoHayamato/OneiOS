@@ -666,6 +666,14 @@ board needs are already in this kernel's board series: `OSMetaClassAdoptSupercla
 `AGXAccelerator -> IOGPU -> IOAcceleratorES`, the user client's `AGXDeviceUserClient -> IOGPUDeviceUserClient`, so the
 sandbox profiles match them as Apple's), the sandbox grant (`NativeSandboxGrantProcess`), `native_pmap_user_mappings`.
 
+**RunningBoard's GPU role (take19, 0088).** Because of that chain, RunningBoard's `IOServiceMatching("IOGPU")` finds
+`AGXAccelerator`, and its `IOGPUDeviceCreate` opens it with IOGPU's type 1, which NativeAdreno refuses (only the plug-in's
+0x4149/0x4148 and the markers are served), so each app transition logs "setGPURole:pid: failed due to nil IOGPU device
+ref". The role still reaches the kernel through RunningBoard's `setpriority(PRIO_DARWIN_GPU)` (`task_set_gpu_role`), and
+the task's RunningBoard role through `TASK_POLICY_ROLE` (the hint below, 2.2b). `oneios-gpu-role=1` gives runningboardd
+a role-only client (kernel/patches/oneios-hosted/README.md, "0088") that makes the call succeed; it schedules nothing:
+a KGSL context's priority is fixed when the context is made.
+
 **The start.** `oneios_board_late_start` (bsd_init) -> `oneios_gpu3d_start` -> `oneios_adreno_start` ->
 `sheng_gpu_power_probe` (DroidVMGpu.cpp), which publishes NativeAdreno, loads IOGPUFamily and registers
 `AGXAccelerator` on the platform expert with `MetalPluginName = NativeAdrenoMetal`,
@@ -1194,7 +1202,8 @@ ONEIOS_METAL_SKIP="display-links-at-panel-rate mesa/0002" userland/metal/build.s
 ```
 
 A word that names no patch stops the build. Each patch applies with or without any other, except
-`NativeMetal/0010`, whose header says `Applies only after: 0008-... 0009-...`: it is left out with either (said on stderr).
+`NativeMetal/0010`, whose header says `Applies only after: 0008-... 0009-...`: it is left out with either (said on stderr),
+and `NativeMetal/0016`, left out with `0003`.
 `out/userland/NativeAdrenoMetal.build.json` lists the patches taken (`oneios_patches`) and the skip (`oneios_metal_skip`).
 
 | Patch | Upstream | What | Switch (boot argument) |
@@ -1213,6 +1222,10 @@ A word that names no patch stops the build. Each patch applies with or without a
 | NativeMetal 0012 | c35508d | IOSurface read-only texture row alignment 16, not 128 (WebKit layers drew nothing) | none |
 | NativeMetal 0013 | none | with `oneios-compile-here=1`, the thread pipelines are asked on, once a process | none |
 | NativeMetal 0014 | upstream OneiOS e84a46e | UIKit's in-process animation links at the panel's rate | `oneios-dl-full=0` |
+| NativeMetal 0015 | none (take19) | the five private device queries every process logged "no device answer" for, answered by the bridge: `maxVertexAmplificationCount` 2, `maxComputeThreadgroupMemory` 32768 (the public length), `isLargeMRTSupported` YES, `supportsComputeCompressedTextureWrite` and `supportsConditionalLoadStore` NO; `gpuCoreCount` (the frontend's own 8) no longer asked | on; `oneios-device-answers=0` |
+| NativeMetal 0016 | none (take19), after 0003 | backboardd counts an app's CAMetalLayer drawable (surface "CAMetalLayer Display Drawable") in use only from each commit to its completion, not for its texture's life (Maps' nextDrawable timeouts) | `oneios-drawable-release=1` (off by default) |
+| NativeMetal 0017 | none (take20) | a client whose temporary directory the boot empties (/private/var/mobile/tmp: SpringBoard, cameracaptured, mediaplaybackd, chrono, messages) keeps its pipeline cache in `$HOME/Library/Caches/<folder>/m2v`, compiled once instead of at every boot | `oneios-client-cache=temp` (on by default) |
+| NativeMetal 0018 | none (take20) | the render server keeps its render pipeline states (an equal descriptor returns the kept state at once) and makes its earlier boots' descriptors (prewarm.log, the journal) again 20 s after its first pipeline, on a utility thread | `oneios-prewarm=1` (off by default), `oneios-prewarm-max=N` |
 | metal2vulkan 0001 | UniXNU d48df9c (0039) | backboardd's two-plane YCbCr textures over their planes alone where read in place | `oneios-ycbcr-planes=0` |
 | metal2vulkan 0002-0004 | macOS-DroidVM a80044a, fec8a28, 3d247c4 (UniXNU 0040-0042) | rate-map buffer and opaque indirect pointer reflection, identity swizzle | none |
 | metal2vulkan 0005 | upstream OneiOS 50873fe | spare command pools follow their recent use | `oneios-pool-cut=0` |
@@ -1242,11 +1255,44 @@ with a pathspec (`git commit -- userland/metal .github/workflows/metal-plugin.ym
 `skip`, leaves patches out. The step "Metal plug-in" prints a `metal: staged drivers/AdrenoMetal: patches/NativeMetal/...`
 line per NativeMetal patch, the three `metal: checked:` lines, and at its end `OneiOS patches taken:` with the list.
 
+**take20 (2026-11-27, prepared, not built):** NativeMetal 0018 (`oneios-prewarm=1`) applies on `b0d6a07` alone, after 0001-0017
+and with 0003, 0005, 0007, 0013, 0014, 0015, 0016 or 0017 left out; its new section and its two in-method hooks pass
+`clang++ -fsyntax-only -fobjc-arc` against stand-in declarations (the patch's own reading of the APIs, not Apple's headers); the
+key's library print rests on `newLibraryWithFile:` setting the library's bytes and length (it does), and its constants are the
+`constantsText` words sorted. Nothing of it has run. Why (take19's -loggpu journal): of backboardd's 586 render pipeline
+creations 26 compiled (25 ms mean) and 560 found every artifact cached and still took 1.3-5.1 ms each on the render thread, in
+bursts at a view's first use after the boot; that boot's store has no cache file read after its first minute (11:51:33 UTC;
+the store sets a file's access time on every hit) while 410 of the 466 came later, so that time is the runtime making the
+pipeline from parts in memory, which packing the cache into one file would not shorten.
+
+**take20 (2026-11-27, prepared, not built):** NativeMetal 0017 applies on `b0d6a07` alone, after 0001-0016, and with 0003, 0014,
+0015 or 0016 left out; its folder choice (the patch's own functions, cut from the patched plug-in) passes a host test with stand-ins
+for CoreFoundation's bundle calls (cameracaptured, SpringBoard, an app's container, the switch, /var/empty, a missing or unwritable
+Library/Caches). The CI is its first compile. Why (take19's and take18's Data stores): /var/mobile/tmp/m2v and
+/var/mobile/tmp/com.apple.cameracaptured/m2v were written anew at every boot (51 and 52 entries at take19's, 214 and 52 over take18's
+session), while backboardd's ~/Library/Caches cache was read at boot and kept.
+
+**take19 (2026-11-27, prepared, not built):** NativeMetal 0015 and 0016 apply on `b0d6a07` + 0001-0014, alone (0015) or with
+0003 alone (0016), and the series applies with each patch left out in turn; `build-adreno-metal-plugin.py`'s edits still find
+their lines; `cargo check` of the bridge with every patch for `aarch64-apple-darwin` and `arm64e-apple-ios`; the new C++ lines
+pass `clang++ -fsyntax-only` against stand-in declarations. The CI is their first compile. Two take18 messages got no patch:
+backboardd's `Unsupported image function XRGB` is QuartzCore's variable blur (`CA::OGL::Context::variable_blur_surface`, a
+`kCAFilterVariableBlur` filter) given a mask image of an opaque format (BGRX8888, RGBX8, RGBXh, RGBX16: image function XRGB in
+`MetalContext::image_parameters`, which asks the device nothing); the blur is drawn with the mask all the same, and the format is
+the mask's maker's. `binary archive refused: ... QuartzCore.framework/default.metallib` is the runtime refusing an Apple archive
+(GPU binaries, not its container: `BinaryArchive(InvalidFile)`); Core Animation then makes its pipelines without one, and the
+runtime still looks in its memo and its shader cache on disk before compiling. Each refusal is Core Animation asking for its
+archive again (boot, 06:28:21, 06:42:31), each time before a burst of pipeline creations (the 106 `Metal.Pipelines` signposts
+after an app close): it sets its pipelines up anew. Serving its file as an empty archive would only add misses (and refusals
+under FailOnBinaryArchiveMiss); whether those creations compiled or hit the caches is what `log-gpu=1`'s pipeline journal says.
+
 **On the phone (iOS's log):** `OneiOS metal switches:` (the boot arguments taken), `OneiOS display links: hooked`, and
 for the opt-in `oneios-compile-here=1`, once a process, `native-metal: pipelines asked on thread 'NAME' (..., QoS 0x..,
 N KiB of stack): the runtime makes them on it | on a thread of its own still (under 2 MiB of stack)`. backboardd's line
 answers whether metal2vulkan 0008 changes anything there: under 2 MiB it does not, and the useful change is then a relay
-thread with the asking thread's priority instead (not made).
+thread with the asking thread's priority instead (not made). With 0015 no `native-metal: no device answer` line; with
+`oneios-drawable-release=1`, in backboardd, `native-metal: CAMetalLayer drawable WxH 'BGRA': in use only while a command buffer
+reads it` (the first four), and Maps' `Failed to acquire drawable, rendering to temporary texture` count is the A/B.
 
 ### 7.2 The stack 555b13d (2026-11-27): Droid-VM's tested GPU stack, OneiOS's patches carried to it
 

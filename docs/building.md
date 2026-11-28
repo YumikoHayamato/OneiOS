@@ -223,12 +223,35 @@ runtime/loader/build/host/xnuloader-crosvm out/kernel/native-24A446/kernel.kc ou
 #    kernel.img.disks (the image set's disks on crosvm's PCI, the phone's staged files; without --image: no disk)
 # --bridge (with --image): the battery and haptics, the bridge channel on crosvm's second serial port; vm-boot then needs
 #    runtime/bridges/build/android/bridgectl (make -C runtime/bridges build/android/bridgectl) and starts `bridgectl serve`
+# the GPU Images add --shared-ram --gpu-scanout (docs/native.md); --gpu-intid 36 gives the GPU crosvm's line for 00:0c.0, so
+#    its waits sleep instead of polling (kernel.img.disks: gpu-intid 36; vm-boot checks it in crosvm's tree)
+# --jetsam-product V54 names iOS's jetsam properties (/product jetsam-properties-product-type): launchd then reads
+#    com.apple.jetsamproperties.V54.plist of the OS image (backboardd in band 170 instead of 30); without it no list is
+#    read (docs/native.md "What take15's memory lines say"). The label and kernel.img.disks do not change
+# --identity-tree out/kernel-inputs/24A446/devicetree.bin --identity-groups LIST (artwork, quality, workgroup, ids, memclass, root,
+#    or a-f, or all) copies those groups of the iPhone's tree: each is a switch of its own, all off by default (the tree alone copies
+#    nothing); --memory-class N, --soc-generation NAME|none, --display-corner-radius PT[,WORD2]: docs/booter.md 2.1; effects not verified
+# --jetsam-product V54O names the smaller list that userland/jetsam_derive.py makes of V54 (docs/native.md "A smaller list for this VM"):
+#    only an os.img that has com.apple.jetsamproperties.V54O.plist can use it, and none has yet (not run on the phone);
+#    with an os.img that lacks it launchd finds no list, as without the option
 oneios-tool phone hugepool load && oneios-tool phone hugepool grow --want 1536   # once per phone boot, for a VM above ~0.5 GB
 oneios-tool phone vm-boot --image out/crosvm/kernel.img --seconds 900 --thp --out logs/pa3q-vmboot/NAME
 ```
 
 The bench of those disks: `scripts/qemu/boot-vm.sh` with `PCI=1` beside `IMAGE=` (QEMU's virtio-blk-pci, the same
-nodes).
+nodes). `AUDIO=1` gives the bench a sound card (`xnuloader-qemu --audio`: QEMU's `virtio-sound-device` on `-audiodev
+none`), for the transport's and the microphone self-test's lines (`docs/hardware.md` section 6, "The native VM's
+microphone"): `KERNEL=out/kernel/native-24A446/kernel.kc AUDIO=1 ARGS_ADD="oneios-audio-mic=1
+oneios-audio-mic-selftest=2 oneios-audio-selftest=1" scripts/qemu/boot-vm.sh 100`. `MEDIA=1` gives it the video
+decoder's node with no decoder behind it (`xnuloader-qemu --media`: the codec archive on, its PCI scan finds no
+1af4:1070 function, nothing is published; `docs/hardware.md` 7g): `KERNEL=out/kernel/native-24A446/kernel.kc MEDIA=1
+scripts/qemu/boot-vm.sh 100`.
+
+The video decoder on the phone (take18b, not yet run there): an Image made with `xnuloader-crosvm ... --shared-ram --gpu
+... --media` (crosvm's media_host pool, 192 MiB by default, `--media-mib N`; the boot arguments get `oneios-codec=1
+droidvm-vt-paravirt=1`), booted with `oneios-tool phone vm-boot --image IMG --video-decoder [--video-decoder-uid UID]`
+(crosvm's `--virtio-media kind=decoder,uid=UID`). Without `--video-decoder` vm-boot gives crosvm the pool alone and iOS
+decodes in software, as before; an Image without `--media` is as before.
 
 ## 4. The runtime (xnuhost, helpers, phone tools)
 
@@ -259,7 +282,9 @@ rebuilt with the renderer by `make` (the flags are not tracked): remove `runtime
 
 `runtime/host-tests.sh` runs, and prints one line each for: `loader` (`make -C runtime/loader test`), `xnuhost`
 (`make -C runtime/xnuhost test`: the unit tests, drm2kgsl and its leak test with LeakSanitizer, the image set, and
-the Android xnuhost booting the test kernel), `display` (`make -C runtime/display test`), `bridges`
+the Android xnuhost booting the test kernel), `display` (`make -C runtime/display test`; `test-arm64`: the phone's
+displayctl through the same tests under `qemu-aarch64`), `pace` (`make -C runtime/pace test`: `vm-boot --vsync-lock`'s
+`pacectl`; not part of `runtime/host-tests.sh` yet, run by hand), `bridges`
 (`runtime/bridges/tests/host.sh`: the unit tests, `test-binder`, brightness, battery), `camera`
 (`runtime/bridges/camera/tests/host.sh`), `links` (`runtime/package/elf-check-test.sh`: the link rule and the check
 of the next section) and `package` (`runtime/package/test.sh`); the last two when the NDK is there.

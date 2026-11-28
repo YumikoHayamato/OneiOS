@@ -885,6 +885,25 @@ native kernel. `docs/native.md`, "The bridge, the remembered Wi-Fi network and t
 `kernel/patches/oneios-hosted/README.md`, "0083". Compiled, not run on the phone yet: there `event 9 ... -> 0`, and the
 second session joins by itself.
 
+### The native path's VM: aggregated UDP dropped by the bridge (take18, 2026-11-26)
+
+The bridge's receive path (`wifi/wlan.c` `frames_loop`, `wifi/frames.c`) hands iOS a frame as it is when it fits the
+link (1514 bytes) and cuts a coalesced TCP frame into segments; everything else over 1514 bytes was dropped. take14 to
+take17 dropped 4.9, 10.4, 2.2 and 15 % of the frames for iOS (`wifi: closed (... N dropped ...)`; take17 8599 of
+57313), with GRO off on wlan0 and no TCP frame ever cut (`0 cut from coalesced frames`). [I] They are UDP datagrams the
+phone's Qualcomm Wi-Fi datapath aggregates itself (its flow aggregation hands up one frame of gso type UDP_L4 with the
+datagrams' size as gso_size, whatever ethtool says of GRO): QUIC, YouTube's and most big sites' transport, which reads a
+loss of whole aggregates as congestion. take17's YouTube at 1080p never filled its buffer. Since take18 such a frame is
+cut back into its datagrams (`br_wifi_segment_udp`: `gso_size` payload bytes each, the last the rest; the UDP length and
+checksum and the IP length made again, the IPv4 identifier counted on; always cut, also when the whole fits the link;
+a datagram size that does not fit the link is still a drop), and each frame still dropped is counted by kind
+(`br_wifi_drop_kind`: UDP aggregated, other aggregated, UDP, other IP, not IP), the first eight said:
+`wifi: a frame for iOS not handed on (N of the first 8): L bytes, KIND (ethertype E, protocol P), gso type T size S, flags F`,
+and at the close `wifi: closed: N UDP frames cut into datagrams; dropped: ...`. Host-tested (`tests/test_wifi.c`
+`test_udp_segments`: IPv4 and IPv6, lengths, identifiers, checksums, two datagrams that fit the link kept two); in
+`wifictl` (built with the NDK); not run on the phone. On the phone: the share of `dropped` in `wifi.txt` and the kinds
+line say whether the guess holds.
+
 ### Missing, unknown
 
 - Seen in a session (2026-11-12): wifid takes en0, scans, lists the networks, joins an open network through the
@@ -1375,7 +1394,7 @@ now counts (2026-11-13: host-tested; the hosted kernel built on the Linux PC (`H
 |---|---|---|
 | Actuator's user clients (DroidVMAudio.cpp as staged) | `ONEIOS HAPTIC: Actuator: user client N opened by audiomxd`, `... asks for N channels at R Hz (the device: 1 at 48000 Hz: the same\|differs, refused ...)`, `... selector N refused`, `... maps memory type 0x...` (the first 24) | whether VirtualAudio opened the device at all, and whether it refused our format |
 | The device's I/O | `ONEIOS HAPTIC: Actuator: I/O started by audiomxd (start N)` and `I/O stopped: ...` (as before) | whether a VAD ran I/O |
-| The samples | `ONEIOS HAPTIC: counters: Actuator N opens (N closed, last by X), N selectors (N StartIO, N StopIO, N refused, N formats asked, last S), N maps; N periods (N ms), N with samples, N loud, peak P of 32768; N requests to the motor \| vibrator service N requests \| /dev/oneios-haptic N frames \| bridge N vib + N stop sent, N failed, N with no host actuator` (every 30 s while a figure moved; `oneios_haptic_report=0` leaves it out) | whether samples reached the ring (`with samples`), were loud enough (`loud`, above 256), became requests and went over the bridge |
+| The samples | `ONEIOS HAPTIC: counters: Actuator N opens (N closed, last by X), N selectors (N StartIO, N StopIO, N refused, N formats asked, last S), N maps; N periods (N ms), N with samples, N loud, peak P of 32768` and `ONEIOS HAPTIC: counters: N requests to the motor \| vibrator service N requests \| /dev/oneios-haptic N frames \| bridge N vib + N stop + N impacts sent, N failed, N with no host actuator` (every 30 s while a figure moved; `oneios_haptic_report=0` leaves it out; two lines since take17: as one it passed the console's 255 bytes, so take16's log has it cut there, without its bridge part and with the next line begun in it) | whether samples reached the ring (`with samples`), were loud enough (`loud`, above 256), became requests and went over the bridge |
 | xnuhost's bridge | `haptics: effect N played on /dev/input/eventN: N ms, period N ms, level N (intensity N, N Hz asked)` (the first 8, then 16, 32, 64, ...), `haptics: counters: N requests from the guest (N vibrate, N stop; N replaced before they started), N effects played, N stopped, N failed on ...` (at 16, 32, ... and at the end) | whether the requests arrived and the force-feedback device took them |
 
 **The power key (fault 2) and this fault** [V for what is read; I where marked]: backboardd's
@@ -1952,6 +1971,74 @@ a PC boot with the null back end), the round trip through air.
 - Beside One UI: `bridgectl audio /data/local/tmp/oneios-audio 12` (the probe, the path) and `bridgectl audio-loop
   /data/local/tmp/oneios-audio 10` (the round trip); then the keyboard-click recording above, before and after.
 
+### The native VM's microphone (take17, 2026-11-26; built, and run on the PC's bench only)
+
+The native VM (`docs/native.md`) has crosvm's virtio-snd on PCI and `oneios-audio-mic=1` in its Image. In take16 Voice
+Memos recorded nothing, for two reasons that are told apart in `docs/native.md` ("What take16's lines say"): the
+transport had given the input stream up at boot (crosvm opens the phone's input at the stream's PREPARE, which took
+10 s with One UI stopped: `crosvm.log` has the output's endpoint at 12:25:02.2 and the input's at 12:25:12.2; the
+guest waited 2 s), and iOS did not start the Mic device for the recording (its engine took 11 periods at the very
+most in the session). The first is fixed; the second is not found (it is in iOS's own log) and now has lines.
+
+- **The transport** (`staged/audio.rs` `SND_TRANSPORT_PCI`, the native kernel only): the input's SET_PARAMS and
+  PREPARE are a thread's of their own with a wait of 60 s each (`droidvm-snd: the microphone's stream 1 (x1): ready
+  after N ms`); the engines' requests wait for it behind one lock (the control queue has one chain); the microphone is
+  started only when its stream is ready (`droidvm-snd: the microphone is asked for and its stream is still being set
+  up: silence`, and the next start or stop of either device starts it); the receive chains are kept by slot, so a
+  second START posts only what the device gave back (crosvm keeps a stopped stream's chains; the source posted all
+  sixteen again); a chain without a whole period is handed back unheard and the engine stays at most four periods
+  behind; a START that is not answered in 2 s has its answer waited for for 13 s more (`droidvm-snd: the microphone's
+  START was not answered in its wait; then: running`), one that is refused is stopped and started once more. Every
+  control request that took 100 ms or more, was refused or got no answer is a line (`droidvm-snd: request 0x102 for
+  stream 1: answered after N ms (status 0x8000)`: 0x101 SET_PARAMS, 0x102 PREPARE, 0x104 START, 0x105 STOP; 0x8000
+  is OK).
+- **What iOS asks of the Mic device** (`staged/audio.rs` `AUDIO`): `DroidVMAudio: mic: opened N by NAME[PID]`,
+  `closed`, `StartIO N (selector S) by NAME[PID]: 0x0`, `StopIO`, and a sample rate or format a device refuses
+  (`DroidVMAudio: Mic: a sample rate of 44100 Hz asked: refused`, counted with the refused selectors).
+- **Every 10 s in which any of it moved**, two lines: `ONEIOS AUDIO: mic: 10 s: touched: C clients opened (+c, K
+  closed), +S selectors (seen since the boot: 0 1 4 5 ...), +M maps, +P property sets; StartIO +a StopIO +o, engine
+  +p periods (running|idle)` and `ONEIOS AUDIO: mic: 10 s: the device gave +r periods, with sound +l, largest sample
+  X of 32767, nothing for +e, unheard +k; its stream: ready (set up in N ms; STARTs n, refused r, asked before ready
+  u)`. A period is "with sound" when a sample is over 32.
+- **How to read a recording that fails**: no `opened` after boot and no selector: the HAL never took the device (a
+  route question: VirtualAudio's device list, the UIDs). Clients and selectors but none of 0 or 10 (no `StartIO`):
+  iOS set the device up and did not start it; the reason is in the unified log (`oneios-tool ioslog show DATA.img
+  --boot last`, filtered for the recording's seconds). `StartIO` with `engine +2000 periods` and `the device gave
+  +0`: the stream (the `droidvm-snd:` lines say what was refused). `the device gave +2000` and `with sound +0,
+  largest sample 0`: the phone gives digital silence (the next point). With sound and a silent file: iOS's side.
+- **`oneios-audio-mic-selftest=SECONDS`** (1 to 10): at boot, once the stream is ready, two capture runs straight off
+  the transport (the first of that many seconds, the second of one second: a stopped stream started again), without
+  iOS's audio stack: `ONEIOS AUDIO: mic self-test, run 1: G of P periods from the device (R taken off its queue, L
+  with sound, K unheard, nothing E times), largest sample X of 32767; its stream: ready` (a second line when iOS's
+  audio server asked something of the devices meanwhile: the run is then no measure). Speak near the phone in the
+  boot's first 20 s. `largest sample 0` in both runs is a host that gives silence: with One UI
+  stopped the record app-op may silence uid 0 (above, "Missing, unknown"), and crosvm f7c6ce8 runs with
+  `--virtio-snd backend=aaudio,capture=false` (its help: "capture=(false,true) - Disable/enable audio capture.
+  Default is false"), although in take16 it opened the input endpoint with `capture=false` and warned of an empty
+  read only four times.
+- **`vm-boot --mic-capture`** (`oneios-phone` `vmboot.rs`): `capture=true` on that line. Off by default: the session
+  is as take16's without it. To be used when the self-test says digital silence.
+- **On the PC's bench** (`AUDIO=1 scripts/qemu/boot-vm.sh`: QEMU's `virtio-sound-device` on `-audiodev none`, which
+  gives silence at once; `docs/native.md`): `the microphone's stream 1 (x1): ready after 3 ms`, the tone self-test's
+  200 of 200 periods, `mic self-test, run 1: 397 of 400 periods ... largest sample 0`, `run 2: 198 of 200`, and the
+  10 s lines. What the bench cannot show: a PREPARE of 10 s, a START that is answered late or refused, a host that
+  gives sound, and iOS's HAL on the device.
+- **take17 on the phone, and the Mic's input data sources (take18).** take17's stream and self-test worked (`ready after
+  10048 ms`, `599 of 600 periods ... largest sample 541`), and every recording still failed before the HAL asked the
+  Mic for StartIO: VirtualAudio's recording route reads the built-in mic's input data sources
+  (kAudioDevicePropertyDataSource, `[ssrc/inpt/0]`) to set its sub-ports and gave the whole route up without them
+  (`SubPortPolicy.cpp:134 ... Error getting data size of property [ssrc/inpt/0] on device 37`, `Routing is not
+  supported`; Voice Memos `AURemoteIO ... -10851` with an input of 0 Hz, Safari `-66637`). The Mic now publishes a data
+  source control in its `controls` (24A446 CoreAudio's IOAudio2 form: `base class` `slct`, `class` `dsrc`, `scope`
+  `inpt`, `element` 0, `multi-selector` true, `selectors` of `{value, name}`: `mc01` Bottom, `mc02` Front, `mc03` Back,
+  `mc04` Bottom 2, the IDs an iPhone's microphones have; `value` the array of the selected ones, `mc01` at first) and
+  takes the HAL's SetControlValue (selector 2) and SetMultiControlValue (selector 8: the control ID and the IDs as the
+  input structure, the IDs taken as the output) for it; every ID asked is taken, since all of them are the one mono
+  stream (`staged/audio.rs`, `oneiosMicControls`, `oneiosSetMicSources`). Line: `DroidVMAudio: mic: data sources mc01
+  (1) set by audiomxd[100], set 1: all of them the one mono stream` (the first 16 changes, then every 64th). The
+  reading of iOS's log and of 24A446's HAL behind it: `docs/native.md`, "What take17's lines say". Built and booted
+  on the PC's bench; not run on the phone.
+
 ### Missing, unknown
 
 - **Not run yet in a test cycle of mine:** `owner-hide-vmm=audiomxd,com.apple.WebKit.GPU` (VirtualAudio's Null device
@@ -1975,6 +2062,29 @@ a PC boot with the null back end), the round trip through air.
   are out of scope (no baseband in the guest).
 - The Actuator device (Core Haptics taps, section 5) is an IOAudio2Device of the same archive, but its periods go to
   the haptics bridge, not to virtio-snd and this helper.
+
+### take18: the control replies by interrupt (opt-in; UniXNU-droidvm 793bb45, 2cd4c8e)
+
+UniXNU-droidvm's transport moved from polling to completion interrupts after our pin (793bb45: a level SPI wakes the
+control waiter and a PCM/event worker; 2cd4c8e: either ADT name for the line, polling where there is none). What this
+tree took (staged/audio.rs `SND_IRQ`, on the native kernel's PCI transport only): the control queue's replies. With the
+boot argument `oneios-audio-irq=1` and `/arm-io/virtio-snd` `droidvm,intid` plus `oneios,intid-slot` (xnuloader-crosvm
+`--audio-intid N,SLOT`; take17's crosvm tree: the card at 00:08.0, SPI 12, so `--audio-intid 44,8`), the transport maps
+the function's ISR, attaches the line level-high (ArmCpu's `armcpu_spi_attach`) for a card found at SLOT only, clears
+NO_INTERRUPT on the control queue alone, and each 1 ms turn of a control wait ends as soon as the line says the reply is
+there (the ISR's read acknowledges and lowers the line). The PCM queues stay NO_INTERRUPT: their periods go at the engine's
+5 ms pace either way. Lines: `droidvm-snd: control replies by interrupt: INTID N (crosvm's SPI M), the card at 00:SS.0` or
+`droidvm-snd: control replies polled (WHY)`; the count is `oneios_snd_interrupts`. vm-boot checks crosvm's
+interrupt-map for 00:SLOT.0 (`audio: the sound card's line is intid N ...`) and stops the VM before the card attaches a line
+that is not its own. Not taken from upstream: its worker thread and its PREPARE/START/STOP/RELEASE order (those are the
+paths of the microphone, which another change owns), 9116f38's 40 ms lead of silence (take17's crosvm.log has one 5 ms
+underrun in the whole session: this tree's speaker hands each period on as it starts, fix-audio-latency), af16f1b (the
+output latency here is the host path's already: `oneios-audio-latency`, 720 frames) and 2f75613 (a kext's registration; the
+archive registers at its start). 3da41ea (a period that wraps the ring, the zero time stamp at each wrap) is fix-audio-latency's
+own fix of the same bug (staged/audio.rs `AUDIO`, 2026-11-15). Tested: oneios-kernel's golden test on the pinned source, the
+loader's (239 + 45 checks), vm-boot's map check run by sh on take17's map bytes, the kernel build, the QEMU bench (its card
+is virtio-mmio: `polled (not on PCI)`). Not run on the phone; the GPU's line of the same kind (`--gpu-intid`) is not proven
+on the phone either.
 
 ## 7. Camera (fable-camera, 2026-11-11; camera, 2026-11-12)
 
@@ -2746,7 +2856,25 @@ With `pen=auto` in the session's `xnuhost.conf` (or `--set pen=auto`):
 `N of a layout not known` above 0 with `0 stylus events given ...` means the event data is not the layout orient()
 knows: tilt and pressure then stay as the driver made them (pressure 0..1, no angles).
 
-## 7g. Video encoder (hevc-encoder, 2026-11-15; host done, guest archive not yet built)
+## 7g. Video encoder (hevc-encoder, 2026-11-15; host done, guest archive not yet built) and the native VM's video decoder (take18b, 2026-11-26)
+
+**The native VM's hardware video decoder (take18b; built, QEMU-booted without a device, not run on the phone).** In the
+crosvm VM YouTube in Safari decoded on the guest's CPU (take15 to take17: mediaplaybackd 70-130 %, heat, 1080p pictures
+going black). The native kernel now has the codec archive (`kernel/patches/oneios-hosted/codec`, `oneios-tool kernel gen
+codec`): UniXNU-droidvm's virtio-media transport staged for crosvm's PCI bus (crosvm f7c6ce8's `--virtio-media
+kind=decoder` is the 1af4:1070 function; the prebuilt has no `--virtio-mmio-media`), its VideoToolbox host with upstream
+OneiOS 79c4921's decoder edit (VP9 and AV1 beside H.264 and HEVC as the device's OUTPUT formats list them; `dcap` and
+`dcan` answered; each surface's kernel mapping kept for the session) and this tree's edits for crosvm's decoder (a
+mid-stream announce resumed with V4L2_DEC_CMD_START or a new CAPTURE set; an ERROR event ends the session at once; HEVC
+at 8 bits only, since crosvm's NV12 copy refuses 10-bit pictures; sessions sized to crosvm's media_host pool and refused
+at `dsta` when they do not fit; `dcap` from the device's profile and level menus, bounded by the pool; a command wait of
+12 s with late completions taken off the queue). VideoToolbox then publishes `AppleVideoToolboxParavirtualizationDriver`
+and decodes on the phone's MediaCodec (`c2.qti.*`), the pictures copied from crosvm's pool into the IOSurfaces it gives.
+Off by default: an Image made with `xnuloader-crosvm ... --shared-ram --media [--media-mib N]` (boot arguments
+`oneios-codec=1 droidvm-vt-paravirt=1`, the pool 192 MiB by default), booted with `oneios-tool phone vm-boot
+--video-decoder [--video-decoder-uid UID]` (crosvm `--virtio-media kind=decoder,uid=UID`, default 2000). The switches,
+crosvm's behaviour, the lines and what is left: `kernel/patches/oneios-hosted/codec/README.md`. Not tested: anything with
+the device (QEMU has none).
 
 The phone's hardware video encoder (Qualcomm's Codec2 `c2.qti.hevc.encoder` / `c2.qti.avc.encoder`) for iOS, so
 VideoToolbox encodes HEVC and H.264 and **CMPhoto writes HEIC**: chronod's widget snapshots, screenshots, the photo

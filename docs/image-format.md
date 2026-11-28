@@ -48,7 +48,9 @@ This is the plan's choice (section 4: UniXNU's release layout, `os.img` and `sys
   (EROFS, squashfs, HFS+ as iOSPlus10 uses on phones without APFS) needs a file system XNU does not have, or
   a rebuilt tree that no longer matches Apple's seal and trust caches.
 - The images are sealed volumes with Apple's root hashes. Unchanged bytes keep the seal, so the booter can
-  use UniXNU's verified-root scheme as it is.
+  use UniXNU's verified-root scheme as it is. (Read on 2026-11-27: of 24A446's images the two cryptex volumes have the
+  seal flag, `apfs_incompatible_features` 0x28, and the OS volume has not, 0x8: `apfs-info` says `sealed: false`, as the
+  manifest does. The kernel here trusts a disk by the SHA-256 of its hash list, not by a seal.)
 - Unchanged bytes are the same for everyone who builds from the same IPSW, so one size and SHA-256 per build
   pin them, as `Images.kt` pins a MysticGSI image.
 - arm64e binaries and the dyld shared cache stay as Apple built them; the S24 Ultra's cores have PAC. No
