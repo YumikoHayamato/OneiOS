@@ -842,6 +842,23 @@ mod cli_tests {
         c: Command,
     }
 
+    // take23: the new options parse (nothing here reaches adb)
+    #[test]
+    fn take23s_options_parse() {
+        let t = T::try_parse_from(["t", "vm-boot", "--image", "a.img", "--image-larger", "b.img", "--image-larger", "c.img", "--host-keep-mib", "1536",
+                                   "--orchestrator", "--orchestrator-set", "gpu-floor=734", "--orchestrator-set", "good=95", "--takeover", "--thp"]).unwrap();
+        let Command::VmBoot { image, image_larger, fill_after_stop, host_keep_mib, orchestrator, orchestrator_set, .. } = t.c else { panic!() };
+        assert_eq!((image.as_str(), image_larger.len(), fill_after_stop, host_keep_mib, orchestrator, orchestrator_set.len()), ("a.img", 2, false, 1536, true, 2));
+        let t = T::try_parse_from(["t", "vm-boot", "--fill-after-stop"]).unwrap();
+        let Command::VmBoot { image_larger, fill_after_stop, host_keep_mib, orchestrator, .. } = t.c else { panic!() };
+        assert!(image_larger.is_empty() && fill_after_stop && host_keep_mib == take23::KEEP_MIB && !orchestrator);
+        let t = T::try_parse_from(["t", "hugepool", "load", "--system-reserve-mb", "3072"]).unwrap();
+        assert!(matches!(t.c, Command::Hugepool { command: HugepoolCommand::Load { system_reserve_mb: Some(3072), .. } }));
+        let t = T::try_parse_from(["t", "hugepool", "load"]).unwrap();
+        assert!(matches!(t.c, Command::Hugepool { command: HugepoolCommand::Load { system_reserve_mb: None, .. } }));
+        assert_eq!(hugepool::insmod_line_with(64, 9, "", Some(3072)), format!("{} system_reserve_mb=3072", hugepool::insmod_line(64, 9, "")));
+    }
+
     #[test]
     fn hugepool_load_takes_the_alternative_module_by_name_only() {
         let t = T::try_parse_from(["t", "hugepool", "load", "--samfor12", "--want", "64"]).unwrap();
