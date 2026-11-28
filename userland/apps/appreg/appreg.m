@@ -20,6 +20,10 @@
 //   rebuild      _LSPrivateRebuildApplicationDatabasesForSystemApps:internal:user: (YES, NO, NO): lsd asks installd for
 //                the system apps again (uicache --all's way); asked once per run, for all bundles
 //   url          registerApplication: with the bundle where the addon wrote it (take21's failing way, kept as a probe)
+// take23: before those, the bundles are also copied into /private/var/oneios/appsview and that folder is shown over /Applications
+// (view_on below says why: the kernel's view of the staged apps is the OS volume's, so take22's copies were never seen there).
+// ONEIOS_APPREG_VIEW=0 leaves the view out. The rebuild way is asked only when the bundle is visible in /Applications.
+//   oneios-appreg: view: /private/var/oneios/appsview over /Applications: entries 52 -> 54 (readdir), 52 -> 54 (NSFileManager), Settings 1, ours 1: kept
 // ONEIOS_APPREG_STAGE=0 in the environment (appreg.conf: env=) skips the copy and the first two ways: take21's
 // behaviour. ONEIOS_APPREG_REBUILD=0 leaves out only the rebuild way (it makes lsd go through every system app again). NOT TESTED on the phone when written: read log/appreg.log after the first boot.
 // Lines (stdout, which oneios-init keeps in log/appreg.log, and the unified log):
@@ -31,6 +35,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <errno.h>
+#include <sys/mount.h>
+#include <sys/param.h>
 
 @interface LSApplicationWorkspace : NSObject
 + (instancetype)defaultWorkspace;
@@ -127,6 +135,103 @@ static NSString *stage_copy(NSString *app, NSDictionary *info, NSString **what) 
   return name;
 }
 
+// take23. What take22 showed on the phone (appreg.log, two boots): the copies were made ("staged ... (copied)", then "(kept)") and
+// "/Applications/OneiOS2048.app is not visible". The kernel's view of the staged apps is taken BEFORE the Data volume is mounted
+// (kern_exec.c, native_owner_data_prepare: "still the OS volume's /private/var"), so it shows the OS volume's
+// /private/var/staged_system_apps, never the Data volume's folder of the same name, where the copies are.
+// So this tool makes a second view of its own: a folder that holds only OneiOS's bundles (kViewDir), shown over /Applications as
+// the kernel shows the staged apps (bindfs, read-only, union; the entitlement com.apple.private.bindfs-allow). A name that is not in
+// it falls through to what /Applications was before, so no app of Apple's is covered. Checked right after the mount: /Applications
+// must list at least as many entries as before plus ours, and Settings and Weather must still be found, by both ways of reading a
+// folder; if not, the view is unmounted at once and nothing is registered from it.
+// ONEIOS_APPREG_VIEW=0 (appreg.conf: env=) leaves it out: take22's behaviour.
+static NSString *const kViewDir = @"/private/var/oneios/appsview";
+
+static int count_readdir(const char *path, BOOL *settings) {
+  DIR *d = opendir(path);
+  if (!d) return -1;
+  int n = 0;
+  struct dirent *e;
+  while ((e = readdir(d))) {
+    if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+    if (!strcmp(e->d_name, "Preferences.app")) *settings = YES;
+    n++;
+  }
+  closedir(d);
+  return n;
+}
+
+static BOOL visible(NSString *app) {
+  return [[NSFileManager defaultManager] fileExistsAtPath:[app stringByAppendingPathComponent:@"Info.plist"]];
+}
+
+// The copy of one bundle in the view's folder (as stage_copy's, for another folder).
+static BOOL view_copy(NSString *app, NSDictionary *info, NSString **what) {
+  NSFileManager *fm = [NSFileManager defaultManager];
+  NSString *name = app.lastPathComponent, *copy = [kViewDir stringByAppendingPathComponent:name], *exe = info[@"CFBundleExecutable"];
+  NSError *e = nil;
+  if (![fm createDirectoryAtPath:kViewDir withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions : @0755} error:&e]) {
+    *what = [NSString stringWithFormat:@"no %@: %@", kViewDir, e.localizedDescription];
+    return NO;
+  }
+  if ([fm fileExistsAtPath:copy]) {
+    if (exe && same_file([app stringByAppendingPathComponent:exe], [copy stringByAppendingPathComponent:exe]) &&
+        same_file([app stringByAppendingPathComponent:@"Info.plist"], [copy stringByAppendingPathComponent:@"Info.plist"])) {
+      *what = @"kept";
+      return YES;
+    }
+    if (![fm removeItemAtPath:copy error:&e]) {
+      *what = [NSString stringWithFormat:@"old copy not removed: %@", e.localizedDescription];
+      return NO;
+    }
+  }
+  NSString *tmp = [kViewDir stringByAppendingPathComponent:[@".oneios-" stringByAppendingString:name]];
+  [fm removeItemAtPath:tmp error:nil];
+  if (![fm copyItemAtPath:app toPath:tmp error:&e] || ![fm moveItemAtPath:tmp toPath:copy error:&e]) {
+    [fm removeItemAtPath:tmp error:nil];
+    *what = [NSString stringWithFormat:@"copy failed: %@", e.localizedDescription];
+    return NO;
+  }
+  *what = @"copied";
+  return YES;
+}
+
+// The view over /Applications. YES: `first` (one of ours) is found in /Applications now. Says what it did.
+static BOOL view_on(NSString *first) {
+  NSFileManager *fm = [NSFileManager defaultManager];
+  NSString *in_apps = [kAppsDir stringByAppendingPathComponent:first];
+  if (visible(in_apps)) {
+    say(@"view: %@ is visible already", in_apps);
+    return YES;
+  }
+  BOOL settings_before = NO;
+  const int before_readdir = count_readdir(kAppsDir.fileSystemRepresentation, &settings_before);
+  const NSUInteger before_fm = [fm contentsOfDirectoryAtPath:kAppsDir error:nil].count;
+  if (before_readdir < 10 || !settings_before || !visible(@"/Applications/Preferences.app") || !visible(@"/Applications/Weather.app")) {
+    say(@"view: /Applications is not as expected before the mount (%d entries, Settings %d): left alone", before_readdir, settings_before);
+    return NO;
+  }
+  char source[MAXPATHLEN];
+  strlcpy(source, kViewDir.fileSystemRepresentation, sizeof source);
+  if (mount("bindfs", kAppsDir.fileSystemRepresentation, MNT_RDONLY | MNT_UNION, source) != 0) {
+    say(@"view: mount bindfs %s over /Applications refused: %s (errno %d)", source, strerror(errno), errno);
+    return NO;
+  }
+  BOOL settings_after = NO;
+  const int after_readdir = count_readdir(kAppsDir.fileSystemRepresentation, &settings_after);
+  const NSUInteger after_fm = [fm contentsOfDirectoryAtPath:kAppsDir error:nil].count;
+  const BOOL ok = after_readdir >= before_readdir && after_fm >= before_fm && settings_after && visible(@"/Applications/Preferences.app") &&
+                  visible(@"/Applications/Weather.app") && visible(@"/Applications/Camera.app") && visible(in_apps);
+  say(@"view: %@ over /Applications: entries %d -> %d (readdir), %lu -> %lu (NSFileManager), Settings %d, ours %d: %@", kViewDir, before_readdir,
+      after_readdir, (unsigned long)before_fm, (unsigned long)after_fm, settings_after, visible(in_apps), ok ? @"kept" : @"NOT as expected");
+  if (ok) return YES;
+  if (unmount(kAppsDir.fileSystemRepresentation, MNT_FORCE) != 0)
+    say(@"view: unmount refused: %s (errno %d): /Applications may list fewer apps until the next boot", strerror(errno), errno);
+  else
+    say(@"view: unmounted again (entries now %d)", count_readdir(kAppsDir.fileSystemRepresentation, &settings_after));
+  return NO;
+}
+
 static BOOL register_url(id ws, NSString *path, NSString **error) {
   @try {
     return [ws registerApplication:[NSURL fileURLWithPath:path isDirectory:YES]];
@@ -166,6 +271,23 @@ int main(int argc, char *argv[]) {
       return 1;
     }
     if (!stage) say(@"ONEIOS_APPREG_STAGE=0: no copy into %@, the url way only", kStagedDir);
+    // take23: the view of OneiOS's own bundles over /Applications (see view_on), made once, before any registration
+    const char *view_env = getenv("ONEIOS_APPREG_VIEW");
+    BOOL view = NO;
+    if (stage && !(view_env && !strcmp(view_env, "0"))) {
+      NSString *first = nil;
+      for (NSString *app in apps) {
+        NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[app stringByAppendingPathComponent:@"Info.plist"]];
+        if (!info[@"CFBundleIdentifier"]) continue;
+        NSString *what = @"";
+        if (view_copy(app, info, &what) && !first) first = app.lastPathComponent;
+        say(@"%@: view copy %@ (%@)", info[@"CFBundleIdentifier"], [kViewDir stringByAppendingPathComponent:app.lastPathComponent], what);
+      }
+      if (first) view = view_on(first);
+      (void)view;
+    } else if (stage) {
+      say(@"ONEIOS_APPREG_VIEW=0: no view over /Applications (take22's behaviour)");
+    }
     int done = 0;
     BOOL rebuilt = NO;
     for (NSString *app in apps) {
@@ -208,6 +330,10 @@ int main(int argc, char *argv[]) {
           ok = register_url(ws, path, &error);
         } else if ([way isEqualToString:@"rebuild"]) {
           path = in_apps;
+          if (!visible(path)) {
+            say(@"%@: rebuild: %@ is not visible: skipped (take22: lsd went through every system app for 51 s and found nothing)", bundle_id, path);
+            continue;
+          }
           if (rebuilt) {
             ok = YES;  // asked already in this run: only look again
           } else if (![ws respondsToSelector:@selector(_LSPrivateRebuildApplicationDatabasesForSystemApps:internal:user:)]) {

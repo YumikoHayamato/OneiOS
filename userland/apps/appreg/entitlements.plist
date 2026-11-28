@@ -12,5 +12,7 @@
   <key>com.apple.private.coreservices.canmaplsdatabase</key><true/>
   <key>com.apple.private.MobileContainerManager.allowed</key><true/>
   <key>com.apple.private.security.storage.AppBundles</key><true/>
+  <!-- take23: the view of OneiOS's bundles over /Applications (bindfs's mount asks for it: bind_vfsops.c) -->
+  <key>com.apple.private.bindfs-allow</key><true/>
 </dict>
 </plist>
