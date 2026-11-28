@@ -12,9 +12,9 @@
 // plus "oneios-bench: begin ..." and "oneios-bench: end ..." around a run, and "oneios-bench: mem-step ..." while the
 // memory test allocates (it may be killed by jetsam before it can say more; it runs last).
 // The lines are logged as public text (a "%@" argument is <private> in the stored log) and appended to a file too (the
-// launch line names it). "FPS" is the app's display-link callbacks; "screen" is what the render server drew, where it
-// tells (CARenderServerGetFrameCounter, looked up at run time): layers the render server cannot draw in time lower the
-// second and leave the first at 120.
+// launch line names it). "FPS" is the app's display-link callbacks; "screen" is the frames that reached the display
+// (the guest kernel's count, sysctl kern.oneios_frames, or the render server's counter): layers the render server
+// cannot draw in time lower the second and leave the first at 120.
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
@@ -82,12 +82,30 @@ static void BLog(NSString *format, ...) {
     if (write(g_logFd, d.bytes, d.length) < 0) { close(g_logFd); g_logFd = -1; g_logPath = "none (write failed)"; }
   }
 }
-// The frames the render server drew (every display update, whoever asked for it). 0 = it does not tell.
+// The frames that reached the screen (every display update, whoever asked for it). 0 = nobody tells. First the guest
+// kernel's own count of the frames its display wrote (sysctl kern.oneios_frames, when OneiOS's kernel gives it), then
+// the render server's counter where QuartzCore still has it (looked up at run time).
 static uint32_t (*g_frameCounter)(mach_port_t);
+static int g_screenSource = -1;  // 0 none, 1 the kernel's sysctl, 2 the render server's counter
 static uint32_t screen_frames(void) {
   static dispatch_once_t once;
-  dispatch_once(&once, ^{ g_frameCounter = (uint32_t (*)(mach_port_t))dlsym(RTLD_DEFAULT, "CARenderServerGetFrameCounter"); });
+  dispatch_once(&once, ^{
+    uint64_t n = 0;
+    size_t len = sizeof n;
+    if (sysctlbyname("kern.oneios_frames", &n, &len, NULL, 0) == 0 && len == sizeof n) { g_screenSource = 1; return; }
+    g_frameCounter = (uint32_t (*)(mach_port_t))dlsym(RTLD_DEFAULT, "CARenderServerGetFrameCounter");
+    g_screenSource = g_frameCounter ? 2 : 0;
+  });
+  if (g_screenSource == 1) {
+    uint64_t n = 0;
+    size_t len = sizeof n;
+    return sysctlbyname("kern.oneios_frames", &n, &len, NULL, 0) == 0 ? (uint32_t)n : 0;
+  }
   return g_frameCounter ? g_frameCounter(MACH_PORT_NULL) : 0;
+}
+static const char *screen_source(void) {
+  uint32_t n = screen_frames();
+  return g_screenSource == 1 ? "kernel" : g_screenSource == 2 ? (n ? "render-server" : "render-server-zero") : "none";
 }
 static NSString *thermal_name(NSProcessInfoThermalState s) {
   switch (s) {
@@ -471,7 +489,7 @@ static BenchTest *T(NSString *name, Cat cat) {
         model, [UIDevice currentDevice].systemVersion, (unsigned long)[NSProcessInfo processInfo].activeProcessorCount,
         (unsigned long)vm_page_size, [NSProcessInfo processInfo].physicalMemory / 1048576.0,
         _dev ? _dev.name : (_metalError ?: @"none"), _libMs, footprint_mib(), avail_mib(),
-        screen_frames() ? "yes" : (g_frameCounter ? "zero" : "none"), g_logPath);
+        screen_source(), g_logPath);
 }
 
 - (void)viewDidLayoutSubviews {
