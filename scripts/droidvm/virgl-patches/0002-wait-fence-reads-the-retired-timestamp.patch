@@ -1,0 +1,50 @@
+diff --git a/src/drm/drm2kgsl/drm2kgsl_renderer.c b/src/drm/drm2kgsl/drm2kgsl_renderer.c
+index 555e067..b2d8d07 100644
+--- a/src/drm/drm2kgsl/drm2kgsl_renderer.c
++++ b/src/drm/drm2kgsl/drm2kgsl_renderer.c
+@@ -3055,9 +3055,42 @@ kgsl_ccmd_wait_fence(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
+       .timeout = 0,
+    };
+ 
+-   rsp->ret = kgsl_ioctl(dctx->fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait)
+-                 ? -errno
+-                 : 0;
++   /* ONEIOS (take22, after Droid-VM/virglrenderer PR 1 "make WAIT_FENCE genuinely non-blocking"): ask KGSL for the
++    * context's retired timestamp, a plain read, instead of entering WAITTIMESTAMP with timeout 0. That PR's author
++    * saw a zero timeout wait without end on a tablet's KGSL (the VM froze while presenting); on kernels where 0 is a
++    * poll the answer is the same and nothing sleeps either way. Not retired = -ETIMEDOUT at once, as the wait gave;
++    * the guest polls again. A kernel that refuses the read is remembered and the old call serves from then on.
++    * ONEIOS_WAIT_FENCE_READTS=0 in the renderer's environment keeps the old call. Timestamps wrap: compared as KGSL
++    * compares them (a signed difference). */
++   static int readts = -1;   /* -1 not decided, 0 off or refused, 1 on */
++   if (readts < 0) {
++      const char *e = getenv("ONEIOS_WAIT_FENCE_READTS");
++      readts = !(e && e[0] == '0');
++      drm_log("wait_fence: %s", readts ? "the retired timestamp is read (no wait in KGSL)" : "WAITTIMESTAMP with timeout 0 (ONEIOS_WAIT_FENCE_READTS=0)");
++   }
++   bool answered = false;
++   if (readts == 1) {
++      struct kgsl_cmdstream_readtimestamp_ctxtid read = {
++         .context_id = req->queue_id,
++         .type = KGSL_TIMESTAMP_RETIRED,
++         .timestamp = 0,
++      };
++      if (!kgsl_ioctl(dctx->fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID, &read)) {
++         rsp->ret = (int32_t)(read.timestamp - wait.timestamp) >= 0 ? 0 : -ETIMEDOUT;
++         answered = true;
++      } else if (errno == ENOTTY || errno == ENOSYS) {
++         /* this kernel does not serve the read: the old call from now on (never a failing call per poll) */
++         drm_log("wait_fence: READTIMESTAMP_CTXTID refused (%s): WAITTIMESTAMP with timeout 0 from now on", strerror(errno));
++         readts = 0;
++      }
++      /* any other error (EINVAL: no such context; a context gone) is this request's alone: the wait reports it, below.
++       * Known limit of the read: a context KGSL has invalidated still answers its last timestamp, so the guest sees
++       * -ETIMEDOUT where the wait said -EDEADLK; its own fence timeout ends that wait. */
++   }
++   if (!answered)
++      rsp->ret = kgsl_ioctl(dctx->fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait)
++                    ? -errno
++                    : 0;
+    if (rsp->ret == 0 && kgsl_retire_delay_ms()) {
+       /* Retired for KGSL: for the guest only once the delay has passed since this poll first saw it. */
+       static uint32_t seen_ts, seen_queue;

@@ -16,6 +16,9 @@
 # resources (context-less guest blobs) with EINVAL: it hands virglrenderer no pages for a blob that comes with its
 # udmabuf, which virglrenderer requires (docs/native.md "The GPU in the shared-RAM VM").
 #
+# libvirglrenderer.so of both lines is virglrenderer cd71ea4 (2026-09-01). take18 builds a newer one from source,
+# scripts/droidvm/build-virgl.sh (2529a9f), which vm-boot pushes in its place (`vm-boot --virgl`, `--virgl prebuilt` for this one).
+#
 # libvulkan_freedreno.so is their Turnip (Mesa, MIT; the same file in both lines): the Vulkan driver crosvm's Android
 # display blits the VM's frames with when it is named (CROSVM_DISPLAY_VULKAN_LIBRARY, set by vm-boot with the scanout).
 #

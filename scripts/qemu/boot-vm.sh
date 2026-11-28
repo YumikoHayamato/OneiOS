@@ -21,6 +21,17 @@
 #                               and virtio-keyboard-device, for the kernel's touch screen and keys (the hid archive)
 #   PCI=1 IMAGE=DIR ...         the disks as virtio-blk-pci functions (00:02.0 to 00:06.0) with DMA windows, as in a VM of
 #                               the phone's crosvm (xnuloader-qemu --pci; docs/native.md "A VM under Gunyah")
+#   AUDIO=1 ...                 QEMU's virtio-sound-device with `-audiodev none` (xnuloader-qemu --audio): the kernel's
+#                               virtio-snd transport and its microphone on the bench. With ARGS_ADD="oneios-audio-mic=1
+#                               oneios-audio-mic-selftest=2" serial.log has `droidvm-snd: the microphone's stream 1 (x1): ready
+#                               after N ms` and two `ONEIOS AUDIO: mic self-test` lines (silence: `largest sample 0`)
+#   JETSAM_PRODUCT=V54 ...      the name of iOS's jetsam properties (xnuloader-qemu --jetsam-product, as xnuloader-crosvm's:
+#                               launchd then reads com.apple.jetsamproperties.V54.plist; serial.log: `oneios-band:
+#                               backboardd[N] 180 -> 170` with it, `-> 30` without)
+#   MEDIA=1 ...                 the video decoder's node on bus 0 of virt's ECAM and oneios-codec=1 droidvm-vt-paravirt=1
+#                               (xnuloader-qemu --media): the kernel's codec archive with no decoder behind it (QEMU has no
+#                               virtio-media device); serial.log: `droidvm-media: no 1af4:1070 function on bus 0` and
+#                               `ONEIOS CODEC: 1 virtio-media device(s), 0 up; VideoToolbox paravirtualization not published`
 # Out: OUT (out/qemu/vm) serial.log (the kernel's console on the PL011), qemu.log (QEMU's -d log, the first 64 MB), and
 # xnuloader-qemu's layout files; monitor.sock, QEMU's monitor while it runs (scripts/qemu/shot.sh takes a picture of the
 # display), and qmp.sock, its QMP socket (scripts/qemu/touch.sh taps and swipes on the tablet). A guest restart ends the run (-no-reboot). QEMU comes from the project's sysroot
@@ -45,7 +56,10 @@ opts=()
 [ -z "${BOOT_ARGS:-}" ] || opts+=(--args "$BOOT_ARGS")
 [ -z "${ARGS_ADD:-}" ] || opts+=(--args-add "$ARGS_ADD")
 [ -z "${SCREEN:-}" ] || opts+=(--display "$SCREEN" --scale "${SCALE:-2}" --hz "${HZ:-60}")
+[ "${MEDIA:-0}" = 0 ] || opts+=(--media)
 [ -z "${INPUT:-}" ] || opts+=(--input "$INPUT")
+[ "${AUDIO:-0}" = 0 ] || opts+=(--audio)
+[ -z "${JETSAM_PRODUCT:-}" ] || opts+=(--jetsam-product "$JETSAM_PRODUCT")
 display=(-display none)
 [ -z "${VNC:-}" ] || display+=(-vnc "127.0.0.1:$VNC")
 debug=${QEMU_DEBUG:-int,guest_errors,unimp}

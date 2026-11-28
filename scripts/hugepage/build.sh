@@ -10,8 +10,16 @@
 #
 # Output: WORK/out/android15-6.6.ko, WORK/out/kapi_check, WORK/out/build.txt (the pins and the .ko's modinfo).
 # docs/native.md "A VM under Gunyah" ("Stopping One UI for the module").
+#
+# scripts/hugepage/build.sh WORK samfor12: the alternative module instead (take18, off unless loaded by name:
+# `phone hugepool load --ko WORK/out/android15-6.6-samfor12.ko`): samfor12/gh-hugepage-reserve-temp-root-support 361d499,
+# our pin 00c8a03 plus six commits of 2026-11-18 (pool pages held with PG_reserved while the module keeps them and
+# cleared before every free and before a page is served; the death grace 3 -> 13 s so the release worker can take
+# a dead VM's served pages back). The same module name, parameters and sysfs files as ours.
+# Output: WORK/out/android15-6.6-samfor12.ko, WORK/out/build-samfor12.txt.
 set -euo pipefail
 WORK=${1:-/mnt/tkg-build/oneios/hugepage}
+VARIANT=${2:-}
 IMAGE=ylarod/ddk-min
 TAG=android15-6.6
 DIGEST=sha256:51159bc935c75a282fc65bc87e02f16bd098d1cdf55dc558c4fdd0fcf7a132e2
@@ -21,6 +29,18 @@ DDK=$WORK/ddk-$TAG
 ROOTFS=$DDK/rootfs
 SRC=$WORK/gh-hugepage-reserve
 OUT=$WORK/out
+KO=$TAG.ko
+RECORD=build.txt
+case "$VARIANT" in
+  '') ;;
+  samfor12)
+    REPO=https://github.com/samfor12/gh-hugepage-reserve-temp-root-support.git
+    COMMIT=361d4999bd6b7e2a3e2c83dcac17a0313e4b6b1d
+    SRC=$WORK/gh-hugepage-reserve-samfor12
+    KO=$TAG-samfor12.ko
+    RECORD=build-samfor12.txt ;;
+  *) echo "usage: build.sh [WORK [samfor12]]" >&2; exit 2 ;;
+esac
 mkdir -p "$DDK/blobs" "$OUT"
 sha() { sha256sum < "$1" | cut -d' ' -f1; }
 
@@ -71,14 +91,23 @@ if [ "$(git -C "$SRC" rev-parse HEAD)" != "$COMMIT" ]; then
 fi
 [ -z "$(git -C "$SRC" status --porcelain)" ] || { echo "build: $SRC has local changes" >&2; exit 1; }
 
-# 3. The .ko, in the image, as docker_exec.sh builds it.
-rm -f "$OUT/$TAG.ko"
+# 3. The .ko, in the image, as docker_exec.sh builds it (into a folder of its own: it names the file $TAG.ko).
+BOUT=$OUT/.build${VARIANT:+-$VARIANT}
+rm -rf "$BOUT" "${OUT:?}/$KO"
+mkdir -p "$BOUT"
 bwrap --unshare-all --die-with-parent --clearenv \
   --setenv PATH /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin --setenv HOME /tmp \
   --ro-bind "$ROOTFS" / --proc /proc --dev /dev --tmpfs /tmp \
-  --ro-bind "$SRC" /src --bind "$OUT" /out_gh_hugepage_reserve \
+  --ro-bind "$SRC" /src --bind "$BOUT" /out_gh_hugepage_reserve \
   sh /src/docker_exec.sh gh_hugepage_reserve.c:gh_hugepage_reserve
-[ -f "$OUT/$TAG.ko" ] || { echo "build: no $TAG.ko" >&2; exit 1; }
+[ -f "$BOUT/$TAG.ko" ] || { echo "build: no $TAG.ko" >&2; exit 1; }
+mv "$BOUT/$TAG.ko" "$OUT/$KO"
+rmdir "$BOUT" 2>/dev/null || true
+if [ -n "$VARIANT" ]; then
+  { echo "image $IMAGE:$TAG $DIGEST"; echo "source $REPO $COMMIT"; echo "ko sha256 $(sha "$OUT/$KO")"; modinfo "$OUT/$KO"; } > "$OUT/$RECORD"
+  cat "$OUT/$RECORD"
+  exit 0
+fi
 
 # 4. kapi_check for the PC (libbpf), from the same commit's abi/.
 awk -f "$SRC/abi/gen_kapi.awk" "$SRC/abi/kapi_abi.tsv" > "$OUT/kapi_abi.gen.h"

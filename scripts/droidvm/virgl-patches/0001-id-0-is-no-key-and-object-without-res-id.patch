@@ -1,0 +1,101 @@
+diff --git a/src/drm/drm2kgsl/drm2kgsl_renderer.c b/src/drm/drm2kgsl/drm2kgsl_renderer.c
+index 02cf86a..555e067 100644
+--- a/src/drm/drm2kgsl/drm2kgsl_renderer.c
++++ b/src/drm/drm2kgsl/drm2kgsl_renderer.c
+@@ -1553,6 +1553,11 @@ kgsl_object_create(uint32_t mem_id, int dmabuf_fd, uint32_t flags,
+ static struct kgsl_object *
+ kgsl_object_from_res_id(struct kgsl_context *kctx, uint32_t res_id)
+ {
++   /* ONEIOS: 0 names no resource, and mesa's hash tables reserve it as their empty key: a search for it asserts
++    * (hash_table.c "!key_pointer_is_reserved") in a build with asserts, and an insert of it corrupts the table's
++    * count in one without. The guest sends it for a BO whose blob the host refused. */
++   if (!res_id)
++      return NULL;
+    struct drm_object *dobj = drm_context_get_object_from_res_id(&kctx->base, res_id);
+    return dobj ? to_kgsl_object(dobj) : NULL;
+ }
+@@ -1560,6 +1565,9 @@ kgsl_object_from_res_id(struct kgsl_context *kctx, uint32_t res_id)
+ static struct kgsl_object *
+ kgsl_object_from_blob_id(struct kgsl_context *kctx, uint64_t blob_id)
+ {
++   /* ONEIOS: 0 is the reserved key too, and drm_context asserts a blob id of more than 32 bits: both are no object. */
++   if (!blob_id || blob_id >> 32)
++      return NULL;
+    struct drm_object *dobj =
+       drm_context_retrieve_object_from_blob_id(&kctx->base, blob_id);
+    return dobj ? to_kgsl_object(dobj) : NULL;
+@@ -2068,6 +2076,10 @@ kgsl_ccmd_ioctl_simple(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
+    }
+    case DRM_MSM_SUBMITQUEUE_CLOSE: {
+       uint32_t id = *(uint32_t *)payload;
++      if (!id) {   /* ONEIOS: KGSL makes no context 0, and 0 is the queue table's reserved key */
++         rsp->ret = -EINVAL;
++         break;
++      }
+       uint64_t ignored;
+       int fault_ret = kgsl_query_faults(kctx, &ignored);
+       if (fault_ret && kctx->shmem)
+@@ -2840,8 +2852,8 @@ kgsl_ccmd_gem_submit(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
+       }
+    }
+ 
+-   const struct hash_entry *entry = _mesa_hash_table_search(
+-      kctx->sq_to_ring_idx_table, (void *)(uintptr_t)req->queue_id);
++   const struct hash_entry *entry = !req->queue_id ? NULL :   /* ONEIOS: 0, the reserved key, is no queue */
++      _mesa_hash_table_search(kctx->sq_to_ring_idx_table, (void *)(uintptr_t)req->queue_id);
+    if (!entry) {
+       drm_err("unknown submitqueue: %u", req->queue_id);
+       free(kcmds);
+@@ -3346,7 +3358,7 @@ drm2kgsl_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t
+       return 0;
+    }
+ 
+-   if (!drm_context_res_id_unused(dctx, res_id)) {
++   if (!res_id || !drm_context_res_id_unused(dctx, res_id)) {   /* ONEIOS: 0, the reserved key, is no res_id */
+       drm_err("Invalid res_id %u", res_id);
+       return -EINVAL;
+    }
+diff --git a/src/drm/drm_context.c b/src/drm/drm_context.c
+index 028114b..f249ce1 100644
+--- a/src/drm/drm_context.c
++++ b/src/drm/drm_context.c
+@@ -227,6 +227,10 @@ drm_context_submit_cmd(struct virgl_context *vctx, const void *_buffer, size_t s
+ static void
+ drm_context_remove_object(struct drm_context *dctx, struct drm_object *obj)
+ {
++   /* ONEIOS: an object without a res_id (0) is in no resource table: a GEM_NEW whose CREATE_BLOB the device
++    * refused, which drm_context_deinit frees from the blob table at the context's end. 0 is mesa's reserved key. */
++   if (!obj->res_id)
++      return;
+    if (drm_context_res_id_unused(dctx, obj->res_id))
+       return;
+ 
+@@ -453,9 +457,8 @@ drm_context_blob_id_valid(struct drm_context *dctx, uint32_t blob_id)
+ struct drm_object *
+ drm_context_retrieve_object_from_blob_id(struct drm_context *dctx, uint64_t blob_id)
+ {
+-   assert((blob_id >> 32) == 0);
+-
+-   if ((blob_id >> 32) != 0)
++   /* ONEIOS: a blob id of more than 32 bits, or 0 (mesa's reserved key), is no object: a guest's word, not an abort. */
++   if ((blob_id >> 32) != 0 || !blob_id)
+       return NULL;
+ 
+    uint32_t id = blob_id;
+@@ -494,6 +497,8 @@ drm_context_object_set_res_id(struct drm_context *dctx,
+ struct drm_object *
+ drm_context_get_object_from_res_id(struct drm_context *dctx, uint32_t res_id)
+ {
++   if (!res_id)   /* ONEIOS: 0, the reserved key, names no resource */
++      return NULL;
+    const struct hash_entry *entry = _mesa_hash_table_search(dctx->resource_table, (void *)(uintptr_t)res_id);
+    return likely(entry) ? entry->data : NULL;
+ }
+@@ -501,5 +506,7 @@ drm_context_get_object_from_res_id(struct drm_context *dctx, uint32_t res_id)
+ bool
+ drm_context_res_id_unused(struct drm_context *dctx, uint32_t res_id)
+ {
++   if (!res_id)   /* ONEIOS: 0, the reserved key, is never free to take */
++      return false;
+    return !_mesa_hash_table_search(dctx->resource_table, (void *)(uintptr_t)res_id);
+ }
