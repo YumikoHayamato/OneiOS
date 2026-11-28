@@ -1292,6 +1292,7 @@ or the dispatch input `stack`, builds the other (run 46049251449, the branch's f
 | NativeMetal 0017 (take20) | `NativeMetal/0008-client-cache-kept-across-boots` | now behind the base's same-user shared directory |
 | NativeMetal 0018 (take20) | `NativeMetal/0009-render-pipelines-kept-and-made-at-boot` | unchanged; OFF; the base has a warm pass of its own (below) |
 | - | `NativeMetal/0010-pipeline-wait-bounded-switch` | new, OFF: `oneios-pipeline-wait-ms=N` |
+| - | `NativeMetal/0012-prime-key-and-cache-line-by-compiler-ids` | new, no switch: the priming pass's key ends in Turnip's pipeline cache id, not its dylib's LC_UUID; the `shader cache` line (below) |
 | metal2vulkan 0001 (YCbCr planes) | dropped | bridge patch 0040 makes such textures over their planes in every process |
 | metal2vulkan 0002-0004 | dropped | the base's `patches/metal2vulkan` 0040-0042 |
 | metal2vulkan 0005, 0006, 0007 | dropped | `555b13d`'s `spares.rs` and bridge 0040's room thread and pressure path; no knob (`oneios-pool-cut`, `oneios-idle-spares` are gone) |
@@ -1302,6 +1303,21 @@ or the dispatch input `stack`, builds the other (run 46049251449, the branch's f
 **What changes without any switch** (read before the first session):
 - Every pipeline cache entry is made again once: the runtime's and the translator's versions changed (`RUNTIME_VERSION` 2016,
   `SEMANTICS_VERSION` 2024 with the board's patches) and so did the build's id. The first session compiles as a new install.
+- **What the shader cache is keyed by, and what a new build keeps** (read in a Data store that ran three CI builds of the same
+  compilers, 2026-11-28). Not the plug-in's build, CDHash or date. (a) Translations: `<cache>/v1/<build>/`, `<build>` the SHA-256
+  of the translator's version, its two artifact versions and its source digest (the runtime's `shader_cache`, `this_build()`):
+  the runtime's own sources and the frontend are not in it. (b) The driver's pipeline data (`M2VPPLC` records in the content
+  directory): named by Turnip's `pipelineCacheUUID`, which the base's `build-turnip-darwin.py` derives from Mesa's pin, the
+  diff of its patches and its extra sources (`-Dtu-build-id`), not from the dylib's LC_UUID or file time. So a CI build that
+  changes only the frontend or `.inc` files reads everything the build before wrote; a change of a metal2vulkan (translator)
+  patch empties (a), a change of the Mesa pin or of ANY Mesa patch (ours too, `mesa/0001-idle-bo-cache-trim`) empties (b).
+  (c) The priming pass's `prime-done` was the one key that followed the build (Turnip's LC_UUID, new at every link): NativeMetal
+  0012 gives it Turnip's pipeline cache id instead (`OneiOSTurnipBuild.h`, written by `userland/metal/build.sh` from the turnip
+  step's id; the build record's `turnip_cache_id`). The proof on the phone, without a switch, once a boot in backboardd (60 s
+  after its first render pipeline, and at the prewarm pass's end): `native-metal: shader cache (WHEN): F found, N not found,
+  W written; kept by translator T, Turnip U`. Two builds that print the same T and U share the files; a first boot of the
+  newer one then has N far under F. What is made again at EVERY boot, new build or not: the driver's pipeline objects
+  themselves (from the kept data) and, with `oneios-prewarm=1`, the kept states (`native-metal: prewarm: ...`).
 - The cache directory: backboardd and every process of user `mobile` that may write it use
   `/var/mobile/Library/Caches/org.unixnu.metal` (SharedShaderCache.h: shared between processes, kept across boots); backboardd's
   old `/var/mobile/Library/Caches/com.apple.backboardd/m2v` is its next choice and is no longer written (its files can be

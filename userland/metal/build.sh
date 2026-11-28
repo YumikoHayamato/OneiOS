@@ -270,6 +270,10 @@ edit('scripts/build-turnip-darwin.py', [
      "env.update(CC='clang', CXX='clang++', CFLAGS='', CXXFLAGS='', CPPFLAGS='', LDFLAGS='')",
      "meson's build-machine compiler is the host's clang (on a Mac xcrun's clang is both)"),
     ("'-j6'", "'-j%s'" % jobs, 'ninja jobs'),
+    # NativeMetal 0012: the id Turnip's pipeline cache is keyed by, kept for the plug-in (plugin() writes OneiOSTurnipBuild.h from it)
+    ("options += ['-Dtu-build-id=' + build_id]\n",
+     "options += ['-Dtu-build-id=' + build_id]\n(OUT / 'oneios-tu-build-id.txt').write_text(build_id + '\\n')\n",
+     "Turnip's pipeline cache id is written to its build folder, for the plug-in's priming key and cache line"),
 ])
 edit('scripts/build-adreno-metal-bridge.py', [
     ('timeout=1800)', 'timeout=10800)', 'a longer limit for the fat-LTO Rust build'),
@@ -413,6 +417,20 @@ turnip() {
 }
 
 plugin() {
+  # NativeMetal 0012: Turnip's pipeline cache id (build-turnip-darwin.py's -Dtu-build-id: Mesa's pin, its patches' diff, its
+  # extra sources) for the plug-in's priming key and its `shader cache` line, in place of the dylib's LC_UUID. Not written
+  # when the turnip step left none (an older base's script): the patch then falls back to the LC_UUID.
+  local id_file=$R/build/mesa-tu-ios27/oneios-tu-build-id.txt id
+  rm -f "$R/drivers/AdrenoMetal/OneiOSTurnipBuild.h"
+  if [ -f "$id_file" ]; then
+    id=$(tr -d '\n' < "$id_file")
+    case "$id" in
+      ''|*[!0-9a-f]*) echo "metal: $id_file is not a hex id: $id" >&2; exit 1 ;;
+    esac
+    printf '/* userland/metal/build.sh: Turnip pipeline cache id (tu-build-id). Generated: never commit. */\n#define ONEIOS_TURNIP_BUILD "%s"\n' "$id" \
+      > "$R/drivers/AdrenoMetal/OneiOSTurnipBuild.h"
+    say "Turnip's pipeline cache id $id: the plug-in's priming key and cache line (NativeMetal 0012)"
+  fi
   # ADRENO_METAL_REPLAY=0: no TurnipReplay.h (8789b8d's script; 62d0b11's staged copy has no such line at all)
   (cd "$R" && ADRENO_METAL_REPLAY=0 python3 scripts/build-adreno-metal-plugin.py --target ios27)
 }
@@ -458,6 +476,10 @@ json.dump({
     'oneios_patches': open(os.path.join(staged, 'build/oneios-patches.txt')).read().split()
                       if os.path.exists(os.path.join(staged, 'build/oneios-patches.txt')) else None,
     'oneios_metal_skip': env.get('ONEIOS_METAL_SKIP', '').split(),
+    # what the kept shader cache files are named by (NativeMetal 0012's `shader cache` line prints the same): two builds with the
+    # same value read each other's driver pipeline data
+    'turnip_cache_id': open(os.path.join(staged, 'build/mesa-tu-ios27/oneios-tu-build-id.txt')).read().strip()
+                       if os.path.exists(os.path.join(staged, 'build/mesa-tu-ios27/oneios-tu-build-id.txt')) else None,
 }, open(record, 'w'), indent=2)
 print('metal: built for', target, 'from the stack', stack)
 for name, f in files.items():

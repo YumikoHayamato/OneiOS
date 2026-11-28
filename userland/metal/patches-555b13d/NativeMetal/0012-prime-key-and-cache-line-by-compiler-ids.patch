@@ -1,0 +1,90 @@
+OneiOS take24, stack 555b13d (NativeMetal 935c468), patches-555b13d/NativeMetal/0012. No switch (a key and one log line).
+Asked: "every new build's first boot compiles all shaders again although the compilers did not change".
+Read first, what a Data store that ran three CI builds of the same compilers showed: the shader cache is NOT keyed by the plug-in's
+build. The translations live under <cache>/v1/<SHA-256 of the translator's version, artifact versions and source digest> (the
+runtime's shader_cache, this_build()), the driver's pipeline data is named by Turnip's pipelineCacheUUID, which the base's
+build-turnip-darwin.py derives from Mesa's pin, its patches' diff and its extra sources (-Dtu-build-id), not from the dylib's
+LC_UUID or its file time. Three builds with three LC_UUIDs and CDHashes wrote into one translator directory under one
+pipelineCacheUUID, and the newest's first boot wrote a twentieth of what the first boot after the stack's change had written.
+The one key that did follow the build: the priming pass's (PrimeShaders.h buildId(): the runtime's id and Turnip's LC_UUID, which
+every link changes), so each CI build primed its list's libraries again.
+What: (1) buildId() ends in ONEIOS_TURNIP_BUILD, the id Turnip's pipeline cache is keyed by, from OneiOSTurnipBuild.h, which
+userland/metal/build.sh writes beside this file from what build-turnip-darwin.py passed as -Dtu-build-id; the LC_UUID only
+without that header. A Mesa pin, patch or extra source that changes still primes again, and so does a translator change
+(nmb_runtime_build), as before. The first boot of this patch primes once more (the id's form changed: an old line cannot be
+proved to be the same Turnip source, so none is adopted). (2) The render server says once a boot, 60 s after its first render
+pipeline, and at the prewarm pass's end, what the kept cache did: `native-metal: shader cache (WHEN): F found, N not found,
+W written; kept by translator T, Turnip U` (the device's counts, nmb_device_work_stats). Two builds that print the same T and U
+read each other's files.
+Risk: low. (1) changes only when a library is primed again; (2) reads counters. Removable: yes
+(ONEIOS_METAL_SKIP=prime-key-and-cache-line-by-compiler-ids). The CI is its first compile; nothing of it has run.
+Applies only after: 0009-render-pipelines-kept-and-made-at-boot.patch 0011-archive-asks-made-in-the-background.patch
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index cbe2f6c..0f00922 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -7307,7 +7307,31 @@ id oneiosKeptState(MTLRenderPipelineDescriptor *d,MTLPipelineOption options) {
+  archiveMake(d,queued);
+  return nil;
+ }
++// OneiOS 0012: what the shader cache kept from earlier boots did for this one, said in iOS's log without any switch: the render server's
++// counts of translations and driver pipeline data found in the cache directory, not found (made new) and written, and the two ids
++// the kept files are named by (the translator's source, nmb_runtime_build; Turnip's pipeline cache id, ONEIOS_TURNIP_BUILD). Two
++// builds that print the same two ids read each other's files: a first boot of the newer one then finds nearly everything.
++// `native-metal: shader cache (WHEN): F found, N not found, W written; kept by translator T, Turnip U`
++#if __has_include("OneiOSTurnipBuild.h")
++#include "OneiOSTurnipBuild.h"
++#endif
++#ifndef ONEIOS_TURNIP_BUILD
++#define ONEIOS_TURNIP_BUILD ""
++#endif
++static void oneiosCacheSay(const char *when) {
++ uint64_t work[10]={};
++ if(!gDevice || !nmb_device_work_stats(gDevice,work))return;
++ const char *turnip=ONEIOS_TURNIP_BUILD;
++ NBLOG(@"native-metal: shader cache (%s): %llu found, %llu not found, %llu written; kept by translator %.12s, Turnip %.12s",when,
++       (unsigned long long)work[7],(unsigned long long)work[8],(unsigned long long)work[9],nmb_runtime_build(),turnip[0]?turnip:"(its LC_UUID)");
++}
+ void oneiosKeepState(MTLRenderPipelineDescriptor *d,id state) {
++ if(isRenderServer()) {   // once a boot, with or without oneios-prewarm
++  static std::atomic<bool> asked{false};
++  if(!asked.exchange(true))
++   dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(60*NSEC_PER_SEC)),dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
++    oneiosCacheSay("60 s after the first render pipeline");});
++ }
+  if(!prewarmOn() || !state)return;
+  std::string line;bool record=false;
+  {std::lock_guard<std::mutex> lock(gKeptLock);
+@@ -7451,5 +7475,6 @@ static void prewarmStart() {
+   NBLOG(@"native-metal: prewarm: %u of %zu descriptors made in %llu ms (%u refused, %u already kept)",made,lines.size(),
+         (unsigned long long)((nowUs()-began)/1000),refused,kept);
+   if(archiveOn())archiveSay("at the boot pass's end");
++  oneiosCacheSay("at the boot pass's end");
+  });
+ }
+diff --git a/PrimeShaders.h b/PrimeShaders.h
+index 6db8352..09696c9 100644
+--- a/PrimeShaders.h
++++ b/PrimeShaders.h
+@@ -232,8 +232,19 @@ static std::string imageUuid(const char *suffix) {
+ // cache (int-246: after a runtime change the Vulkan cache had 0 hits and 214 misses, while prime-done still listed every library), and
+ // Turnip's build, which keys its pipeline cache (int-249: 4099 misses after a Turnip rebuild). A change of either primes every library
+ // again; a plugin rebuild alone keeps what was finished.
++// OneiOS 0012: Turnip's half is the id its pipeline cache is keyed by (ONEIOS_TURNIP_BUILD, OneiOSTurnipBuild.h written by userland/metal/
++// build.sh from build-turnip-darwin.py's -Dtu-build-id: Mesa's pin, its patches' diff, its extra sources), not the dylib's LC_UUID, which
++// every link of the same source changes: a CI build of unchanged compilers then primed every library again although the translations
++// and the driver's pipelines of the build before were all still read. Without the header (a build outside build.sh): the LC_UUID.
++#if __has_include("OneiOSTurnipBuild.h")
++#include "OneiOSTurnipBuild.h"
++#endif
++#ifndef ONEIOS_TURNIP_BUILD
++#define ONEIOS_TURNIP_BUILD ""
++#endif
+ static std::string buildId() {
+-    return std::string(nmb_runtime_build()) + "-" + imageUuid("/libvulkan_freedreno.dylib");
++    const std::string turnip = ONEIOS_TURNIP_BUILD;
++    return std::string(nmb_runtime_build()) + "-" + (turnip.empty() ? imageUuid("/libvulkan_freedreno.dylib") : turnip);
+ }
+ 
+ // A kernel that calls visible functions it does not define (`NeedsInput(LinkedFunction { symbol: "..." })`): link the library's function of
