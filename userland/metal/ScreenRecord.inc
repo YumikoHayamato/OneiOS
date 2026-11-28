@@ -37,6 +37,7 @@
 //   "OneiOS screenrec: CPU scaler installed (N entries)"      at start, or "... not installed: <why>"
 //   "OneiOS screenrec: first copy SRC WxH 'FMT' -> DST WxH 'FMT' (async A, events S/D)"
 //   "OneiOS screenrec: N copies, last M us, average A us, failed F"   every 600 copies
+//       take23: "...; of the average: waits W us, locks L us, copy C us; this recording: K copies in T ms (R a second)"
 //   "OneiOS screenrec: cannot copy 'FMT' -> 'FMT' (...)"              once per pair of formats it does not do
 
 #include <stddef.h>
@@ -298,6 +299,7 @@ struct Accel {
 
 static CFStringRef keySrcRef, keySrcWait, keySrcSignal, keyDstRef, keyDstWait, keyDstSignal, keySkipAsync;
 static uint64_t gCopies, gFailed, gTotalUs, gLastUs;
+static uint64_t gWaitUs, gLockUs, gCopyUs;  // take23: the average's two parts
 static bool gFirstLogged;
 static uint32_t gRefused[8][2];
 static unsigned gRefusedCount;
@@ -484,6 +486,8 @@ static int32_t transformSurface(const void *ref, SurfaceRef src, SurfaceRef dst,
     numberU64(options, keyDstRef, dstRef); numberU64(options, keyDstWait, dstWait); numberU64(options, keyDstSignal, dstSignal);
     eventWait(srcRef, srcWait);  // the writer of the source (the GPU's frame) is done
     eventWait(dstRef, dstWait);  // the destination's last reader is done
+    const uint64_t t1 = mach_absolute_time();  // take23: the waits and the copy timed apart (which of them is the 12 ms)
+    uint64_t t1b = t1;                         // ... and the two IOSurface locks (a lock waits for the GPU's writers)
     const uint32_t sf = S.pixelFormat(src), df = S.pixelFormat(dst);
     int32_t status = kIOReturnUnsupported_;
     Rect rs, rd;
@@ -493,6 +497,7 @@ static int32_t transformSurface(const void *ref, SurfaceRef src, SurfaceRef dst,
         status = kIOReturnBadArgument_;
     } else if (S.lock(src, 1 /* kIOSurfaceLockReadOnly */, nullptr) == 0) {
         if (S.lock(dst, 0, nullptr) == 0) {
+            t1b = mach_absolute_time();
             void *sb[2] = {S.baseAddress(src), nullptr}, *db[2] = {S.baseAddress(dst), nullptr};
             if (S.planeCount(src)) sb[0] = S.baseAddressOfPlane(src, 0);
             if (S.planeCount(dst)) for (size_t i = 0; i < 2 && i < S.planeCount(dst); i++) db[i] = S.baseAddressOfPlane(dst, i);
@@ -526,10 +531,18 @@ static int32_t transformSurface(const void *ref, SurfaceRef src, SurfaceRef dst,
         }
         S.unlock(src, 1, nullptr);
     }
+    const uint64_t t2 = mach_absolute_time();
     eventSignal(srcRef, srcSignal);  // done reading the source
     eventSignal(dstRef, dstSignal);  // the destination holds the frame (also on failure: no one waits forever)
     const uint64_t us = (mach_absolute_time() - t0) * gTimebase.numer / gTimebase.denom / 1000;
     gCopies++; gLastUs = us; gTotalUs += us;
+    gWaitUs += (t1 - t0) * gTimebase.numer / gTimebase.denom / 1000;
+    gLockUs += (t1b - t1) * gTimebase.numer / gTimebase.denom / 1000;
+    gCopyUs += (t2 - t1b) * gTimebase.numer / gTimebase.denom / 1000;
+    // take23: how often the copies come (the rate the clone display asks at), per 600
+    static uint64_t gSpanStart, gSpanCopies, gSpanLast;   // a span ends at a pause of half a second (another recording)
+    if (!gSpanCopies || (t0 - gSpanLast) * gTimebase.numer / gTimebase.denom > 500000000ull) { gSpanStart = t0; gSpanCopies = 0; }
+    gSpanCopies++; gSpanLast = t0;
     if (status) gFailed++;
     if (!gFirstLogged && status == kIOReturnSuccess_) {
         gFirstLogged = true;
@@ -539,10 +552,16 @@ static int32_t transformSurface(const void *ref, SurfaceRef src, SurfaceRef dst,
                rs.w, rs.h, a1, rd.w, rd.h, b1, completion && completion->func ? 1 : 0, srcRef ? 1 : 0, dstRef ? 1 : 0,
                (unsigned long long)us);
     }
-    if (gCopies % 600 == 0)
-        os_log(OS_LOG_DEFAULT, "OneiOS screenrec: %llu copies, last %llu us, average %llu us, failed %llu",
+    if (gCopies % 600 == 0) {
+        const uint64_t spanMs = (t0 - gSpanStart) * gTimebase.numer / gTimebase.denom / 1000000;
+        os_log(OS_LOG_DEFAULT, "OneiOS screenrec: %llu copies, last %llu us, average %llu us, failed %llu; of the average: waits %llu us, "
+               "locks %llu us, copy %llu us; this recording: %llu copies in %llu ms (%llu a second)",
                (unsigned long long)gCopies, (unsigned long long)gLastUs, (unsigned long long)(gTotalUs / gCopies),
-               (unsigned long long)gFailed);
+               (unsigned long long)gFailed, (unsigned long long)(gWaitUs / gCopies), (unsigned long long)(gLockUs / gCopies),
+               (unsigned long long)(gCopyUs / gCopies),
+               (unsigned long long)gSpanCopies, (unsigned long long)spanMs,
+               (unsigned long long)(spanMs ? (gSpanCopies - 1) * 1000 / spanMs : 0));
+    }
     // The framework answers an asynchronous request at once and calls back later; a refused one it answers with the error
     // and no callback. QuartzCore calls the callback itself for a synchronous one (completion is then null).
     if (status == kIOReturnSuccess_ && completion && completion->func && !flag(options, keySkipAsync))

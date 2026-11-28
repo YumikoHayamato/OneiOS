@@ -29,6 +29,10 @@
 //                              same-user shared directory stays
 //   oneios-prewarm=1           ONEIOS_PREWARM=1: take20's kept render pipeline states and its boot pass (NativeMetal 0009); OFF
 //                              without it (the base's own warm pass, metal-flow bit 4, is on either way). oneios-prewarm-max=N
+//   oneios-prewarm-archive=0   ONEIOS_PREWARM_ARCHIVE=0 (take23, NativeMetal 0011): with oneios-prewarm=1 the pipelines Core Animation
+//                              asks its binary archive for are made in the background; this leaves those asks alone, as take22
+//   oneios-res-log=1           ONEIOS_RES_LOG=1 (take23, NativeMetal 0011): a diagnostic; backboardd logs the buffers and textures it
+//                              makes, by size, and the time they took (`native-metal: res:`), at most every 2 s
 //   oneios-pipeline-wait-ms=N  backboardd alone, ONEIOS_PIPELINE_WAIT_MS=N (1..4500): a pipeline state's creation and a command
 //                              buffer wait N ms at most for a driver pipeline being made, on the runtime's pool; what the
 //                              new pipeline draws is left out until it is made (NativeMetal 0010); OFF without it: every
@@ -107,6 +111,8 @@ __attribute__((constructor)) static void apply() {
         {"oneios-drawable-release=1", "ONEIOS_DRAWABLE_RELEASE", "1"},
         {"oneios-client-cache=temp", "ONEIOS_CLIENT_CACHE", "temp"},
         {"oneios-prewarm=1", "ONEIOS_PREWARM", "1"},
+        {"oneios-prewarm-archive=0", "ONEIOS_PREWARM_ARCHIVE", "0"},   // take23, NativeMetal 0011
+        {"oneios-res-log=1", "ONEIOS_RES_LOG", "1"},                   // take23, NativeMetal 0011 (a diagnostic)
     };
     for (const Flag &flag : flags)
         if (bootWord(args, flag.word)) {

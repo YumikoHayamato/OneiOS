@@ -1,0 +1,175 @@
+OneiOS take23, stack 555b13d (NativeMetal 935c468), patches-555b13d/NativeMetal/0011: the pipelines Core Animation asks its binary
+archive for are made in the background, and a counter of what the render server allocates (a diagnostic).
+Upstream: none (OneiOS). Needs 0009 (the kept states); applies after 0001-0010.
+
+1. Archive asks. ON with oneios-prewarm=1; off with oneios-prewarm-archive=0 (ONEIOS_PREWARM_ARCHIVE=0).
+What: newRenderPipelineStateWithDescriptor:options:... with MTLPipelineOptionFailOnBinaryArchiveMiss ("give me this pipeline only if
+it needs no compile") was left alone by 0009 and refused by the runtime (no binary archive here). Now oneiosKeptState answers it from
+the kept states when an equal descriptor's state is kept; when none is, the ask is refused as before and a copy of the descriptor
+(binaryArchives cleared) is made on a serial utility-QoS queue, after the render server's own asks have been quiet for 100 ms, one
+every 4 ms; the state is kept (and recorded in prewarm2.log) by 0009's oneiosKeepState, so the first real use is returned at once
+and the next boot's pass makes it too. Each descriptor is queued once a boot; nothing is queued past oneios-prewarm-max.
+Why: take22b's iOS log, backboardd, 03:49:08.3-08.5 UTC: 64 "render pipeline refused: ... BinaryArchiveMiss ... compiler untried"
+lines in 0.2 s (the log's limit; the count after it is not printed), for fixed_frag_lph_cpf, the path_*, blur, downsample and all the
+glass_* functions: Core Animation's own list of the pipelines the system's animations need, asked before any of them is drawn. They
+were made later, each at its first use on the render thread (0009's header: 1.3-25 ms each): "an animation never seen before
+stutters the first time". The owner asked for every system animation to be compiled ahead; this is Core Animation's list of them.
+Risk: low-medium. An archive ask answered with a kept state: Core Animation gets a pipeline where it got nil; the state is the one
+its next ask without the option would have got (same key). The background compiles: CPU at utility QoS at the boot (a pipeline is
+1-25 ms; 0009's pass already does the same 20 s later). A descriptor that cannot be made fails once a boot (counted).
+iOS's log (backboardd): `native-metal: archive asks (so far|at the boot pass's end): A asked, H answered from the kept states, M made in
+the background (F failed), N not queued (the K kept states' limit)`.
+
+2. The allocation counter. OFF without oneios-res-log=1 (ONEIOS_RES_LOG=1); backboardd only.
+What: newBufferWithLength:, newBufferWithBytes: and newTextureWithDescriptor: of the device are timed; at most every 2 s one line:
+`native-metal: res: buffers <16K/<64K/<256K/<1M/more +a/+b/+c/+d/+e in T us (S of 4 ms or more, the longest M us); textures ...`.
+Why: take22b, rounds 52-54 (03:57:11-03:57:41 UTC, the "..." menus and the Share sheet of Notes): the kernel's oneios-gpu-memory
+says backboardd made +1277, +970 and +889 GPU blobs in 10 s each (28 in a round of scrolling), oneios-gpu-ages that 1246 of them
+were under 64 KiB, oneios-gpu-legs that 62 of the 1277 took 8 ms or longer (8 over 33 ms). The kernel cannot say whether they are
+buffers or textures, nor which call made them; this line does, for the diagnostic image.
+Checked on the PC: applies to 935c468 after 0001-0010 (git apply); the base's build-adreno-metal-plugin.py (UniXNU 8789b8d) edits none
+of the lines touched. Not compiled here (no iPhoneOS SDK): the CI is its first compile. Nothing of it has run.
+Removable: yes (ONEIOS_METAL_SKIP=archive-asks-made-in-the-background).
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 28b3f23..b6ba859 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -5647,7 +5647,10 @@ static void fillBaseLimits(id device);
+  NBQueue *queue=[NBQueue new];queue.handle=handle;return (id<MTLCommandQueue>)queue;
+ }
+ - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
++ bool oneiosResOn();void oneiosResNote(int,uint64_t,uint64_t);   // OneiOS 0011, at the end of this file
++ const uint64_t resBegan=oneiosResOn()?nowUs():0;
+  NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,nullptr);
++ if(resBegan)oneiosResNote(0,length,resBegan);
+  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;
+  {NmbTextureDescriptor none={};none.options=options;buffer.asked=askedToken(1,length,none);}
+@@ -5655,7 +5658,10 @@ static void fillBaseLimits(id device);
+ }
+ - (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options {
+  if(!bytes)return nil;
++ bool oneiosResOn();void oneiosResNote(int,uint64_t,uint64_t);   // OneiOS 0011
++ const uint64_t resBegan=oneiosResOn()?nowUs():0;
+  NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,bytes);
++ if(resBegan)oneiosResNote(0,length,resBegan);
+  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
+  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;
+  {NmbTextureDescriptor none={};none.options=options;buffer.asked=askedToken(1,length,none);}
+@@ -5674,7 +5680,10 @@ static void fillBaseLimits(id device);
+ }
+ - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
+  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
++ bool oneiosResOn();void oneiosResNote(int,uint64_t,uint64_t);   // OneiOS 0011
++ const uint64_t resBegan=oneiosResOn()?nowUs():0;
+  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
++ if(resBegan)oneiosResNote(1,(uint64_t)descriptor.width*(uint64_t)descriptor.height*4,resBegan);
+  if(gLogTextures && textureLogTurn())
+   GLOG(@"native-metal: texture-log %llu texture %llux%llu fmt %llu type %llu levels %llu usage %llx options %llx %s",
+         (unsigned long long)gTexturesLogged.load(),(unsigned long long)descriptor.width,(unsigned long long)descriptor.height,
+@@ -7125,6 +7134,28 @@ extern "C" size_t native_bridge_metal_formats(char *out,size_t size) {
+ #include <fstream>
+ #include <sstream>
+ #include <pwd.h>
++// OneiOS NativeMetal 0011 (take23), a diagnostic: what the render server allocates, and how long each allocation took. take22b: while
++// menus opened, backboardd made 900-1300 GPU blobs in 10 s, nearly all under 64 KiB, 5 % of them 8 ms or longer (the kernel's
++// oneios-gpu-legs); the kernel cannot say what they are. With ONEIOS_RES_LOG=1 (oneios-res-log=1), backboardd only: buffers and
++// textures made since the last line, by size, with the time spent making them; at most a line every 2 s, none while nothing is made.
++bool oneiosResOn() {static const bool on=[](){const char *v=getenv("ONEIOS_RES_LOG");return v && !strcmp(v,"1") && !strcmp(getprogname(),"backboardd");}();return on;}
++void oneiosResNote(int kind,uint64_t bytes,uint64_t began) {
++ static std::atomic<uint64_t> count[2][5],us[2],slow[2],most[2],said{0};
++ const uint64_t now=nowUs(),took=now-began;
++ const int c=bytes<16384?0:bytes<65536?1:bytes<262144?2:bytes<1048576?3:4;
++ count[kind][c]++;us[kind]+=took;if(took>=4000)slow[kind]++;
++ uint64_t m=most[kind].load();while(took>m && !most[kind].compare_exchange_weak(m,took)){}
++ uint64_t last=said.load();
++ if(now-last<2000000 || !said.compare_exchange_strong(last,now))return;
++ uint64_t n[2][5],t[2],sl[2],mx[2];
++ for(int k=0;k<2;k++){for(int i=0;i<5;i++)n[k][i]=count[k][i].exchange(0);t[k]=us[k].exchange(0);sl[k]=slow[k].exchange(0);mx[k]=most[k].exchange(0);}
++ NBLOG(@"native-metal: res: buffers <16K/<64K/<256K/<1M/more +%llu/+%llu/+%llu/+%llu/+%llu in %llu us (%llu of 4 ms or more, the longest %llu us); "
++       "textures (4 bytes a pixel assumed) +%llu/+%llu/+%llu/+%llu/+%llu in %llu us (%llu of 4 ms or more, the longest %llu us)",
++       (unsigned long long)n[0][0],(unsigned long long)n[0][1],(unsigned long long)n[0][2],(unsigned long long)n[0][3],(unsigned long long)n[0][4],
++       (unsigned long long)t[0],(unsigned long long)sl[0],(unsigned long long)mx[0],
++       (unsigned long long)n[1][0],(unsigned long long)n[1][1],(unsigned long long)n[1][2],(unsigned long long)n[1][3],(unsigned long long)n[1][4],
++       (unsigned long long)t[1],(unsigned long long)sl[1],(unsigned long long)mx[1]);
++}
+ static bool prewarmOn() {static const bool on=[](){const char *v=getenv("ONEIOS_PREWARM");return v && !strcmp(v,"1") && !strcmp(getprogname(),"backboardd");}();return on;}
+ static std::mutex &gKeptLock=*new std::mutex;   // never destroyed (see gAskedLock)
+ static std::unordered_map<std::string,id> &gKept=*new std::unordered_map<std::string,id>;
+@@ -7215,16 +7246,61 @@ static void prewarmStart();
+ static thread_local bool tPrewarming;   // the made-again thread's own creations do not hold it back
+ // The creation's hooks (newRenderPipelineStateWithDescriptor:options:reflection:error: declares them where it calls them): the kept
+ // state of an equal descriptor, or nil; and the state it made, to keep.
++// OneiOS NativeMetal 0011 (take23): the asks that must not compile (MTLPipelineOptionFailOnBinaryArchiveMiss). Core Animation asks its
++// binary archive for the pipelines it expects to need (87 such asks in 0.2 s at take22b's boot, the glass and blur ones among them);
++// this plug-in has no archive, so each was refused and the pipeline was made at its first real use, on the render thread. Now such
++// an ask is answered from the kept states when an equal descriptor's state is there (that is what "in the archive" means: no compile),
++// and when it is not, a copy of the descriptor is made in the background (utility QoS, one at a time, after the render server's own
++// asks), so the first real use finds it kept. The ask itself is refused as before. Off: ONEIOS_PREWARM_ARCHIVE=0 (oneios-prewarm-archive=0).
++static bool archiveOn() {static const bool on=[](){const char *v=getenv("ONEIOS_PREWARM_ARCHIVE");return !(v && !strcmp(v,"0"));}();return on;}
++static std::unordered_set<std::string> &gArchiveQueued=*new std::unordered_set<std::string>;   // gKeptLock held
++static std::atomic<uint64_t> gArchiveAsks{0},gArchiveHits{0},gArchiveMade{0},gArchiveFailed{0},gArchiveFull{0};
++static void archiveSay(const char *when) {
++ NBLOG(@"native-metal: archive asks (%s): %llu asked, %llu answered from the kept states, %llu made in the background (%llu failed), %llu not queued (the %zu kept states' limit)",
++       when,(unsigned long long)gArchiveAsks.load(),(unsigned long long)gArchiveHits.load(),(unsigned long long)gArchiveMade.load(),
++       (unsigned long long)gArchiveFailed.load(),(unsigned long long)gArchiveFull.load(),keptMost());
++}
++static void archiveMake(MTLRenderPipelineDescriptor *d) {
++ static dispatch_queue_t queue=dispatch_queue_create("oneios.prewarm.archive",dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_UTILITY,0));
++ MTLRenderPipelineDescriptor *copy=[d copy];
++ if(!copy)return;
++ copy.binaryArchives=nil;
++ dispatch_async(queue,^{
++  struct Flag {Flag(){tPrewarming=true;} ~Flag(){tPrewarming=false;}} flag;   // GCD's thread serves others after this block
++  while(nowUs()-gLastAsked.load()<100000)usleep(20000);   // the render server first
++  id<MTLDevice> device=gDeviceObject;if(!device)return;
++  @autoreleasepool {
++   NSError *e=nil;
++   id<MTLRenderPipelineState> state=[device newRenderPipelineStateWithDescriptor:copy error:&e];   // kept by oneiosKeepState
++   if(state)gArchiveMade++;else gArchiveFailed++;
++  }
++  const uint64_t done=gArchiveMade.load()+gArchiveFailed.load();
++  if(done==1 || done%64==0)archiveSay("so far");
++  usleep(4000);
++ });
++}
+ id oneiosKeptState(MTLRenderPipelineDescriptor *d,MTLPipelineOption options) {
+- if(!prewarmOn() || (options & MTLPipelineOptionFailOnBinaryArchiveMiss))return nil;
++ if(!prewarmOn())return nil;
++ const bool archiveAsk=(options & MTLPipelineOptionFailOnBinaryArchiveMiss)!=0;
++ if(archiveAsk && !archiveOn())return nil;
+  if(!tPrewarming)gLastAsked=nowUs();
+  if(!gPrewarmStarted.exchange(true))prewarmStart();
+- std::string line;std::lock_guard<std::mutex> lock(gKeptLock);
+- const std::string key=keptKey(d,&line);if(key.empty())return nil;
+- auto it=gKept.find(key);if(it==gKept.end())return nil;
+- const uint64_t hits=++gKeptHits;
+- if(hits%1000==0)NBLOG(@"native-metal: kept states: %llu returned, %llu made",(unsigned long long)hits,(unsigned long long)gKeptMade.load());
+- return it->second;
++ {std::string line;std::lock_guard<std::mutex> lock(gKeptLock);
++  const std::string key=keptKey(d,&line);if(key.empty())return nil;
++  if(archiveAsk)gArchiveAsks++;
++  auto it=gKept.find(key);
++  if(it!=gKept.end()) {
++   const uint64_t hits=++gKeptHits;
++   if(archiveAsk)gArchiveHits++;
++   if(hits%1000==0)NBLOG(@"native-metal: kept states: %llu returned, %llu made",(unsigned long long)hits,(unsigned long long)gKeptMade.load());
++   return it->second;
++  }
++  if(!archiveAsk)return nil;
++  if(gKept.size()+gArchiveQueued.size()>=keptMost()){gArchiveFull++;return nil;}
++  if(!gArchiveQueued.insert(key).second)return nil;   // asked before: being made, or it failed
++ }
++ archiveMake(d);
++ return nil;
+ }
+ void oneiosKeepState(MTLRenderPipelineDescriptor *d,id state) {
+  if(!prewarmOn() || !state)return;
+@@ -7369,5 +7445,6 @@ static void prewarmStart() {
+   }
+   NBLOG(@"native-metal: prewarm: %u of %zu descriptors made in %llu ms (%u refused, %u already kept)",made,lines.size(),
+         (unsigned long long)((nowUs()-began)/1000),refused,kept);
++  if(archiveOn())archiveSay("at the boot pass's end");
+  });
+ }
