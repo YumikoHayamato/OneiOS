@@ -1,0 +1,102 @@
+OneiOS, stack 555b13d, patches-555b13d/mesa/0001: patches/mesa/0003 (take18, idle-bo-cache-trim) unchanged, after the 34 recorded
+patches of Droid-VM/UniXNU 8789b8d's scripts/data/adreno-compiler-inputs.json (which now hold what patches/mesa/0001 and 0002
+were: upstream-78fd465c-tu-clear-unused-sp-xs-bases and turnip-darwin-submit-split-at-command-buffers). Called once a minute by
+Switches-555b13d.inc's oneios_idle_tick (patches-555b13d/NativeMetal/0002). Switch: oneios-bo-cache-idle=0.
+
+OneiOS take18, userland/metal/patches/mesa/0003: Turnip's freed-BO cache gives back BOs no allocation took for 30 s.
+Upstream: upstream OneiOS cb32176, userland/metal/turnip-idle-bo-cache.patch (2026-11-24), made for this Mesa; applies with
+a 3-line offset (contexts made again: upstream applied it after its trace patch).
+What: tu_darwin_bo_cache_trim_idle(age_ms), exported: the cached BOs that sat in the cache for age_ms or longer go back to
+the host. Called once a minute with 30000 by userland/metal/Switches.inc's oneios_idle_tick, from NativeMetal 0002's idle
+timer (upstream called it from its own row thread, CommandPoolRow.inc).
+Why: the cache went back only past its budgets (96 + 16 MiB in the render server, 16 + 8 elsewhere) or at a memory
+pressure rise, so a process that went still kept it full (upstream: "tuc 78M" in backboardd at a still screen), every BO
+wired guest memory.
+Needs: NativeMetal 0002 (the caller's timer). Switch: boot argument oneios-bo-cache-idle=0 (upstream's name): never called.
+Removable: yes (ONEIOS_METAL_SKIP=idle-bo-cache-trim). Turnip's build id changes.
+
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index 7afff10..1ef6811 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -223,6 +223,7 @@ struct darwin_cached_bo {
+    void *mapping;
+    uint32_t token;
+    bool read_only;
++   uint64_t cached_ns;   /* OneiOS: when it was cached (tu_darwin_bo_cache_trim_idle) */
+ };
+ struct darwin_bo_cache_stats {
+    uint64_t lookups, hits, inserts, evictions, flushes, bytes_peak;
+@@ -259,6 +260,7 @@ struct darwin_retire_state {
+    struct darwin_va va;
+ };
+ static struct darwin_retire_state *darwin_stats_state;   /* for tu_darwin_bo_cache_stats */
++static struct tu_device *darwin_stats_dev;   /* OneiOS: its device, for tu_darwin_bo_cache_trim_idle */
+ 
+ extern "C" __attribute__((visibility("default"))) void tu_darwin_bo_cache_stats(uint64_t out[8]);
+ extern "C" __attribute__((visibility("default"))) void
+@@ -802,7 +804,7 @@ darwin_cache_put(struct tu_device *dev, struct darwin_retire_state *retire, cons
+    if (bo->size > (darwin_small(bo->size) ? darwin_cache_small_budget() : darwin_cache_budget()))
+       return false;
+    retire->cache[retire->cache_count++] = {bo->handle, bo->iova, bo->size, ++retire->cache_stamp, bo->mapping, bo->token,
+-                                           bo->read_only};
++                                           bo->read_only, os_time_get_nano()};
+    retire->cache_bytes += bo->size;
+    const bool small = darwin_small(bo->size);
+    if (small)
+@@ -883,6 +885,39 @@ darwin_cache_trim(struct tu_device *dev, struct darwin_retire_state *retire)
+    darwin_cache_flush(dev, retire);
+ }
+ 
++/* OneiOS: the cached BOs that sat in the cache for `age_ms` or longer, no allocation having taken them, go back to the host: the
++ * bytes released. The Metal plug-in's GPU memory row calls it every 60 s with 30000 (userland/metal/CommandPoolRow.inc; boot
++ * argument oneios-bo-cache-idle=0: never called). The cache went back only past its budgets or at a memory pressure rise, so a
++ * process that went still kept it full: the render server's 78 MiB at a still screen (oneios-gpu-text "tuc 78M", 2026-11-23), every
++ * BO wired guest memory. A BO asked for again within the age is a hit as before; one asked later is a new BO, as past the budget. */
++extern "C" __attribute__((visibility("default"))) uint64_t tu_darwin_bo_cache_trim_idle(uint64_t age_ms);
++extern "C" __attribute__((visibility("default"))) uint64_t
++tu_darwin_bo_cache_trim_idle(uint64_t age_ms)
++{
++   struct darwin_retire_state *retire = darwin_stats_state;
++   struct tu_device *dev = darwin_stats_dev;
++   if (!retire || !dev)
++      return 0;
++   const uint64_t age = age_ms * 1000000ull;
++   uint64_t released = 0;
++   pthread_mutex_lock(&retire->lock);
++   const uint64_t now = os_time_get_nano();
++   /* From the end: an eviction moves the last entry into the slot, one already looked at. */
++   for (unsigned i = retire->cache_count; i-- > 0;) {
++      const struct darwin_cached_bo *e = &retire->cache[i];
++      if (now - e->cached_ns < age)
++         continue;
++      const uint64_t size = e->size;
++      const VkResult result = darwin_cache_evict(dev, retire, i);
++      if (result == VK_SUCCESS)
++         released += size;
++      else if (result != VK_NOT_READY)
++         break;   /* the device is lost (darwin_release_native said so) */
++   }
++   pthread_mutex_unlock(&retire->lock);
++   return released;
++}
++
+ /* The process's memory-pressure source, made once: libdispatch delivers the kernel's memorystatus levels to it. */
+ static void
+ darwin_watch_memory_pressure(void)
+@@ -1704,6 +1739,7 @@ darwin_device_init(struct tu_device *dev)
+    }
+    dev->darwin_retire = retire;
+    darwin_stats_state = retire;
++   darwin_stats_dev = dev;
+    darwin_watch_memory_pressure();
+    retire->pressure_seen = p_atomic_read(&darwin_memory_pressure);
+    return VK_SUCCESS;
+@@ -1725,6 +1761,7 @@ darwin_device_finish(struct tu_device *dev)
+       if (retire->cache_stats.lookups)
+          darwin_cache_log(retire);
+       darwin_stats_state = NULL;
++      darwin_stats_dev = NULL;
+       rb_tree_foreach_safe(struct darwin_va_hole, hole, &retire->va.address, by_address)
+          free(hole);
+       pthread_mutex_destroy(&retire->lock);

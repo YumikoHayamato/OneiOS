@@ -1,0 +1,165 @@
+OneiOS, stack 555b13d (NativeMetal 935c468), patches-555b13d/NativeMetal/0005: patches/NativeMetal/0014 (take18) unchanged,
+appended at the end of NativeAdrenoMetalPlugin.mm (after the base's macOS-only block, at file scope).
+Switch: oneios-dl-full=0 (read by its own constructor). Removable: yes (ONEIOS_METAL_SKIP=display-links-at-panel-rate).
+
+The header of the 624bab3 stack's patch (patches/NativeMetal/0014-display-links-at-panel-rate.patch), which says the what and the why:
+| OneiOS take18, userland/metal/patches/NativeMetal/0014: UIKit's in-process animations run at the panel's rate.
+| Upstream: upstream OneiOS e84a46e (fix/s24-fps-heat-camera, 2026-11-25), userland/metal/DisplayLinks.inc, verbatim but for
+| its first lines (where it sits) and its docs reference; itself from qiumochen/UniXNU-zizhan 42629e5 (userland/ui_compat18.c
+| display_link_rates, MIT; from hakios 7caa457). Upstream built it on its build laptop and did not boot it (its
+| docs/s24-fps-heat-camera.md: "built and host-tested ..., not booted"); nor was it booted here.
+| What: at the end of NativeAdrenoMetalPlugin.mm, a constructor (every process but backboardd that loads the plug-in) hooks
+| CADisplayLink's makers (+displayLinkWithTarget:selector:, +displayLinkWithDisplay:target:selector:, -[CADisplay
+| displayLinkWithTarget:selector:]) and its two rate setters: a link whose target's class name holds
+| "InProcessAnimationManager" (iOS 27's AnimationKit manager and UIKit's nested classes) asks for the display's own rate
+| (preferredFramesPerSecond 0, CAFrameRateRangeDefault) instead of the 20..120 / 30 preferred it asks. Every other link
+| keeps the rate it asks.
+| Why: stutter. Those in-process animations (a home-screen page settling, an app opening and closing) got frames 33 ms
+| apart while the panel refreshes whatever is drawn; upstream zizhan measured moving 56.7-58.4 -> 95.3 fps, the frame
+| interval p50 after a release 33.2 -> 8.3 ms. Cost: during such an animation the app and backboardd draw at the panel's
+| rate, as One UI's own animations do.
+| Logs (iOS's log): "OneiOS display links: hooked (made M fps 1 range 1)", then once a process "... in-process animation link
+| at the panel's rate (asked MIN..MAX, PREF)", and the first 4 other links asking under 120 ("... kept: CLASS asks ...").
+| Switch: boot argument oneios-dl-full=0 keeps every rate asked. Removable: yes (ONEIOS_METAL_SKIP=display-links-at-panel-rate).
+
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+index db930b2..6691029 100644
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -1010,3 +1010,136 @@ __attribute__((constructor)) static void freeWakeupFromBootArgs() {
+     os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal: free wakeup on (%.2f ms)", refresh * 1e3);
+ }
+ #endif
++
++// SPDX-License-Identifier: MIT
++//
++// OneiOS: UIKit's in-process animations at the panel's rate (upstream OneiOS e84a46e, userland/metal/DisplayLinks.inc, here
++// userland/metal/patches/NativeMetal/0014, docs/gpu.md 7.1). At the end of the Metal plug-in's NativeAdrenoMetalPlugin.mm: the
++// plug-in is the OneiOS code that every process with a Metal device loads (SpringBoard, Safari, WebKit's GPU process, the posters, backboardd: oneios-gpu-text lines of the
++// 2026-11-24 gpumem session).
++//
++// Why: the in-process animation manager (the animations an app or SpringBoard runs in its own process, a home-screen
++// page settling, an app's open and close) asks its CADisplayLink for 20..120 a second, 30 preferred. On a ProMotion
++// iPhone the low rate saves power; here the panel refreshes at 120 whatever is drawn, so those frames came 33 ms apart.
++// Ported from UniXNU-zizhan (qiumochen/UniXNU-zizhan, userland/ui_compat18.c display_link_rates, commit 42629e5, SPDX
++// MIT; itself from hakios 7caa457): their moving fps 56.7-58.4 -> 95.3, the frame interval p50 after a release 33.2 ->
++// 8.3 ms (docs/evidence/2026-11-04-g298-displaylink.txt there). Only the animation manager's links lose the rate they
++// ask; every other link (the clock's, the motion effects') keeps it.
++//
++// iOS 27 (24A446's cache, `oneios-tool sym cstr`): the manager is AnimationKit's (`_TtC12AnimationKit25InProcess-
++// AnimationManager`, with UIKit's nested `...InProcessAnimationManager...CADisplayBasedDisplay` and `DisplayObserver`),
++// not UIKit's of iPadOS 18, so the target's class name is matched by the part "InProcessAnimationManager" (zizhan
++// compared whole names). A link can be made three ways: +[CADisplayLink displayLinkWithTarget:selector:],
++// +[CADisplayLink displayLinkWithDisplay:target:selector:] and -[CADisplay displayLinkWithTarget:selector:] (UIKit's
++// display-based path, a guess from the class name): each that exists is hooked, marking is the same in all three.
++//
++// Switch: boot argument oneios-dl-full=0 (boot-args-add=oneios-dl-full=0 in the image set's xnuhost.conf) keeps every
++// rate asked (docs/gpu.md 7.1). A link made before the plug-in loaded is not marked.
++//
++// What it logs (iOS's log, each process that loads the plug-in; lasting, a handful of lines a process):
++//   "OneiOS display links: hooked (made M fps 1 range 1)"   M: the makers hooked, of 3
++//   "OneiOS display links: <process> in-process animation link at the panel's rate (asked MIN..MAX, PREF)"  the first one
++//   "OneiOS display links: <process> kept: <class> asks MIN..MAX, PREF"   the first 4 other links that ask under 120: the
++//                                                                         class to match if the animations stay slow
++// nothing with oneios-dl-full=0.
++#include <CoreFoundation/CoreFoundation.h>
++#include <objc/runtime.h>
++#include <os/log.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/sysctl.h>
++#include <atomic>
++
++namespace oneios_display_links {
++struct Range { float minimum, maximum, preferred; };   // CAFrameRateRange
++typedef id (*Maker)(id, SEL, id, SEL);
++static Maker madeOriginal, screenMadeOriginal;
++static id (*withDisplayOriginal)(id, SEL, id, id, SEL);
++static void (*fpsOriginal)(id, SEL, long);
++static void (*rangeOriginal)(id, SEL, Range);
++static char fullKey, classKey;
++static std::atomic<bool> said{false};
++static std::atomic<unsigned> kept{0};
++
++static bool full(id link) { return link && objc_getAssociatedObject(link, &fullKey) != nil; }
++
++// Every link made after the plug-in loaded: the target's class (to name a kept link), and the mark when it is the manager's.
++static id mark(id link, id target) {
++    if (!link || !target) return link;
++    Class of = object_getClass(target);
++    objc_setAssociatedObject(link, &classKey, (id)of, OBJC_ASSOCIATION_ASSIGN);
++    const char *name = class_getName(of);
++    if (name && strstr(name, "InProcessAnimationManager"))   // AnimationKit's, UIKit's, and their nested classes
++        objc_setAssociatedObject(link, &fullKey, (__bridge id)kCFBooleanTrue, OBJC_ASSOCIATION_ASSIGN);
++    return link;
++}
++
++static void sayFirst(const Range &asked) {
++    if (said.exchange(true)) return;
++    os_log(OS_LOG_DEFAULT, "OneiOS display links: %{public}s in-process animation link at the panel's rate (asked %.0f..%.0f, %.0f)",
++           getprogname(), asked.minimum, asked.maximum, asked.preferred);
++}
++
++static void sayKept(id link, const Range &asked) {
++    const bool low = (asked.maximum > 0 && asked.maximum < 120) || (asked.preferred > 0 && asked.preferred < 120);
++    if (!low || kept.load() >= 4 || kept.fetch_add(1) >= 4) return;
++    Class of = (Class)objc_getAssociatedObject(link, &classKey);
++    os_log(OS_LOG_DEFAULT, "OneiOS display links: %{public}s kept: %{public}s asks %.0f..%.0f, %.0f", getprogname(),
++           of ? class_getName(of) : "(made before the plug-in)", asked.minimum, asked.maximum, asked.preferred);
++}
++
++static id made(id self, SEL selector, id target, SEL action) { return mark(madeOriginal(self, selector, target, action), target); }
++static id withDisplay(id self, SEL selector, id display, id target, SEL action) {
++    return mark(withDisplayOriginal(self, selector, display, target, action), target);
++}
++static id screenMade(id self, SEL selector, id target, SEL action) { return mark(screenMadeOriginal(self, selector, target, action), target); }
++
++static void fps(id self, SEL selector, long asked) {
++    if (full(self)) {
++        sayFirst(Range{float(asked), float(asked), float(asked)});
++        asked = 0;
++    } else {
++        sayKept(self, Range{float(asked), float(asked), float(asked)});
++    }
++    fpsOriginal(self, selector, asked);
++}
++
++static void range(id self, SEL selector, Range asked) {
++    if (full(self)) {
++        sayFirst(asked);
++        asked = Range{0, 0, 0};   // CAFrameRateRangeDefault: the display's own rate
++    } else {
++        sayKept(self, asked);
++    }
++    rangeOriginal(self, selector, asked);
++}
++}   // namespace oneios_display_links
++
++__attribute__((constructor)) static void oneiosDisplayLinks() {
++    using namespace oneios_display_links;
++    if (!strcmp(getprogname(), "backboardd")) return;   // the render server runs no UIKit animations
++    char args[1024] = {};
++    size_t size = sizeof(args) - 1;
++    if (!sysctlbyname("kern.bootargs", args, &size, nullptr, 0) && strstr(args, "oneios-dl-full=0")) return;
++    Class link = objc_getClass("CADisplayLink");
++    if (!link) return;
++    Method f = class_getInstanceMethod(link, sel_registerName("setPreferredFramesPerSecond:"));
++    Method r = class_getInstanceMethod(link, sel_registerName("setPreferredFrameRateRange:"));
++    Method m = class_getClassMethod(link, sel_registerName("displayLinkWithTarget:selector:"));
++    Method d = class_getClassMethod(link, sel_registerName("displayLinkWithDisplay:target:selector:"));
++    Class display = objc_getClass("CADisplay");
++    Method s = display ? class_getInstanceMethod(display, sel_registerName("displayLinkWithTarget:selector:")) : nullptr;
++    const int makers = (m != nullptr) + (d != nullptr) + (s != nullptr);
++    // Both setters and a maker, or nothing: a link marked with no setter hooked, or a setter with no marking, would be
++    // half the change.
++    if (!f || !r || !makers) {
++        os_log(OS_LOG_DEFAULT, "OneiOS display links: not hooked (made %d fps %d range %d)", makers, f != nullptr, r != nullptr);
++        return;
++    }
++    fpsOriginal = (void (*)(id, SEL, long))method_setImplementation(f, (IMP)fps);
++    rangeOriginal = (void (*)(id, SEL, Range))method_setImplementation(r, (IMP)range);
++    if (m) madeOriginal = (Maker)method_setImplementation(m, (IMP)made);
++    if (d) withDisplayOriginal = (id (*)(id, SEL, id, id, SEL))method_setImplementation(d, (IMP)withDisplay);
++    if (s) screenMadeOriginal = (Maker)method_setImplementation(s, (IMP)screenMade);
++    os_log(OS_LOG_DEFAULT, "OneiOS display links: hooked (made %d fps 1 range 1)", makers);
++}

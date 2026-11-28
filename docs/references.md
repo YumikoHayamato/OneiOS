@@ -2,6 +2,10 @@
 
 Survey date: 2026-11-10. Owner of this file: the references agent. Fetch the pinned repos with
 `scripts/setup/get-references.sh` (`-l` lists them and their state; `external/` is git-ignored).
+How old each pin is: `scripts/pin-ages.sh` (POSIX sh and `gh`, read only) reads this checkout's pins
+(`get-references.sh`, `kernel/pins.sh`, the phone's `scripts/droidvm` and `scripts/hugepage` scripts) and prints each one's
+date, the head of the branch it comes from and Droid-VM's own pin of the component (Droid-VM/UniXNU `wip/hackintosh`: its
+submodules and `scripts/data/*.json`) with the commits between them.
 
 Scope: the Galaxy S24 Ultra (SM8650 "pineapple", Cortex-X4/A720/A520 with PAC, Adreno 750, GKI 6.1) running
 iOS 27.0.1 (iPhone18,2, 24A446) under xnuhost. xnuhost is a process on One UI's kernel that gives XNU a
@@ -52,6 +56,7 @@ Two consequences for OneiOS:
 | Guest kernel: policy | `droidvm-gpu-sandbox-first.patch`, `droidvm-gpu-grant-apps.patch`, `droidvm-surface-gpu-wait.patch`, `droidvm-osmetaclass-adopt-superclass.patch`, `zzw-native-sandbox-grant-patterns.patch` | `UniXNU-droidvm` | BSD-2-Clause-Patent | Already in `kernel/device/patches/xnu-12377/series` |
 | User space: plug-in | `NativeAdrenoMetalPlugin.mm`, `NativeBridgeMetalFrontend.mm`, `bridge/`, `shaders/`, `tools/` | `NativeMetal` b0d6a07 (= `drivers/AdrenoMetal` of the kernel base) | MIT | **Direct** for the API; its QuartzCore and RenderBox hooks are found per shared cache, so they must be re-found in the iPhone18,2 cache (`macOS-DroidVM/docs/TODO-gpu.md`) |
 | User space: translator | metal2vulkan `624bab3` (`development`) + `patches/metal2vulkan/0001..0038` | steelbrain/metal2vulkan, patches in `Droid-VM-UniXNU` 62d0b11 (pin: `scripts/data/gpu-metal-vulkan-inputs.json`) | GPL-2.0 / LGPL-3.0 parts | Direct. In the table as `metal2vulkan` since 2026-11-11 (`userland/metal/build.sh` builds it; the shallow clone is 1.8 GB with its fixtures). Never linked into the kernel |
+| User space: the stack 555b13d (the plug-in's default since 2026-11-27, docs/gpu.md 7.2) | NativeMetal `935c468` + its `bridge/patches` (0040: the board's runtime on 555b13d), metal2vulkan `555b13d` (`development`, 2026-11-10) + `patches/metal2vulkan` carried to it, the scripts and the 34-patch Mesa list of Droid-VM/UniXNU `8789b8d` | `external/NativeMetal-935c468`, `external/metal2vulkan-555b13d`, `external/Droid-VM-UniXNU-8789b8d` (`scripts/setup/get-references.sh`; the kernel stays on `62d0b11`) | MIT; GPL-2.0 / LGPL-3.0 parts; BSD-2-Clause-Patent | Direct: the combination Droid-VM booted iPadOS 27 on (UniXNU `421e982`). The rows above and below are the stack 624bab3, the fallback |
 | User space: Vulkan driver | Mesa: Droid-VM/mesa `cecc0e9` (`droidvm`; the pin of `scripts/data/adreno-compiler-inputs.json`, in the table as `mesa-droidvm`; `gpu-metal-vulkan-inputs.json` names upstream `c823a83e` as the reference) + `patches/mesa/*` (the 30 that file lists: `turnip-darwin-kmd`, `turnip-darwin-virtgpu`, `-virtgpu-resets`, `-lazy-bos`, `-bo-slot-before-reuse`, A8xx backports); built by `scripts/build-turnip-darwin.py`, plug-in by `build-adreno-metal-plugin.py`, `build-adreno-metal-bridge.py`, staged by `add-gpu-plugin-data.py` | Mesa upstream, patches in `Droid-VM-UniXNU` | MIT | Direct: A750 (`0x43051400` family) is in upstream Mesa's device table. Check that the build has the A750 fix Droid-VM carries in its phone-side Turnip (BR-only `RB_CCU` registers, 9452b5e9090: without it KGSL logs `CP: AHB bus error` every frame, `plans/ACCEPTANCE_REPORT_20260816.md`) |
 | Tests | `package/metalcheck`, `package/gfxprobe`, `package/gfxbench` | `UniXNU-droidvm` | BSD-2-Clause-Patent | The acceptance tests of docs/plan.md M5 |
 

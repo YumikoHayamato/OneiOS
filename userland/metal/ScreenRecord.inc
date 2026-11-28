@@ -662,8 +662,21 @@ static bool installGate(char *why, size_t whySize) {
     if (!readWord(kServiceToken + gSlide, &token, sizeof token) || !readWord(kServiceValue + gSlide, &value, sizeof value)) {
         snprintf(why, whySize, "get_io_service's value unreadable"); return false;
     }
+    // The token's states (libdispatch once.h; arm64 iOS uses the quiescent counter): 0 = never asked, ~0 = done,
+    // (generation << 2) + 2 = DONE too (the block has returned, the token turns to ~0 at a later dispatch_once), and a
+    // value with its low bits 00 or 01 = the running thread's id (01: others wait). take21 on the phone read 0x4142
+    // here, a generation (low bits 10), and this file took it for "running" and never opened the gate: recordings got
+    // no frame. A really running block (a registry lookup, milliseconds) is waited for, up to 2 s.
+    for (int i = 0; i < 20 && token != 0 && token != ~0ull && (token & 3) != 2; i++) {
+        usleep(100 * 1000);
+        if (!readWord(kServiceToken + gSlide, &token, sizeof token) || !readWord(kServiceValue + gSlide, &value, sizeof value)) {
+            snprintf(why, whySize, "get_io_service's value unreadable"); return false;
+        }
+    }
     if (value) { snprintf(why, whySize, "get_io_service already found a scaler service (0x%x)", value); return false; }
-    if (token != 0 && token != ~0ull) { snprintf(why, whySize, "get_io_service's block is running (token 0x%llx)", (unsigned long long)token); return false; }
+    if (token != 0 && token != ~0ull && (token & 3) != 2) {
+        snprintf(why, whySize, "get_io_service's block is running (token 0x%llx)", (unsigned long long)token); return false;
+    }
     if (!token) {  // not asked yet: mark it done with no service, so that the block never overwrites the value later
         const uint64_t done = ~0ull;
         if (vm_write(mach_task_self(), kServiceToken + gSlide, (vm_offset_t)&done, sizeof done) != KERN_SUCCESS) {

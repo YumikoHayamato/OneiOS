@@ -1,0 +1,137 @@
+OneiOS, stack 555b13d (NativeMetal 935c468), patches-555b13d/NativeMetal/0008: a client that may not write the same-user
+shared cache directory keeps its cache across boots all the same.
+Port of patches/NativeMetal/0017 (take20). The base changed what this is for: a client now tries first the same-user shared
+directory (SharedShaderCache.h: ~/Library/Caches/org.unixnu.metal, i.e. /var/mobile/Library/Caches/org.unixnu.metal for
+SpringBoard and the mobile daemons, and the render server takes the same one), which is kept across boots and shared between
+the processes of the user, then its cache directory and its temporary directory. take20's folder
+($HOME/Library/Caches/<its folder>/m2v) is tried between them: after the shared directory, before the directories the boot
+empties, so it only serves a client whose sandbox refuses the shared one. A client that took a kept directory says which on
+its text line (serial: `oneios-gpu-text: NAME[pid] cache Library/Caches/org.unixnu.metal`, or its own folder).
+Switch: oneios-client-cache=temp (ONEIOS_CLIENT_CACHE=temp): take20's folder is not tried (the base's order alone; the shared
+directory has the base's own switch, the environment variable NATIVE_METAL_SHARED_CACHE_DIR, empty = none).
+Removable: yes (ONEIOS_METAL_SKIP=client-cache-kept-across-boots). Never compiled for iOS before this CI.
+
+The header of the 624bab3 stack's patch (patches/NativeMetal/0017-client-cache-kept-across-boots.patch), which says the what and the why:
+| OneiOS take20, userland/metal/patches/NativeMetal/0017: a Metal client whose temporary directory is one the boot empties keeps its
+| pipeline cache in its home's Library/Caches, so its pipelines are compiled once rather than at every boot.
+| Upstream: none (OneiOS); the render server's own move of 2026 (marker 0x6814, ~/Library/Caches/com.apple.backboardd) for clients.
+| What: clientDevice() first tries $HOME/Library/Caches/<folder>/m2v when confstr's temporary directory is under /private/var/mobile/tmp,
+| /private/var/tmp or /tmp (each emptied by launchd's boot task dirs_cleaner); <folder> is the temporary directory's own folder there
+| (com.apple.cameracaptured), else the bundle identifier (com.apple.springboard), else the process's name. Then the cache and
+| temporary directories as before. A home of /var/empty, a missing Library/Caches or a folder the process may not make or write (a
+| sandbox) leaves the earlier order. An app's container tmp/m2v (kept across boots) is not moved.
+| Why: take19's Data store (data-take19.img, newest checkpoint) against take18's: /var/mobile/tmp/m2v (SpringBoard's RenderBox
+| pipelines, 10:37:56-58 UTC) and /var/mobile/tmp/com.apple.cameracaptured/m2v (52 entries, as many as take18's) were written anew at
+| take19's boot; take18's held 214 and 52, all written in take18's own session. Clients' confstr cache directory is empty on iOS, so
+| every client took its temporary directory. The render server's cache is persistent and was hit at boot (take19: 52 build entries and
+| 92 driver records read, the rest of its 1670 take18 entries untouched since).
+| Risk: low. A sandbox that refuses the folder keeps the earlier order; the first boot with the patch compiles the moved clients'
+| pipelines once into the new folder (what every boot did before). Disk: what those clients' caches hold (take19: about 100 entries).
+| Switch: boot argument oneios-client-cache=temp (ONEIOS_CLIENT_CACHE=temp, Switches.inc): the earlier order. Default: on.
+| Removable: yes (ONEIOS_METAL_SKIP=client-cache-kept-across-boots).
+| iOS's serial log: `oneios-gpu-text: SpringBoard[32] cache Library/Caches/com.apple.springboard/m2v` (each client that took the
+| folder, once); the Data store after the session: no new files in /var/mobile/tmp/*/m2v, the clients' folders under
+| /var/mobile/Library/Caches; at the next boot those folders' entries are read (their access times move), not written again.
+
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+index 6691029..c77d870 100644
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -337,6 +337,62 @@ static void boundClientBoCache() {
+     snprintf(text, sizeof text, "%u", small);
+     setenv("TU_DARWIN_BO_CACHE_SMALL_MB", text, 0);
+ }
++// OneiOS (patches-555b13d/NativeMetal/0008, take20's 0017): a client whose temporary directory is one the boot empties, and which
++// may not write the same-user shared directory the base tries first (SharedShaderCache.h: ~/Library/Caches/org.unixnu.metal, kept
++// across boots and shared), keeps its cache in its home's Library/Caches instead. launchd's boot task dirs_cleaner empties /private/var/mobile/tmp (and /private/var/tmp, /tmp) at every
++// boot, and a client's confstr cache directory is empty on iOS, so SpringBoard and the mobile daemons (cameracaptured,
++// mediaplaybackd, chrono, messages) compiled their pipelines again at each boot: take19's store had the 51 entries of
++// /var/mobile/tmp/m2v and cameracaptured's 52 written again at its boot, take18's the same 52 and 214 (/var/mobile/tmp/m2v over
++// its session). The render server left that directory before (marker 0x6814, ~/Library/Caches/com.apple.backboardd); a client
++// now does the same: $HOME/Library/Caches/<its folder>/m2v, <its folder> the temporary directory's own (com.apple.cameracaptured)
++// or else the bundle identifier (com.apple.springboard) or the process's name. Where that cannot be made or written (a sandbox),
++// the earlier order stands; an app's container tmp/m2v (kept across boots) is left as it is. ONEIOS_CLIENT_CACHE=temp (boot
++// argument oneios-client-cache=temp, Switches.inc): the earlier order always. The client's text line says the folder taken
++// (oneios-gpu-text: "<process> cache Library/Caches/<its folder>").
++static size_t clientTempEmptiedAtBoot(const char *dir) {
++    static const char *const emptied[] = {"/private/var/mobile/tmp/", "/var/mobile/tmp/", "/private/var/tmp/", "/var/tmp/", "/private/tmp/", "/tmp/"};
++    for (const char *prefix : emptied)
++        if (!strncmp(dir, prefix, strlen(prefix))) return strlen(prefix);
++    return 0;
++}
++static bool clientCacheName(const char *name) {
++    if (!name[0] || !strcmp(name, ".") || !strcmp(name, "..")) return false;
++    for (const char *c = name; *c; ++c)
++        if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '.' || *c == '_' || *c == '-')) return false;
++    return true;
++}
++// The persistent folder for a client whose temporary directory is `temp`, with its trailing '/' (the caller adds "m2v"), into
++// out; empty when there is none to take.
++static void clientPersistentCache(const char *temp, char *out, size_t size) {
++    out[0] = 0;
++    if (const char *mode = getenv("ONEIOS_CLIENT_CACHE"); mode && !strcmp(mode, "temp")) return;
++    const size_t prefix = temp[0] ? clientTempEmptiedAtBoot(temp) : 0;
++    if (!prefix) return;
++    const char *home = getenv("HOME");
++    if (!home || home[0] != '/')
++        if (const passwd *user = getpwuid(getuid()); user && user->pw_dir) home = user->pw_dir;
++    if (!home || home[0] != '/' || clientTempEmptiedAtBoot(home) || !strncmp(home, "/var/empty", 10) || !strncmp(home, "/private/var/empty", 18)) return;
++    char name[128] = {};
++    strlcpy(name, temp + prefix, sizeof name);
++    name[strcspn(name, "/")] = 0;
++    if (!clientCacheName(name)) {
++        name[0] = 0;
++        if (CFBundleRef bundle = CFBundleGetMainBundle())
++            if (CFStringRef identifier = CFBundleGetIdentifier(bundle)) CFStringGetCString(identifier, name, sizeof name, kCFStringEncodingUTF8);
++        if (!clientCacheName(name)) strlcpy(name, getprogname(), sizeof name);
++        if (!clientCacheName(name)) return;
++    }
++    char caches[512];
++    snprintf(caches, sizeof caches, "%s/Library/Caches", home);
++    struct stat st = {};
++    if (stat(caches, &st) != 0 || !S_ISDIR(st.st_mode)) return;
++    char folder[512];
++    if ((size_t)snprintf(folder, sizeof folder, "%s/%s", caches, name) >= sizeof folder - 8) return;
++    mkdir(folder, 0700);
++    if (access(folder, W_OK) != 0) return;
++    if (strlcpy(out, folder, size) >= size - 1) {out[0] = 0; return;}
++    strlcat(out, "/", size);
++}
+ static id clientDevice(unsigned port) {
+     char turnip[1024];
+     if (!turnip::libraryPath(turnip, sizeof turnip) || access(turnip, R_OK) != 0) {clientFailure(port, "no-turnip", ""); return nil;}
+@@ -349,14 +405,17 @@ static id clientDevice(unsigned port) {
+     CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+     boundPooledBlocks();
+     boundClientBoCache();
+-    char candidates[3][512] = {};
++    // OneiOS: [3] the persistent folder of a client whose temporary directory the boot empties (clientPersistentCache), after the
++    // same-user shared directory and before the cache and temporary directories.
++    char candidates[4][512] = {};
+     if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
+     if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
+     strlcpy(candidates[2], sharedShaderCacheDirectory().c_str(), sizeof candidates[2]);
++    clientPersistentCache(candidates[1], candidates[3], sizeof candidates[3] - 16);
+     id device = nil;
+     const char *lastError = "";
+     unsigned usable = 0;
+-    for (unsigned i : {2u, 0u, 1u}) {
++    for (unsigned i : {2u, 3u, 0u, 1u}) {
+         if (device) break;
+         if (!candidates[i][0]) continue;
+         // In the user cache directory the cache sits inside Metal's own shader cache directory (com.apple.metal): a sandboxed process may
+@@ -375,6 +434,14 @@ static id clientDevice(unsigned port) {
+             lastError = "exception";
+         }
+         if (!device && !lastError[0]) lastError = nmb_last_error();
++        // OneiOS: which kept directory the client took, once, on its text line (the shared one or its own folder).
++        if (device && i >= 2)
++            if (Gpu *gpu = makeGpu(port)) {
++                char text[64];
++                const char *shown = strstr(candidates[i], "/Library/Caches/");
++                snprintf(text, sizeof text, "cache %.56s", shown ? shown + 1 : candidates[i]);
++                streamText(*gpu, text);
++            }
+     }
+     if (!device && !usable) {
+         setenv("METAL2VULKAN_SHADER_CACHE_OPTIONAL", "1", 1);

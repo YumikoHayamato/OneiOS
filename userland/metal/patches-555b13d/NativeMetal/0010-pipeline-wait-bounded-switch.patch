@@ -1,0 +1,60 @@
+OneiOS, stack 555b13d (NativeMetal 935c468), patches-555b13d/NativeMetal/0010: an opt-in bounded wait for pipelines being
+made, for the first-use compile stutters.
+Upstream: none (OneiOS). The policy is metal2vulkan's own default (crates/metal2vulkan/src/device/policy.rs:
+PipelineWaitPolicy::Bounded with pipeline_creation_wait and pipeline_commit_wait, 4.5 s each; in 624bab3 and 555b13d alike);
+NativeMetal's bridge replaces it with Exact, as Metal compiles inside newRenderPipelineState.
+What: with ONEIOS_PIPELINE_WAIT_MS=N (1..4500) the device is opened with Bounded and N ms for both waits. Read in
+555b13d (pipeline/render.rs settle_graphics_pipeline and make_at_creation): under Exact the creation makes the pipeline on the
+calling thread before it returns; under Bounded it hands the making to the runtime's pool and waits N ms at most, and a
+command buffer waits N ms after its commit at most, then records the draws and dispatches whose pipeline is still being
+made as nothing (the runtime counts them and announces draw-dropped-still-making / dispatch-dropped-still-making); later
+command buffers draw with the pipeline once made. The pool thread makes the driver's call itself
+(METAL2VULKAN_COMPILE_ON_ASKING_THREAD stays as the plug-in set it: it only chooses between the calling thread and a relay
+thread for the driver's call, device/compiles.rs at_user_initiated). Only on this pin: metal2vulkan later holds such draws
+instead of dropping them (RUNTIME 2161, 11-12, after 555b13d), so the experiment must be read again at the next move.
+Why: take19/take20: backboardd's first-ever pipelines are 17-120 ms compiles each, on the thread that draws the frame (284 in
+take19's session: the shade, the keyboard, menus, the wallpaper gallery). With a wait of about half a frame the frame is
+shown without what the new pipeline draws, which appears some frames later, instead of every frame waiting.
+Risk (why off): what a new pipeline draws is missing while it compiles (a layer's blur, mask or backdrop popping in); the
+bridge's authors chose Exact after the render server showed missing pieces of the screen under the 4.5 s default. An A/B
+for the owner's eye, not a default.
+Switch: boot argument oneios-pipeline-wait-ms=N (try 4): Switches-555b13d.inc sets ONEIOS_PIPELINE_WAIT_MS in backboardd
+alone. OFF without it. Removable: yes (ONEIOS_METAL_SKIP=pipeline-wait-bounded-switch).
+Tested: cargo check of the bridge for arm64e-apple-ios with it. Not run anywhere.
+
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index bcbad17..f876bb0 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -626,6 +626,13 @@ fn flow_bits() -> u32 {
+     })
+ }
+ 
++/// OneiOS (patches-555b13d/NativeMetal/0010): `ONEIOS_PIPELINE_WAIT_MS` (the boot argument `oneios-pipeline-wait-ms=N`, which
++/// userland/metal/Switches-555b13d.inc sets in the render server alone), 1 to 4500; `None` without it: the bridge's `Exact`.
++fn oneios_pipeline_wait() -> Option<std::time::Duration> {
++    let ms = std::env::var("ONEIOS_PIPELINE_WAIT_MS").ok()?.trim().parse::<u64>().ok()?;
++    (1..=4500).contains(&ms).then(|| std::time::Duration::from_millis(ms))
++}
++
+ /// # Safety
+ /// `loader` and `cache` are C strings.
+ #[unsafe(no_mangle)]
+@@ -648,6 +655,17 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
+         // default (PipelineWaitPolicy::Bounded) drops the draws and dispatches of a pipeline not made 4.5 s after the commit, which the
+         // render server showed as missing pieces of the screen while it compiled (int 590aaee2).
+         options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Exact;
++        // OneiOS (patches-555b13d/NativeMetal/0010, opt-in): ONEIOS_PIPELINE_WAIT_MS=N takes the runtime's own default instead,
++        // PipelineWaitPolicy::Bounded, with N ms for both waits. Under Exact a state's creation makes its pipeline on the
++        // calling thread before it returns (pipeline/render.rs settle_graphics_pipeline, make_at_creation's `joined`); under
++        // Bounded it hands the making to the runtime's pool and waits N ms at most, and a command buffer committed N ms ago
++        // records the draws whose pipeline is still being made as nothing (counted, `draw-dropped-still-making`). So a frame
++        // is late by N ms at most for a compile, and what the new pipeline draws appears when it is made.
++        if let Some(wait) = oneios_pipeline_wait() {
++            options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Bounded;
++            options.policy.pipeline_creation_wait = wait;
++            options.policy.pipeline_commit_wait = wait;
++        }
+         // Render encoder calls are checked at the call and lowered on the device's lowering thread, so the program's thread does not
+         // pay for them (the render server's main thread spent most of the plugin's CPU time lowering). A refusal only the lowering
+         // finds fails the command buffer, naming the call. `metal-flow=` without bit 1 keeps the lowering at the call.

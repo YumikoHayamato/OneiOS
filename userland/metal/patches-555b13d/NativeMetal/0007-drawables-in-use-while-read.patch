@@ -1,0 +1,83 @@
+OneiOS, stack 555b13d (NativeMetal 935c468), patches-555b13d/NativeMetal/0007: patches/NativeMetal/0016 (take19) unchanged.
+Applies only after: 0001-surface-use-while-commands-read.patch
+Switch: oneios-drawable-release=1 (ONEIOS_DRAWABLE_RELEASE=1); OFF without it. Removable: yes
+(ONEIOS_METAL_SKIP=drawables-in-use-while-read). Never compiled for iOS before this CI.
+
+The header of the 624bab3 stack's patch (patches/NativeMetal/0016-drawables-in-use-while-read.patch), which says the what and the why:
+| OneiOS take19, userland/metal/patches/NativeMetal/0016: with oneios-drawable-release=1, an app's CAMetalLayer drawable counts
+| in use in the render server only while a command buffer reads it.
+| Upstream: none (OneiOS); 0003's commandUse (macOS-DroidVM 4f77b11's commit-to-completion rule) held to drawables.
+| Applies only after: 0003-surface-use-while-commands-read.patch
+| What: in backboardd, with ONEIOS_DRAWABLE_RELEASE=1, a texture over a surface named "CAMetalLayer Display Drawable"
+| (IOSurfaceCopyValue of kIOSurfaceName, "IOSurfaceName") is commandUse: its surface is IOSurfaceIncrementUseCount'ed at each
+| commit of a command buffer that reads it and decremented at that command buffer's completion, instead of counted for the
+| texture's life, in every oneios-surface-use mode. The name is asked only with the switch on (one IOSurface call for each
+| texture made over a surface).
+| Why: Maps (VectorKit, CAMetalLayer) logged "Failed to acquire drawable, rendering to temporary texture" 344 times in take18:
+| nextDrawable came back empty (allowsNextDrawableTimeout: after 1 s) and VectorKit drew offscreen and copied, the big globe
+| lag. iOS 27's QuartzCore (24A446 cache): get_unused_drawable (0x184530d2c) hands a presented drawable out again only while
+| IOSurfaceIsInUse(its surface) is false (0x184530dc8). Core Animation counts a drawable in use itself:
+| layer_private_present_impl calls CAImageQueueInsertImage_ (IOSurfaceIncrementUseCount), and the client's release_image
+| (IOSurfaceDecrementUseCount) runs once the render server gave the image back (layer_collectable_signal). It names the surface
+| in CA::SurfaceUtil::CAIOSurfaceCreate (IOSurfaceSetValue of kIOSurfaceName). The frontend counted the surface in use as well,
+| for the life of the render server's texture over it (the base's countUse, which 0003 keeps for every one-plane surface), and
+| that texture lives as long as Core Animation's image cache keeps it (CA::OGL::Context::lookup_image,
+| MetalContext::retain_image, freed by Context::collect), not as long as the drawable is shown: a drawable the render server
+| gave back can stay in use until the cache lets its texture go. That is read from the code, not measured; the A/B below
+| measures it. Counted from commit to completion, a drawable goes back to its layer once Core Animation released it and the
+| composition that read it completed, which is the GPU's part of Apple's count. The scanout presenter (GpuScanoutPresenter.h)
+| takes no part: it copies the render server's own framebuffer at the display driver's swaps; an app's drawable reaches the
+| screen through the render server's composition.
+| Risk: a drawable its app draws into again while the render server still samples it would tear or flicker. Core Animation's own
+| count covers it from its present until the render server gives it back, and the switch's count covers each command buffer that
+| reads it; a read encoded after the give-back and before its commit would not be covered (none is known). Not booted.
+| Switch: boot argument oneios-drawable-release=1 (ONEIOS_DRAWABLE_RELEASE=1); off by default: as before. Removable: yes
+| (ONEIOS_METAL_SKIP=drawables-in-use-while-read); left out with 0003.
+| iOS's log (backboardd, the switch on): "native-metal: CAMetalLayer drawable WxH 'BGRA': in use only while a command buffer
+| reads it (oneios-drawable-release=1)", the first four; the A/B is Maps' count of "Failed to acquire drawable" (344 in take18)
+| and its globe's frame rate.
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 145bdc7..a533aea 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1629,12 +1629,35 @@ static int surfaceUseMode() {
+  }();
+  return mode;
+ }
++// OneiOS (userland/metal/patches-555b13d/NativeMetal/0007): with ONEIOS_DRAWABLE_RELEASE=1 (the boot argument oneios-drawable-release=1), an
++// app's CAMetalLayer drawable counts only while a command buffer reads it, in every mode above. QuartzCore names each drawable's surface
++// "CAMetalLayer Display Drawable" (get_unused_drawable -> CA::SurfaceUtil::CAIOSurfaceCreate: IOSurfaceSetValue(kIOSurfaceName)), and
++// counts it in use itself from its present (CAImageQueueInsertImage) until the render server gives it back (release_image).
++// get_unused_drawable hands out a presented drawable again only once IOSurfaceIsInUse is false; counted for the life of the render
++// server's texture over it, which Core Animation keeps in its image cache after it gave the drawable back, a layer's few drawables
++// stayed in use until those textures were collected, and nextDrawable timed out (Maps: "Failed to acquire drawable, rendering to
++// temporary texture"). Counted from each commit to its completion, a drawable goes back to its layer once the composition that read
++// it is done, as Apple's GPU does it. The name is read only with the switch on (an IOSurface call for each texture made over a surface).
++static bool layerDrawable(IOSurfaceRef surface) {
++ static const bool on=[]{const char *v=getenv("ONEIOS_DRAWABLE_RELEASE");return v && !strcmp(v,"1");}();
++ if(!on)return false;
++ CFTypeRef name=IOSurfaceCopyValue(surface,CFSTR("IOSurfaceName"));
++ const bool drawable=name && CFGetTypeID(name)==CFStringGetTypeID() && CFEqual(name,CFSTR("CAMetalLayer Display Drawable"));
++ if(name)CFRelease(name);
++ static std::atomic<uint64_t> said;
++ if(drawable && said++<4) {
++  const OSType f=IOSurfaceGetPixelFormat(surface);
++  NBLOG(@"native-metal: CAMetalLayer drawable %lux%lu '%c%c%c%c': in use only while a command buffer reads it (oneios-drawable-release=1)",
++        (unsigned long)IOSurfaceGetWidth(surface),(unsigned long)IOSurfaceGetHeight(surface),(char)(f>>24),(char)(f>>16),(char)(f>>8),(char)f);
++ }
++ return drawable;
++}
+ static bool surfaceUseByCommand(IOSurfaceRef surface) {
+  if(!surface || !gCountsSurfaceUse)return false;
+- switch(surfaceUseMode()) {
+-  case 0:return false;
+-  case 2:return true;
+- }
++ const int mode=surfaceUseMode();
++ if(mode==2)return true;
++ if(layerDrawable(surface))return true;   // OneiOS 0007
++ if(mode==0)return false;
+  if(IOSurfaceGetPlaneCount(surface)!=2)return false;
+  const size_t luma=IOSurfaceGetBytesPerElementOfPlane(surface,0),chroma=IOSurfaceGetBytesPerElementOfPlane(surface,1);
+  return (luma==1 || luma==2) && chroma==2*luma;

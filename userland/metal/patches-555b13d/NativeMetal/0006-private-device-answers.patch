@@ -1,0 +1,114 @@
+OneiOS, stack 555b13d (NativeMetal 935c468), patches-555b13d/NativeMetal/0006: patches/NativeMetal/0015 (take19), the same
+code on 935c468's device_answer (which has metal-tile=1's branch before the flags). Never compiled for iOS before this CI.
+Switch: oneios-device-answers=0 (ONEIOS_DEVICE_ANSWERS=0). Removable: yes (ONEIOS_METAL_SKIP=private-device-answers).
+
+The header of the 624bab3 stack's patch (patches/NativeMetal/0015-private-device-answers.patch), which says the what and the why:
+| OneiOS take19, userland/metal/patches/NativeMetal/0015: the device answers the private queries every Metal process logged it
+| had no answer for.
+| Upstream: none (OneiOS).
+| What: bridge/NativeMetalObjects.rs device_answer answers five of Apple's private device queries itself where the runtime gives
+| no answer of the device's (metal2vulkan's PrivateAnswer::Metal: no document says what they promise), each held to what the
+| runtime does here: maxVertexAmplificationCount 2, Metal's measured value and one multiview pass on Turnip
+| (maxMultiviewViewCount 6; 1 without multiview); maxComputeThreadgroupMemory the public maxThreadgroupMemoryLength (Turnip's
+| maxComputeSharedMemorySize, 32 KiB on the Adreno 830; Metal's 64 KiB is twice the public length on Apple's GPUs, and a kernel
+| sized by it would be refused here); isLargeMRTSupported YES where the pass takes more than Apple1's 4 color attachments
+| (maxColorAttachments 8 here); supportsComputeCompressedTextureWrite NO (the runtime makes no Apple-compressed texture; an M3
+| Max answers NO too); supportsConditionalLoadStore NO (no document or AIR form names it: no client path is taken on a guess).
+| The frontend's installAnswers no longer asks the runtime for a query its device class answers itself (gpuCoreCount:
+| NBDeviceMethods' 8, which class_addMethod would not have replaced anyway).
+| Why: take18's iOS log, every process with a Metal device: "native-metal: no device answer: the device has no answer for
+| gpuCoreCount", and the same for maxVertexAmplificationCount, maxComputeThreadgroupMemory, isLargeMRTSupported,
+| supportsComputeCompressedTextureWrite and supportsConditionalLoadStore (22 processes x 6 lines in take17's). Unanswered, the
+| five fell to iOS 27's _MTLDevice (24A446's Metal): -[_MTLDevice isLargeMRTSupported] is `mov w0, #0`;
+| maxComputeThreadgroupMemory and maxVertexAmplificationCount read [self limits] +0x64 and +0xe4, which the frontend's empty
+| initLimits leaves zero; the two flags send familySupports... to the GPU family object at +0x270, which its empty
+| initGPUFamilySupport leaves nil. So 0 and NO, against the device's own public answers (maxThreadgroupMemoryLength 32768,
+| supportsVertexAmplificationCount: 2 YES, maxColorAttachments 8). Which clients ask is not known from here (the base class
+| answered them, so no "missing" line names them).
+| Switch: boot argument oneios-device-answers=0 (ONEIOS_DEVICE_ANSWERS=0): the five unanswered again (the base class's 0 and
+| NO). On by default: every answer is one the runtime executes, two keep the NO clients saw, and the changed three make the
+| device's answers agree with each other. Removable: yes (ONEIOS_METAL_SKIP=private-device-answers).
+| iOS's log: no "no device answer" line (with oneios-device-answers=0 the five come back, gpuCoreCount's does not).
+
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 4f25b8b..145bdc7 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -6307,6 +6307,9 @@ static void installAnswers(Class cls) {
+   SEL sel=sel_registerName(name);uint64_t value=0;
+   switch(kind) {
+   case NMB_ANSWER_COUNT: case NMB_ANSWER_FLAG:
++   // OneiOS: a query the device class answers itself (NBDeviceMethods: gpuCoreCount) keeps that answer, which class_addMethod would
++   // not replace: it is not asked of the runtime (its "no device answer" line was in every process's log).
++   if(class_getInstanceMethod(cls,sel)!=class_getInstanceMethod(class_getSuperclass(cls),sel))continue;
+    if(!nmb_device_answer(gDevice,name,0,&value)){NBLOG(@"native-metal: no device answer: %@",lastError());continue;}
+    // Extended-range 10-bit (XR10) framebuffers are withheld: this display chain presents 8-bit BGRX scanout only. The render server picks its
+    // wide-gamut 64-bit (and Apple-compressed) framebuffer when a device offers them, and the display driver could not show it (int-089: the
+diff --git a/bridge/NativeMetalObjects.rs b/bridge/NativeMetalObjects.rs
+index 67a6cc6..bcbad17 100644
+--- a/bridge/NativeMetalObjects.rs
++++ b/bridge/NativeMetalObjects.rs
+@@ -1424,12 +1424,53 @@ pub extern "C" fn nmb_device_family_blockers(device: *const NmbDevice, family: i
+     })
+ }
+ 
++/// OneiOS (userland/metal/patches-555b13d/NativeMetal/0006): the bridge's own answers to five of Apple's private device queries that the runtime
++/// leaves without one (`PrivateAnswer::Metal`: no document says what they promise, so its value is Apple's GPU's, never this device's).
++/// Unanswered, the device class inherits _MTLDevice's: `isLargeMRTSupported` is NO there, `maxComputeThreadgroupMemory` and
++/// `maxVertexAmplificationCount` read its `limits`, which the frontend's empty initLimits leaves zero, and the two flags ask its GPU
++/// family object, which the empty initGPUFamilySupport leaves nil. Those zeros contradicted the device's own public answers. Each answer
++/// is held to what the runtime does on the device, the smaller one where Metal's would claim more. ONEIOS_DEVICE_ANSWERS=0 (the boot
++/// argument oneios-device-answers=0) leaves them unanswered, as before.
++fn oneios_private_answer(device: &NmbDevice, selector: &str) -> Option<u64> {
++    static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if !*WANTED.get_or_init(|| std::env::var("ONEIOS_DEVICE_ANSWERS").map_or(true, |value| value.trim() != "0")) {
++        return None;
++    }
++    let p = device.0.properties();
++    let l = &p.description.limits;
++    Some(match selector {
++        // Metal's measured 2 (the public supportsVertexAmplificationCount: takes 1 to 8 on that GPU too): two amplifications are one
++        // multiview pass where the device has `multiview` (Turnip's maxMultiviewViewCount is 6), and the runtime draws up to 8 (past the
++        // device's views as draws of one amplification each). 1 without multiview, where only a count of 1 is taken.
++        "maxVertexAmplificationCount" => {
++            if p.supports_vertex_amplification_count(2) == Ok(true) {
++                2
++            } else {
++                1
++            }
++        }
++        // The most threadgroup memory one threadgroup is given: the public maxThreadgroupMemoryLength (the device's
++        // maxComputeSharedMemorySize, 32 KiB on the Adreno 830). Metal's 64 KiB is twice its public length on Apple's GPUs; a kernel
++        // sized by it would be refused here.
++        "maxComputeThreadgroupMemory" => p.max_threadgroup_memory_length,
++        // More than Apple1's four color attachments in one pass: the runtime's pass takes maxColorAttachments (8 on Turnip).
++        "isLargeMRTSupported" => {
++            ((MAX_COLOR_ATTACHMENTS as u64).min(l.max_color_attachments.min(l.max_fragment_output_attachments) as u64) > 4) as u64
++        }
++        // A kernel's writes keeping a texture's lossless compression: the runtime makes no Apple-compressed texture. No, as an M3 Max.
++        "supportsComputeCompressedTextureWrite" => 0,
++        // No document or AIR form names it, so no path a client would take on a yes is known to run here: no.
++        "supportsConditionalLoadStore" => 0,
++        _ => return None,
++    })
++}
++
+ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, String> {
+     let d = &device.0;
+     let p = d.properties();
+     let none = || format!("the device has no answer for {selector}");
+     if let Some(c) = PrivateCount::ALL.into_iter().find(|c| c.selector() == selector) {
+-        return device.private().count(c).value().ok_or_else(none);
++        return device.private().count(c).value().or_else(|| oneios_private_answer(device, selector)).ok_or_else(none);
+     }
+     if let Some(f) = PrivateFlag::ALL.into_iter().find(|f| f.selector() == selector) {
+         // QuartzCore's render context reads `supportsTileShaders` once (its tile downsample and blur paths); the runtime answers no
+@@ -1437,7 +1478,7 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
+         if f == PrivateFlag::SupportsTileShaders && tile_shaders_offered() {
+             return Ok(1);
+         }
+-        return device.private().flag(f).value().map(u64::from).ok_or_else(none);
++        return device.private().flag(f).value().map(u64::from).or_else(|| oneios_private_answer(device, selector)).ok_or_else(none);
+     }
+     let gap = |r: Result<bool, metal2vulkan_runtime::RuntimeGap>| r.map(u64::from).map_err(|g| format!("{selector}: {g:?}"));
+     let format_supported = |f: PixelFormat| d.pixel_format_capabilities(f) != metal2vulkan_runtime::FormatCapabilities::NONE;

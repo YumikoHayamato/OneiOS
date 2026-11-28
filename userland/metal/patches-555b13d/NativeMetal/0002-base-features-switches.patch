@@ -1,0 +1,91 @@
+OneiOS, stack 555b13d (NativeMetal 935c468), patches-555b13d/NativeMetal/0002: OneiOS's boot-argument switches for what the
+base does itself, and the idle tick.
+Upstream: none (OneiOS). On the stack 624bab3 these features were OneiOS's ports (patches/NativeMetal/0002 and 0004,
+patches/metal2vulkan/0001 and 0008), each with its switch; NativeMetal 935c468 has the features (46fdc91/935c468's idle timer,
+0e7550a's pacing and read wait, bridge patches 0040's YCbCr planes and 0041's makings on the asking thread) and no boot argument
+for most of them. This keeps the names the images and the documents already use:
+  oneios-idle-trim=0     ONEIOS_IDLE_TRIM=0: no 2 s idle trim timer (watchIdleMemory)
+  (the idle tick)        each tick of that timer calls oneios_idle_tick where the image has it (weak; Switches-555b13d.inc:
+                         Turnip's freed-BO cache trimmed once a minute, patches-555b13d/mesa/0001)
+  oneios-read-wait=0     ONEIOS_READ_WAIT=0: the render server does not ask the kernel to wait for other processes' writers
+                         (take20's -readwait0 image); the base's own A/B is the file /private/var/ngpu/debug/no-surface-sync
+  oneios-sched-pace=0    ONEIOS_SCHED_PACE=0: command buffers scheduled at submission; the base's own A/B is the file
+                         /private/var/ngpu/debug/no-scheduled-pacing (and scheduled-depth)
+  oneios-ycbcr-planes=0  the base's gpu-ycbcr-planes=0 (NATIVE_METAL_YCBCR_PLANES=0): every two-plane YCbCr surface texture
+                         with its converted image, in every process (the base makes them over their planes alone in every
+                         process; take18 did so in backboardd only)
+  oneios-compile-here=0  no METAL2VULKAN_COMPILE_ON_ASKING_THREAD=1: a driver pipeline is made on a thread the runtime starts
+                         for it. CHANGED DEFAULT: the base sets it in every process (on); take18's plug-in was off without
+                         oneios-compile-here=1
+Removable: yes (ONEIOS_METAL_SKIP=base-features-switches): the switches above then do nothing, and Turnip's freed-BO cache is
+no longer trimmed at idle (nothing calls oneios_idle_tick).
+Tested: applies. First compiled by the CI. Not run on a phone.
+
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+index d35dd9c..db930b2 100644
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -510,11 +510,15 @@ static id deviceForPort(unsigned port) {
+         else unsetenv("NATIVE_METAL_PURGE");
+         // gpu-ycbcr-planes=0: every two-plane YCbCr surface texture is made with its converted image, as before bridge patch 0035,
+         // for a comparison on the same image. Read by the bridge at the first such texture.
+-        if (bootArgSet("gpu-ycbcr-planes=0")) setenv("NATIVE_METAL_YCBCR_PLANES", "0", 1);
++        // (OneiOS: its take18 name for the same, oneios-ycbcr-planes=0, is taken too.)
++        if (bootArgSet("gpu-ycbcr-planes=0") || bootArgSet("oneios-ycbcr-planes=0")) setenv("NATIVE_METAL_YCBCR_PLANES", "0", 1);
+         else unsetenv("NATIVE_METAL_YCBCR_PLANES");
+         // Turnip compiles inside vkCreate*Pipelines on the calling thread: the runtime makes the call there instead of on a thread it
+         // starts for it (its relay exists for a driver whose compiler service takes the asking thread's class).
+-        setenv("METAL2VULKAN_COMPILE_ON_ASKING_THREAD", "1", 1);
++        // OneiOS: the boot argument oneios-compile-here=0 leaves the runtime's own rule (a thread it starts for each making), as the
++        // take18 plug-in did without oneios-compile-here=1.
++        if (bootArgSet("oneios-compile-here=0")) unsetenv("METAL2VULKAN_COMPILE_ON_ASKING_THREAD");
++        else setenv("METAL2VULKAN_COMPILE_ON_ASKING_THREAD", "1", 1);
+         // metal-tile=1: the device also answers the family that has tile shaders (bridge: tile_shaders_offered).
+         if (bootArgSet("metal-tile=1")) setenv("NATIVE_METAL_TILE", "1", 1); else unsetenv("NATIVE_METAL_TILE");
+         {
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index fbddf09..c932054 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -1431,14 +1431,22 @@ static void watchImportPressure() {
+ // placements come each frame refills its kept block within the frame, so only blocks no frame asked for in two seconds go. (Waiting
+ // for the process to commit nothing for two seconds never trimmed the render server: the home screen's clock keeps it drawing.) The
+ // timer is a static for the reason the pressure source is (a source whose last reference goes never fires again).
++// OneiOS (patches-555b13d/NativeMetal/0002): the boot argument oneios-idle-trim=0 (ONEIOS_IDLE_TRIM=0, userland/metal/
++// Switches-555b13d.inc) starts no timer. Each tick also calls oneios_idle_tick where the image has it (Switches-555b13d.inc: Turnip's
++// idle trim of its freed-BO cache, once a minute; patches-555b13d/mesa/0001).
++extern "C" void oneios_idle_tick(void) __attribute__((weak));
+ static void watchIdleMemory() {
+  static dispatch_once_t once;
+  static dispatch_source_t timer;
+  dispatch_once(&once,^{
++  if(const char *on=getenv("ONEIOS_IDLE_TRIM"))if(!strcmp(on,"0"))return;
+   timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
+   if(!timer)return;
+   dispatch_source_set_timer(timer,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),2*NSEC_PER_SEC,250*NSEC_PER_MSEC);
+-  dispatch_source_set_event_handler(timer,^{if(gDevice)gTrimmedBlocks+=nmb_device_trim_memory(gDevice,2000);});
++  dispatch_source_set_event_handler(timer,^{
++   if(gDevice)gTrimmedBlocks+=nmb_device_trim_memory(gDevice,2000);
++   if(&oneios_idle_tick)oneios_idle_tick();
++  });
+   dispatch_activate(timer);
+  });
+ }
+@@ -3091,6 +3099,8 @@ static void end(std::atomic<uint64_t> &ticket) {if(const uint64_t t=ticket.excha
+ static bool awaits() {
+  static const bool ok=[]{
+   if(!isRenderServer() || !available())return false;
++  // OneiOS: the boot argument oneios-read-wait=0 (ONEIOS_READ_WAIT=0, Switches-555b13d.inc): the render server does not ask.
++  if(const char *on=getenv("ONEIOS_READ_WAIT"))if(!strcmp(on,"0"))return false;
+   const uint64_t answer=call(0,nullptr,0,2);
+   if(answer==0x5265616457616974ull)return true;   // "ReadWait"
+   if(answer)call(answer,nullptr,0);
+@@ -4077,6 +4087,8 @@ static std::atomic<uint64_t> gHeld{0},gCapped{0};
+ static uint32_t depth() {
+  static const uint32_t value=[]{
+   if(isRenderServer())return 0u;
++  // OneiOS: the boot argument oneios-sched-pace=0 (ONEIOS_SCHED_PACE=0, Switches-555b13d.inc): scheduled at submission.
++  if(const char *on=getenv("ONEIOS_SCHED_PACE"))if(!strcmp(on,"0"))return 0u;
+   if(access("/private/var/ngpu/debug/no-scheduled-pacing",F_OK)==0)return 0u;
+   uint32_t v=3;
+   if(FILE *file=fopen("/private/var/ngpu/debug/scheduled-depth","r")){unsigned read=0;if(fscanf(file,"%u",&read)==1)v=read;fclose(file);}
