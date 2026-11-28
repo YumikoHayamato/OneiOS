@@ -535,7 +535,7 @@ static BenchTest *T(NSString *name, Cat cat) {
     badge.layer.shadowOffset = CGSizeMake(0, 2);
     c.accessoryView = badge;
   }
-  c.imageView.image = g_listImages[row % g_listImages.count];
+  c.imageView.image = g_listImages.count ? g_listImages[row % g_listImages.count] : nil;
   c.textLabel.text = [NSString stringWithFormat:@"Item %ld: a row with an image", (long)row];
   c.detailTextLabel.text = [NSString stringWithFormat:@"subtitle %ld, some more text to lay out", (long)(row * 7919 % 1000)];
   ((UILabel *)c.accessoryView).text = [NSString stringWithFormat:@"%ld", (long)(row % 99)];
