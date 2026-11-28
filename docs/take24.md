@@ -59,3 +59,27 @@ By the same numbers 8192 leaves Android about 670 MiB while the VM runs, most of
 `docs/take24/sim/fill-drive.sh MEMAVAIL_MIB POOL_AVAIL POOL_WANT PMAX KEEP "GAINS"`: the fill and the choice under the
 PC's shell against fake `/proc` and module files (a pool that stops short and gains at each step, one that fills at once,
 an early pool bounded by the keep, a full pool with Android short). `cargo test -p oneios-phone`.
+
+## Second part: the apps' view, the haptics' floor, the priming key
+
+- **Kernel, hosted patch 0091** (`kernel/patches/oneios-hosted/0091-own-apps-view.patch`): take23's registrar could not
+  mount its folder over /Applications on the phone (the platform sandbox refuses a process's mount there: errno 1 and a
+  `file-mount` violation in iOS's log), so 2048 and Bench were never under /Applications and LaunchServices did not
+  register them. The kernel now mounts `/private/var/oneios/appsview` (the registrar's copies) over /Applications itself,
+  after the Data mount and before the LaunchServices store check, and takes it off again when Settings or Weather is not
+  found through it. `oneios-apps-view=0` turns it off. Serial: `oneios-apps-view: ... stage 5, status 0`. Not run on the
+  phone: that lsd then registers the two bundles is expected, not shown. The registrar (ci/apps 9a6167b) no longer
+  mounts; it keeps the copies and logs what /Applications lists.
+- **Haptics** (`runtime/bridges/haptics/haptic.c`, `vm-boot --haptic-min N`, 150 by default): every pulse of take23's
+  session was iOS's own UI feedback (UIKit selection and slider ticks, menus) at 8 to 122 of 1000; the motor's map lifts
+  any intensity to its floor, so each was a clear 20 ms buzz. `ONEIOS_HAPTIC_MIN_INTENSITY=N` in `bridgectl serve`'s
+  environment leaves out requests weaker than N (counted in bridge.txt); vm-boot sets it. 0: as before. An older
+  bridgectl ignores it. iOS's Settings > Sounds & Haptics > System Haptics off stops the same requests at their source.
+  The intensity of keyboard taps on this path is not known (none in the session).
+- **Plug-in** (ci/metal-upgrade 3d3e37f, NativeMetal 0012): the shader caches already follow the compilers (the
+  translator's source digest, Turnip's cache id), not the plug-in's build; only the priming's key followed the build
+  (Turnip's LC_UUID) and now ends with Turnip's cache id. One line a boot in backboardd's log:
+  `native-metal: shader cache (WHEN): F found, N not found, W written; kept by translator T, Turnip U`.
+- The identity keys of take23 (idiom, subtype, gamut, memory class) are read by CoreUI in every app (its own message
+  prints MobileGestalt's answer); they choose artwork, not layout, so the status bar did not move.
+- `OUT=out/take24 scripts/take22/mk-addon.sh`, then `KC=out/kernel/native-take24/kernel.kc scripts/take24/images.sh`.

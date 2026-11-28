@@ -247,9 +247,36 @@ br_haptic *br_haptic_open_sim(void)
   return h;
 }
 
+// take24: ONEIOS_HAPTIC_MIN_INTENSITY=N (1..1000, unset or 0: every request is played, as before). A vibrate request
+// weaker than N is not played. Why: iOS's own UI feedback (UIKit's selection and slider ticks: Control Center's pages, each
+// step of the volume keys) reaches the guest's Actuator as samples of about 12 % of full scale, and the map above lifts
+// any intensity to the LRA's floor, so a tick an iPhone barely gives is a clear 20 ms buzz here (take23: 66 of them).
+static unsigned haptic_min_intensity(void)
+{
+  static int min = -1;
+  if (min < 0) {
+    const char *e = getenv("ONEIOS_HAPTIC_MIN_INTENSITY");
+    long v = e && *e ? strtol(e, NULL, 10) : 0;
+    min = v < 0 ? 0 : v > 1000 ? 1000 : (int)v;
+    if (min) br_log(1, "haptics: requests weaker than %d of 1000 are not played (ONEIOS_HAPTIC_MIN_INTENSITY)", min);
+  }
+  return (unsigned)min;
+}
+
 void br_haptic_vib(br_haptic *h, uint32_t on_ms, unsigned intensity, unsigned frequency_hz)
 {
   if (!h) return;
+  const unsigned min = haptic_min_intensity();
+  if (on_ms && intensity && intensity < min) {
+    static unsigned long long skipped;                 // guarded by the lock below
+    pthread_mutex_lock(&h->lock);
+    h->stats.vib++;
+    const unsigned long long n = ++skipped;
+    pthread_mutex_unlock(&h->lock);
+    if ((n & (n - 1)) == 0)
+      br_log(1, "haptics: %llu request(s) under the floor not played (the last: %u ms, intensity %u of 1000, floor %u)", n, on_ms, intensity, min);
+    return;
+  }
   pthread_mutex_lock(&h->lock);
   if (h->pending) h->stats.replaced++;     // the newest wins: the one not started is never played
   if (on_ms) h->stats.vib++;

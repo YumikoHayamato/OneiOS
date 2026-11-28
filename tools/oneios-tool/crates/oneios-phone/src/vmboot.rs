@@ -1805,6 +1805,10 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
         }
         text = crate::take23::apply_pick(&text, main, &crate::take23::pick_block_with(&cands, t23.keep_mib, t23.overhead_mib.unwrap_or(crate::take23::OVERHEAD_MIB)))?;
     }
+    if t23.haptic_min > 1000 {
+        bail!("--haptic-min: 0 to 1000");
+    }
+    text = crate::take23::apply_haptic_min(&text, t23.haptic_min);
     if t23.fill_after_stop || orch.is_some() {
         let (start, after) = match &orch {
             Some(orch) => (format!("{}{}", crate::take23::HOSTMEM, crate::take23::orch_start(orch)), "orch_end\n"),

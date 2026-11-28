@@ -13,6 +13,18 @@
 //! 3. The clocks' orchestrator (`--orchestrator`): see ORCH.
 use anyhow::{bail, Result};
 
+/// take24, vm-boot --haptic-min N: `bridgectl serve` started with ONEIOS_HAPTIC_MIN_INTENSITY=N (runtime/bridges/haptics).
+/// take23's session: 66 pulses of 20 ms, every one iOS's own UI feedback (Control Center's pages, each volume step, menus),
+/// at 8 to 122 of 1000; the motor's map lifts any intensity to its floor, so each was a clear buzz. 150 is above every one
+/// of them. A script without the bridge is left as it is; 0 leaves the line as it was.
+pub const HAPTIC_MIN: u32 = 150;
+pub fn apply_haptic_min(script: &str, min: u32) -> String {
+    if min == 0 {
+        return script.to_string();
+    }
+    script.replace("\n  $D/bridgectl serve $D/bridge.sock ", &format!("\n  ONEIOS_HAPTIC_MIN_INTENSITY={min} $D/bridgectl serve $D/bridge.sock "))
+}
+
 /// One Image the VM may run: its RAM, the pool pages it takes, drm2kgsl's host arena (hex digits, as crosvm's tree names it;
 /// empty without the GPU), its file's name in the VM's folder and its SHA-256.
 #[derive(Clone, Debug, PartialEq)]
@@ -37,6 +49,8 @@ pub struct Opts {
     pub overhead_mib: Option<u32>,
     /// take24, --pagecensus FILE: runtime/pagecensus's binary, run after the fill
     pub pagecensus: Option<String>,
+    /// take24, --haptic-min N: the bridge does not play vibrate requests weaker than N of 1000 (0: all are played)
+    pub haptic_min: u32,
     /// --orchestrator
     pub orchestrator: bool,
     /// --orchestrator-set KEY=VALUE, repeatable
@@ -429,6 +443,10 @@ mod tests {
             }
         }
         assert!(!b.contains("__"));
+        // take24: the haptics' floor is the bridge's environment, on its one line
+        let line = "x\n  $D/bridgectl serve $D/bridge.sock --wait 120 </dev/null\n";
+        assert_eq!(apply_haptic_min(line, 150), "x\n  ONEIOS_HAPTIC_MIN_INTENSITY=150 $D/bridgectl serve $D/bridge.sock --wait 120 </dev/null\n");
+        assert_eq!(apply_haptic_min(line, 0), line);
         // take24: the want is written once, the fill's (never under what the pool holds: that branch runs only when the
         // pool has fewer pages than the fill wants), and the choice itself presses no acquire
         assert_eq!(b.matches("> $P/pool_want").count(), 1);

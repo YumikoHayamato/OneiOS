@@ -1,0 +1,58 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9672,6 +9672,46 @@
+ 	    "visible; stage 1 status 2: this Data store has no capture plug-in)\n", source, point, oneios_camera_addon_stage,
+ 	    oneios_camera_addon_status);
+ }
++/*
++ * OneiOS (0091): OneiOS's own apps (2048, Bench) in /Applications. The registrar oneios-appreg (userland/apps) keeps a copy
++ * of its bundles in the Data folder /private/var/oneios/appsview; shown here over /Applications as a read-only union, above
++ * 0035's view of the staged system apps (that one is taken while /private/var is still the OS volume's, so a bundle copied
++ * to the Data volume's /private/var/staged_system_apps is never seen: take22). The registrar cannot mount this itself: the
++ * platform sandbox profile refuses any process's mount there (take23 on the phone: errno 1, a sandbox violation for the
++ * file-mount in iOS's log), while the boot mounts of this file are the kernel's. Stage 5: an app of the sealed
++ * /Applications (Settings) and one of the staged view (Weather) are still found through it; a view that is mounted and
++ * hides one of them is taken off again at once. Before 0037's and 0043's look at the LaunchServices store, so the store
++ * that does not name the two bundles yet is dropped once and lsd registers them with the other system apps.
++ * oneios-apps-view=0 turns it off. A Data store without the folder (the registrar makes it at its first run): stage 1,
++ * status 2, and the view comes at the next boot.
++ */
++static volatile int oneios_own_apps_stage = 0;
++static volatile int oneios_own_apps_status = -1;
++static void
++oneios_own_apps_view(proc_t p, user_addr_t scratch)
++{
++	static const char source[] = "/private/var/oneios/appsview", point[] = "/Applications";
++	uint32_t enabled = 1;
++	PE_parse_boot_argn("oneios-apps-view", &enabled, sizeof(enabled));
++	if (enabled == 0) {
++		printf("oneios-apps-view: off (oneios-apps-view=0)\n");
++		return;
++	}
++	/* Scratch 0xa00..0xb20: 0056's mount above has returned (0081's, later, uses it after this one). */
++	native_gpu_addon_mount(p, scratch, 0xa00, source, sizeof(source), point, sizeof(point),
++	    "/Applications/Preferences.app/Info.plist", "/Applications/Weather.app/Info.plist", &oneios_own_apps_stage,
++	    &oneios_own_apps_status);
++	int undone = -1;
++	if (oneios_own_apps_stage == 3 || oneios_own_apps_stage == 4) {
++		/* mounted, and Settings or Weather is not found through it: off again (the point's path is still in the scratch) */
++		struct unmount_args undo = {.path = scratch + 0xa00 + 0x20, .flags = MNT_FORCE};
++		int32_t result = 0;
++		undone = unmount(p, &undo, &result);
++	}
++	printf("oneios-apps-view: %s over %s: stage %d, status %d (stage 5 status 0: mounted, Settings and Weather still visible "
++	    "below it; stage 1 status 2: no such folder yet)%s\n", source, point, oneios_own_apps_stage, oneios_own_apps_status,
++	    undone == 0 ? "; taken off again" : undone > 0 ? "; NOT taken off (unmount failed)" : "");
++}
+ #endif
+ #if XNU_HOSTED || XNU_ONEIOS_NATIVE
+ /*
+@@ -10087,6 +10127,7 @@
+ 	native_ls_store_drop(p, scratch);
+ #if XNU_HOSTED || XNU_ONEIOS_NATIVE
+ 	oneios_camera_addon_mount(p, scratch);        /* 0056 */
++	oneios_own_apps_view(p, scratch);             /* 0091 */
+ 	oneios_icon_store_refresh(p, scratch);        /* 0036 */
+ 	oneios_lsd_first_boot_done(p, scratch);       /* 0037 */
+ 	oneios_store_report(p, scratch);              /* 0060 */

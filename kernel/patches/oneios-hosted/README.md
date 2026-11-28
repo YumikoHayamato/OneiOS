@@ -1486,3 +1486,12 @@ kernel's recorded compile command with `-fsyntax-only`; built on the Linux PC (2
 7632e390). Not booted; the
 PC cannot press a phone's power key into a lit display. Whether backboardd calls it at the lock in this guest is [U] until a phone boot's
 log shows the line.
+
+## 0091-own-apps-view.patch (take24, 2026-11-28)
+
+OneiOS's own apps (2048, Bench) under /Applications. The registrar's bindfs mount of its folder there is refused on the
+phone by the platform sandbox (take23: errno 1, a `file-mount` violation), so the kernel mounts
+`/private/var/oneios/appsview` over /Applications itself (`native_gpu_addon_mount`, as 0056's), after the Data mount and
+before 0036/0037's look at the LaunchServices store. Stage 5: Settings and Weather are still found through it; a view that
+hides one is unmounted at once. `oneios-apps-view=0` turns it off. Serial: `oneios-apps-view: ... stage N, status N`.
+Built into take24's kernel (`git apply` after 0090); not run on the phone.

@@ -355,3 +355,7 @@
 # (the apps' registrar, appreg) without a new Data seed. Every other entry as before. Not run yet on the phone.
 # take19: only with the boot argument oneios-addon-services=1 (the -apps image); without it every entry goes to ngpu.
 0090-addon-oneios-services.patch
+# take24 (2026-11-28): OneiOS's own apps in /Applications. The registrar's mount of its folder over /Applications is refused
+# on the phone by the platform sandbox (take23); the kernel mounts /private/var/oneios/appsview there itself, after the Data
+# mount, with a self-check (Settings and Weather still found, else unmounted). oneios-apps-view=0 turns it off.
+0091-own-apps-view.patch
