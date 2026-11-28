@@ -38,6 +38,8 @@
 #include <libkern/libkern.h>
 #include <pexpert/pexpert.h>
 #include <sys/proc.h>
+#include "../gpu/frame_stages.h"
+#include "vsync_lock.h"
 
 extern vm_offset_t vm_kernel_slide;
 // The generated bindings (build-oneios-display.py): the parent metaclass's link address and instance size as numbers.
@@ -330,33 +332,156 @@ void oneios_display_frame_seen(unsigned kind, uint64_t width, uint64_t height)
 // Without the boot argument (the hosted kernel, the bench) nothing is mapped and nothing is written.
 static volatile uint64_t *frameSequence;
 static uint64_t framesWritten;
-static bool frameSequenceTried;
+static volatile uint32_t frameSequenceTried;
+
+// The page, mapped by whoever asks first (a frame written into the boot video, or the refresh tick: below); nullptr without
+// the boot argument, or while another thread is mapping it.
+static volatile uint64_t *oneios_display_page(void)
+{
+    if (__atomic_exchange_n(&frameSequenceTried, 1, __ATOMIC_ACQ_REL)) return __atomic_load_n(&frameSequence, __ATOMIC_ACQUIRE);
+    uint64_t pa = 0;
+    if (!PE_parse_boot_argn("oneios-frame-seq", &pa, sizeof pa) || !pa) return nullptr;
+    const uint64_t video = native_legacy_gop_physical, bytes = native_legacy_gop_bytes;
+    if ((pa & 16383) || (video && pa < video + bytes && pa + 16384 > video)) {
+        IOLog("oneios-display: oneios-frame-seq=0x%llx is not a 16 KiB page outside the boot video: no frame sequence\n", pa);
+        return nullptr;
+    }
+    IODeviceMemory *memory = IODeviceMemory::withRange(pa, 16384);
+    IOMemoryMap *map = memory ? memory->map(kIOMapAnywhere | kIOMapCopybackCache) : nullptr;
+    OSSafeReleaseNULL(memory);
+    if (!map || !map->getVirtualAddress()) {
+        OSSafeReleaseNULL(map);
+        IOLog("oneios-display: the frame sequence page 0x%llx could not be mapped\n", pa);
+        return nullptr;
+    }
+    volatile uint64_t *page = reinterpret_cast<volatile uint64_t *>(map->getVirtualAddress());   // the map stays for the boot
+    page[1] = 0;
+    __atomic_store_n(&page[0], ONEIOS_FRAME_SEQ_MAGIC, __ATOMIC_RELEASE);      // "OFSQ", version 1
+    __atomic_store_n(&frameSequence, page, __ATOMIC_RELEASE);
+    IOLog("oneios-display: the frame sequence at 0x%llx (the host's bridge copies a frame when it moves)\n", pa);
+    return page;
+}
 
 extern "C" void oneios_display_frame_done(void)
 {
-    if (!frameSequenceTried) {
-        frameSequenceTried = true;
-        uint64_t pa = 0;
-        if (!PE_parse_boot_argn("oneios-frame-seq", &pa, sizeof pa) || !pa) return;
-        const uint64_t video = native_legacy_gop_physical, bytes = native_legacy_gop_bytes;
-        if ((pa & 16383) || (video && pa < video + bytes && pa + 16384 > video)) {
-            IOLog("oneios-display: oneios-frame-seq=0x%llx is not a 16 KiB page outside the boot video: no frame sequence\n", pa);
-            return;
-        }
-        IODeviceMemory *memory = IODeviceMemory::withRange(pa, 16384);
-        IOMemoryMap *map = memory ? memory->map(kIOMapAnywhere | kIOMapCopybackCache) : nullptr;
-        OSSafeReleaseNULL(memory);
-        if (!map || !map->getVirtualAddress()) {
-            OSSafeReleaseNULL(map);
-            IOLog("oneios-display: the frame sequence page 0x%llx could not be mapped\n", pa);
-            return;
-        }
-        frameSequence = reinterpret_cast<volatile uint64_t *>(map->getVirtualAddress());   // the map stays for the boot
-        frameSequence[1] = 0;
-        __atomic_store_n(&frameSequence[0], 0x000000015153464fULL, __ATOMIC_RELEASE);      // "OFSQ", version 1
-        IOLog("oneios-display: the frame sequence at 0x%llx (the host's bridge copies a frame when it moves)\n", pa);
+    if (volatile uint64_t *page = oneios_display_page()) __atomic_store_n(&page[1], ++framesWritten, __ATOMIC_RELEASE);
+}
+
+// ---- the refresh tick on the panel's grid (vsync_lock.h; native-perf, 2026-11-26; docs/native.md "Frame pacing")
+// The staged NativeLegacyDisplay.cpp's tick (staged/display.rs LEGACY_VSYNC) asks here where the next one goes. The phone
+// (vm-boot --vsync-lock: runtime/pace's pacectl) writes the panel's vsync grid into the frame sequence's page several times
+// a second; with a whole, fresh record the next tick is the grid's first point half a period or more away, the compositor
+// is told the panel's period, and a tick that fired within a quarter period of its place carries the place's time. Without
+// a record (no publisher: every session without the flag; the hosted kernel; the bench) the answer is the caller's own
+// free-running time, and nothing here changes a tick. The kernel reads the page, and writes its own record, only with the boot argument oneios-vsync-lock=1 (default 0).
+// The kernel's own record in the same page says what it did (the phone reads it); a change is one line:
+//   oneios-display: the refresh tick is on the panel's grid (period 8355012 ns, phase 0 us)
+//   oneios-display: the refresh tick runs free again (no fresh record of the panel's vsync)
+static oneios_vsync_state vsyncState;
+static volatile uint32_t vsyncLockSwitch = 2;
+
+extern "C" uint64_t oneios_display_vsync_next(uint64_t now, uint64_t scheduled, uint64_t nextFree, uint64_t nominal, uint64_t *interval, uint64_t *stamp);
+uint64_t oneios_display_vsync_next(uint64_t now, uint64_t scheduled, uint64_t nextFree, uint64_t nominal, uint64_t *interval, uint64_t *stamp)
+{
+    static uint64_t hz;
+    if (vsyncLockSwitch == 2) {
+        uint32_t on = 0;   // off unless the image says oneios-vsync-lock=1: no mapping, no record, the tick as it was
+        PE_parse_boot_argn("oneios-vsync-lock", &on, sizeof on);
+        nanoseconds_to_absolutetime(NSEC_PER_SEC, &hz);
+        vsyncLockSwitch = on ? 1 : 0;
     }
-    if (frameSequence) __atomic_store_n(&frameSequence[1], ++framesWritten, __ATOMIC_RELEASE);
+    *interval = nominal;
+    *stamp = now;
+    volatile uint64_t *page = vsyncLockSwitch == 1 ? oneios_display_page() : nullptr;
+    if (!page) return nextFree;
+    oneios_vsync_panel panel;
+    const bool have = oneios_vsync_read(page + ONEIOS_VSYNC_PANEL_OFFSET / 8, &panel) != 0;
+    const bool was = vsyncState.locked != 0;
+    uint64_t told = nominal;
+    const uint64_t next = oneios_vsync_next(&vsyncState, have ? &panel : nullptr, now, nextFree, nominal, hz, &told);
+    const bool is = vsyncState.locked != 0;
+    *interval = told;
+    // this tick's own time: its place on the grid, when it was put there and fired within a quarter period of it
+    if (was && is && now >= scheduled && now - scheduled < told / 4) *stamp = scheduled;
+    volatile uint64_t *mine = page + ONEIOS_VSYNC_GUEST_OFFSET / 8;
+    const uint64_t seq = oneios_rec_begin(&mine[ONEIOS_TICK_SEQ]);   // vsync_lock.h: the seqlock, fenced for arm64
+    __atomic_store_n(&mine[ONEIOS_TICK_AT], now, __ATOMIC_RELAXED);
+    __atomic_store_n(&mine[ONEIOS_TICK_SENT], vsyncState.sent, __ATOMIC_RELAXED);
+    __atomic_store_n(&mine[ONEIOS_TICK_LOCKED], vsyncState.on_grid, __ATOMIC_RELAXED);
+    __atomic_store_n(&mine[ONEIOS_TICK_GAINED], vsyncState.gained, __ATOMIC_RELAXED);
+    __atomic_store_n(&mine[ONEIOS_TICK_LOST], vsyncState.lost, __ATOMIC_RELAXED);
+    oneios_rec_end(&mine[ONEIOS_TICK_SEQ], seq);
+    __atomic_store_n(&mine[ONEIOS_TICK_MAGIC], ONEIOS_VSYNC_GUEST_MAGIC, __ATOMIC_RELEASE);
+    if (was != is && vsyncState.gained + vsyncState.lost <= 16) {
+        // the first changes only: a publisher that comes and goes must not fill the log from the display's work loop
+        uint64_t ns = 0, phase = 0;
+        if (is) {
+            absolutetime_to_nanoseconds((panel.period_q8 + 128) >> 8, &ns);
+            absolutetime_to_nanoseconds(uint64_t(panel.phase < 0 ? -panel.phase : panel.phase), &phase);
+            IOLog("oneios-display: the refresh tick is on the panel's grid (period %llu ns, phase %s%llu us)\n", ns, panel.phase < 0 ? "-" : "", phase / 1000);
+        } else {
+            IOLog("oneios-display: the refresh tick runs free again (no fresh record of the panel's vsync)\n");
+        }
+    }
+    return next;
+}
+
+// ---- the swaps' pace (native-perf, 2026-11-26; docs/native.md "Frame pacing")
+// The virtio scanout (DroidVMVirtioGpuDisplay.cpp) counts every swap the compositor offers: the time since the one before
+// (1 ms steps), how long the swap waited for the render server's GPU work and its holds, and each frame's flush. Nothing
+// printed them. CoreAnimation keeps two swaps in flight, so a refresh is skipped when a swap's trip passes two periods:
+// the gap between swaps says so, which oneios-gpu-report's time per submission does not. Every round of the GPU's report
+// (OneiOSAdreno.cpp calls this) in which a swap came:
+//   oneios-display-pace: 10 s: swaps +1130, 113.4 a second while moving; apart by <1 refresh +2, 1 +1050, 2 (one skipped)
+//     +60, more +6, pauses +12; refused +0
+//       "while moving": the rate over the gaps under 50 ms (the display's own counter). A gap counts by its middle against
+//       the refresh the guest was told (sheng-vsync): under 3/4 of one, up to 1 1/2, up to 2 1/2, up to 40 ms, longer.
+//   oneios-display-wait: 10 s: +900 of +1130 swaps waited for the GPU, 2100 us a swap (late +0); holds 40 us a swap
+//     (late +0); flush 1800 us mean, 6400 most (of the last +64)
+//       "waited for the GPU": the render server's work for the frame was not done as the swap came; "late": shown without it
+//       after 2 s. "holds": commits not yet submitted (200 ms at most). "flush": from the scanout's post to its answer being
+//       taken, which is when the next frame is posted or no frame follows: an upper bound of crosvm's copy.
+extern "C" {
+extern volatile uint64_t droidvm_virtio_offer_gap_hist[ONEIOS_GAP_STEPS], droidvm_virtio_offer_gaps[2], droidvm_virtio_offer_refused;
+extern volatile uint64_t droidvm_virtio_present_probes, droidvm_virtio_present_busy, droidvm_virtio_present_wait_us, droidvm_virtio_present_late;
+extern volatile uint64_t droidvm_virtio_display_hold_late, droidvm_virtio_display_hold_wait_us;
+struct DroidVMPresentSample { uint64_t number; uint32_t fence, retired, mode, status; uint64_t wait_us, flush_us; };
+extern DroidVMPresentSample droidvm_virtio_present_samples[64];
+void oneios_display_pace_report(uint32_t every);
+}
+
+void oneios_display_pace_report(uint32_t every)
+{
+    static uint64_t gapWas[ONEIOS_GAP_STEPS], gapsWas[2], refusedWas, was[6], sampleWas;
+    uint64_t gap[ONEIOS_GAP_STEPS], classes[ONEIOS_GAP_CLASSES];
+    for (unsigned i = 0; i < ONEIOS_GAP_STEPS; i++) gap[i] = droidvm_virtio_offer_gap_hist[i];
+    unsigned hz = 60;
+    oneios_display_boot_arg("sheng-vsync", &hz, sizeof hz);
+    const uint64_t swaps = oneios_gap_classes(gap, gapWas, hz, classes);
+    const uint64_t now[6] = {droidvm_virtio_present_probes, droidvm_virtio_present_busy, droidvm_virtio_present_wait_us, droidvm_virtio_present_late,
+                             droidvm_virtio_display_hold_late, droidvm_virtio_display_hold_wait_us};
+    if (!swaps && now[0] == was[0]) return;
+    const uint64_t gaps[2] = {droidvm_virtio_offer_gaps[0], droidvm_virtio_offer_gaps[1]}, refused = droidvm_virtio_offer_refused;
+    const uint64_t rate = oneios_gap_rate_tenths(gaps[0] - gapsWas[0], gaps[1] - gapsWas[1]);
+    IOLog("oneios-display-pace: %u s: swaps +%llu, %llu.%llu a second while moving; apart by <1 refresh +%llu, 1 +%llu, 2 (one skipped) +%llu, "
+          "more +%llu, pauses +%llu; refused +%llu\n", every, swaps, rate / 10, rate % 10, classes[0], classes[1], classes[2], classes[3], classes[4],
+          refused - refusedWas);
+    // The flushes of the frames since the last report: the ring keeps 64, numbered from 1 in the order they were probed.
+    uint64_t flushes = 0, flushSum = 0, flushMost = 0, newest = sampleWas;
+    for (const DroidVMPresentSample &sample : droidvm_virtio_present_samples) {
+        const uint64_t number = sample.number, flush = sample.flush_us;
+        if (number <= sampleWas) continue;
+        flushes++; flushSum += flush;
+        if (flush > flushMost) flushMost = flush;
+        if (number > newest) newest = number;
+    }
+    const uint64_t probes = now[0] - was[0];
+    IOLog("oneios-display-wait: %u s: +%llu of +%llu swaps waited for the GPU, %llu us a swap (late +%llu); holds %llu us a swap (late +%llu); "
+          "flush %llu us mean, %llu most (of the last +%llu)\n", every, now[1] - was[1], probes, probes ? (now[2] - was[2]) / probes : 0, now[3] - was[3],
+          probes ? (now[5] - was[5]) / probes : 0, now[4] - was[4], flushes ? flushSum / flushes : 0, flushMost, flushes);
+    memcpy(gapWas, gap, sizeof gap);
+    memcpy(was, now, sizeof now);
+    gapsWas[0] = gaps[0]; gapsWas[1] = gaps[1]; refusedWas = refused; sampleWas = newest;
 }
 
 // ---- what Droid-VM's LegacyDisplaySupport27.cpp gives the display

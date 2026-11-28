@@ -32,7 +32,7 @@
  *
  * Log: "ONEIOS HAPTIC: on: ..." or "ONEIOS HAPTIC: off: <why>"; "ONEIOS HAPTIC UI: on|off: <why>"; the
  * Actuator's user clients ("Actuator: user client N opened by audiomxd", formats asked, selectors refused,
- * mappings: the first 24 events); "ONEIOS HAPTIC: counters: ..." every 30 s while a figure moved, one line from the
+ * mappings: the first 24 events); "ONEIOS HAPTIC: counters: ..." every 30 s while a figure moved, two lines from the
  * Actuator's user clients through its samples to the bridge, so a log shows the layer where a tap stops (xnuhost's
  * "haptics: counters:" line is the host's side: what came over the bridge and what the device played).
  * Kill switches: oneios_haptic=0 (all), oneios_haptic_ui=0 (no closed-loop node, no Actuator device);
@@ -305,14 +305,19 @@ oh_report_thread(__unused void *arg, __unused wait_result_t wr)
 			continue;
 		}
 		last = now;
+		/*
+		 * Two lines (take17): as one it was 330 bytes and more, and the console cuts a line at 255: the bridge's
+		 * part and the line's end were lost, and the next line of the log began in this one.
+		 */
 		printf("ONEIOS HAPTIC: counters: Actuator %u opens (%u closed, last by %s), %llu selectors (%u StartIO, %u StopIO, "
-		    "%u refused, %u formats asked, last %d), %u maps; %llu periods (%llu ms), %llu with samples, %llu loud, peak %u of 32768; "
-		    "%llu requests to the motor | vibrator service %u requests | /dev/oneios-haptic %llu frames | bridge %llu vib + %llu stop + %llu impacts sent, "
-		    "%llu failed, %llu with no host actuator\n",
+		    "%u refused, %u formats asked, last %d), %u maps; %llu periods (%llu ms), %llu with samples, %llu loud, peak %u of 32768\n",
 		    oh_act_opens, oh_act_closes, oh_act_opener[0] ? oh_act_opener : "-", oh_act_selectors, oh_act_starts, oh_act_stops,
 		    oh_act_refused, oh_act_formats, (int)oh_act_last_selector, oh_act_maps, oh_act_periods, oh_act_frames / 48u,
-		    oh_act_sounding, oh_act_loud, oh_act_peak, oh_act_requests, oneios_vibrator_requests, oh_frames, oh_sent_vib,
-		    oh_sent_stop, oh_sent_impact, oh_send_failed, oh_send_no_host);
+		    oh_act_sounding, oh_act_loud, oh_act_peak);
+		printf("ONEIOS HAPTIC: counters: %llu requests to the motor | vibrator service %u requests | /dev/oneios-haptic %llu frames | "
+		    "bridge %llu vib + %llu stop + %llu impacts sent, %llu failed, %llu with no host actuator\n",
+		    oh_act_requests, oneios_vibrator_requests, oh_frames, oh_sent_vib, oh_sent_stop, oh_sent_impact, oh_send_failed,
+		    oh_send_no_host);
 	}
 }
 

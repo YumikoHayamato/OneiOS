@@ -1,0 +1,154 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -4938,6 +4938,139 @@
+ }
+ #endif
+ 
++#if XNU_HOSTED || XNU_ONEIOS_NATIVE
++/*
++ * OneiOS (0088): RunningBoard's GPU role, answered by a role-only client (oneios-gpu-role=1; off by default).
++ * -[RBXNUWrapper init] (24A446 RunningBoard 0x23f84f714) takes IOServiceGetMatchingService(IOServiceMatching("IOGPU"))
++ * and IOGPUDeviceCreate on it once. The service is the GPU archive's AGXAccelerator (an IOAcceleratorES whose chain
++ * DroidVMGpu.cpp's publishMetal adopts IOGPU into), and IOGPUDeviceCreateWithOptions (IOGPU 0x20bf84488) opens it with
++ * type 1 | options << 16, which NativeAdreno's newUserClient refuses (kIOReturnUnsupported, "oneios-gpu-open:
++ * runningboardd[31] AGXAccelerator type 0x1 -> 0xe00002c7"). So the ref is nil and every app transition logged
++ * "setGPURole:pid: failed due to nil IOGPU device ref" (-[RBXNUWrapper setGPURoleWithGPUDevice:forPid:] 0x23f8296c0,
++ * 634 times in take17). The same transition's other half, setpriority(PRIO_DARWIN_GPU, pid, role) (+[RBXNUWrapper
++ * setGPURoleWithKernel:forPid:]), already succeeds: the kernel's task_set_gpu_role keeps every process's role.
++ * With the switch, an open of AGXAccelerator with IOGPU's type (1, with options below 0x100 above it) by a process
++ * entitled to set GPU roles (com.apple.private.set-gpu-role: runningboardd) gets OneiOSGPURoleUserClient. Its chain
++ * adopts the family's IOGPUDeviceUserClient (an IOUserClient, not an IOUserClient2022), so the sandbox judges it as it
++ * judges Apple's. It answers IOGPUDeviceCreate's three reads empty (selectors 0, 2 and 4: 0x40, 0x218 and 0x20 bytes
++ * of zeros; the family's table at 0xfffffe00082f64b0 has the same sizes) and IOGPUDeviceSetAppGPURole (selector 33,
++ * scalars {pid, role}: 0 focal UI, 1 UI, 2 other) with success; every other selector is kIOReturnUnsupported.
++ * Nothing reaches the GPU: this VM's GPU work runs on host rings whose priority each context fixed when it was made,
++ * so the role changes no scheduling. It silences the error, and the console says what was asked:
++ *   oneios-gpu-role: runningboardd[31] opens AGXAccelerator with IOGPU's type 0x1: a role client (chain adopted: yes)
++ *   oneios-gpu-role: pid 177 role 2 (other), call 1        (the first 32 calls, then every 1000th)
++ * Other opens, other types and processes without the entitlement are left to the accelerator, as before.
++ */
++class OneiOSGPURoleUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(OneiOSGPURoleUserClient);
++public:
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	MIG_SERVER_ROUTINE virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++	    IOExternalMethodDispatch * dispatch, OSObject * target, void * reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(OneiOSGPURoleUserClient, IOUserClient)
++
++static SInt32 oneios_gpu_role_calls;
++
++IOReturn
++OneiOSGPURoleUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++OneiOSGPURoleUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments * args,
++    IOExternalMethodDispatch * dispatch __unused, OSObject * target __unused, void * reference __unused)
++{
++	if (!args) {
++		return kIOReturnBadArgument;
++	}
++	if (selector == 0 || selector == 2 || selector == 4) {
++		/* IOGPUDeviceCreateWithOptions' reads: IOConnectCallStructMethod with no input, a struct output of this size */
++		const uint32_t size = selector == 0 ? 0x40 : selector == 2 ? 0x218 : 0x20;
++		if (args->scalarInputCount || args->structureInputSize || args->structureInputDescriptor || args->scalarOutputCount
++		    || args->structureOutputDescriptor || !args->structureOutput || args->structureOutputSize != size) {
++			return kIOReturnBadArgument;
++		}
++		bzero(args->structureOutput, size);
++		return kIOReturnSuccess;
++	}
++	if (selector == 33) {
++		/* IOGPUDeviceSetAppGPURole (IOGPU 0x20bf99a88): IOConnectCallScalarMethod(33, {pid, role}, 2, NULL, NULL) */
++		if (args->scalarInputCount != 2 || args->structureInputSize || args->structureInputDescriptor || args->scalarOutputCount
++		    || args->structureOutputSize || args->structureOutputDescriptor) {
++			return kIOReturnBadArgument;
++		}
++		const int pid = (int) args->scalarInput[0];
++		const uint32_t role = (uint32_t) args->scalarInput[1];
++		const SInt32 call = OSIncrementAtomic(&oneios_gpu_role_calls) + 1;
++		if (call <= 32 || !(call % 1000)) {
++			IOLog("oneios-gpu-role: pid %d role %u (%s), call %d\n", pid, role,
++			    role == 0 ? "focal UI" : role == 1 ? "UI" : role == 2 ? "other" : "unknown", (int) call);
++		}
++		return kIOReturnSuccess;
++	}
++	return kIOReturnUnsupported;
++}
++
++/* true: it decided the open (the client made, or *res its failure); false: the service's newUserClient decides */
++static bool
++oneios_gpu_role_open(IOService * service, task_t owningTask, uint32_t type, IOUserClient ** client, IOReturn * res)
++{
++	static int wanted = -1;
++	static volatile UInt32 adoption;        /* 0 not tried, 1 being tried, 2 tried */
++	static bool adopted;
++	/* IOGPU's type: 1 with small options above it (not the Metal plug-in's progress markers, 0x4147xxxx) */
++	if ((type & 0xffff) != 1 || (type >> 16) >= 0x100 || strcmp(service->getMetaClass()->getClassName(), "AGXAccelerator")) {
++		return false;
++	}
++	if (wanted < 0) {
++		uint32_t value = 0;
++		PE_parse_boot_argn("oneios-gpu-role", &value, sizeof(value));
++		wanted = value == 1;
++	}
++	if (!wanted || !IOTaskHasEntitlement(owningTask, "com.apple.private.set-gpu-role")) {
++		return false;
++	}
++	/* the chain is adopted once, before the first instance (OSMetaClassAdoptSuperclass takes a class with none) */
++	if (OSCompareAndSwap(0, 1, &adoption)) {
++		adopted = OSMetaClassAdoptSuperclass("OneiOSGPURoleUserClient", "IOGPUDeviceUserClient");
++		OSMemoryBarrier();
++		adoption = 2;
++	} else if (adoption != 2) {
++		return false;
++	}
++	OneiOSGPURoleUserClient * role = new OneiOSGPURoleUserClient;
++	if (!role || !role->initWithTask(owningTask, (void *) owningTask, type)) {
++		OSSafeReleaseNULL(role);
++		*res = kIOReturnNoMemory;
++		return true;
++	}
++	if (!role->attach(service)) {
++		role->release();
++		*res = kIOReturnNotAttached;
++		return true;
++	}
++	if (!role->start(service)) {
++		role->detach(service);
++		role->release();
++		*res = kIOReturnError;
++		return true;
++	}
++	char name[33] = {};
++	proc_name(proc_selfpid(), name, sizeof(name));
++	IOLog("oneios-gpu-role: %s[%d] opens AGXAccelerator with IOGPU's type %#x: a role client (chain adopted: %s): "
++	    "IOGPUDeviceCreate's reads answered empty, IOGPUDeviceSetAppGPURole taken; the GPU's scheduling is unchanged\n",
++	    name, proc_selfpid(), type, adopted ? "yes" : "no");
++	*client = role;
++	*res = kIOReturnSuccess;
++	return true;
++}
++#endif
++
+ #if XNU_HOSTED
+ #define is_io_service_open_extended hosted_impl_is_io_service_open_extended
+ static
+@@ -5025,6 +5158,10 @@
+ 			}
+ 		}
+ #endif
++#if XNU_HOSTED || XNU_ONEIOS_NATIVE
++		/* 0088: IOGPU's open of the accelerator by RunningBoard (oneios-gpu-role=1), else the service decides */
++		if (!oneios_gpu_role_open(service, owningTask, connect_type, &client, &res))
++#endif
+ 		res = service->newUserClient( owningTask, (void *) owningTask,
+ 		    connect_type, propertiesDict, &client );
+ 

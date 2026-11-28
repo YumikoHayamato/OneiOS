@@ -50,7 +50,7 @@
 use crate::class_record::{pylist, ClassRecord};
 use crate::drivers_build::Record;
 use crate::gen::{self, fail, Compile, Ctx};
-use crate::staged::gpu::{GPU, GPU3D, GPU3D_NATIVE, TRANSPORT, TRANSPORT_PCI};
+use crate::staged::gpu::{GPU, GPU3D, GPU3D_NATIVE, GPU3D_READ_WAIT, GPU3D_ROOM, GPU3D_STAGES, TRANSPORT, TRANSPORT_PCI, TRANSPORT_STAGES};
 use anyhow::{Context, Result};
 use oneios_common::pyjson::Value;
 use std::collections::BTreeSet;
@@ -193,6 +193,58 @@ pub fn staged_3d_native_text(text: String) -> std::result::Result<String, String
     Ok(text)
 }
 
+/// DroidVMVirtioGpu.cpp, after staged_transport_pci_text, with staged/gpu.rs TRANSPORT_STAGES: each command keeps what the
+/// frame-stage lines need (docs/native.md "Frame pacing"). Err is the anchor that is not there exactly once.
+pub fn staged_transport_stages_text(text: String) -> std::result::Result<String, String> {
+    let mut text = text;
+    for (anchor, replacement) in TRANSPORT_STAGES {
+        if text.matches(anchor).count() != 1 {
+            return Err(format!("DroidVMVirtioGpu.cpp no longer has exactly one {}", anchor.trim()));
+        }
+        text = text.replace(anchor, replacement);
+    }
+    Ok(text)
+}
+
+/// DroidVMVirtioGpu3D.cpp, after staged_3d_native_text, with staged/gpu.rs GPU3D_STAGES: the render server's fenced
+/// submissions give their stamps to OneiOSAdreno.cpp. Err is the anchor that is not there exactly once.
+pub fn staged_3d_stages_text(text: String) -> std::result::Result<String, String> {
+    let mut text = text;
+    for (anchor, replacement) in GPU3D_STAGES {
+        if text.matches(anchor).count() != 1 {
+            return Err(format!("DroidVMVirtioGpu3D.cpp no longer has exactly one {}", anchor.trim()));
+        }
+        text = text.replace(anchor, replacement);
+    }
+    Ok(text)
+}
+
+/// DroidVMVirtioGpu3D.cpp, after staged_3d_stages_text, with staged/gpu.rs GPU3D_ROOM (take17): the GPU address range a
+/// process's DRM capset names goes to OneiOSAdreno.cpp. Err is the anchor that is not there exactly once.
+pub fn staged_3d_room_text(text: String) -> std::result::Result<String, String> {
+    let mut text = text;
+    for (anchor, replacement) in GPU3D_ROOM {
+        if text.matches(anchor).count() != 1 {
+            return Err(format!("DroidVMVirtioGpu3D.cpp no longer has exactly one {}", anchor.trim()));
+        }
+        text = text.replace(anchor, replacement);
+    }
+    Ok(text)
+}
+
+/// DroidVMVirtioGpu3D.cpp, after staged_3d_room_text, with staged/gpu.rs GPU3D_READ_WAIT (take20): a writer that made the
+/// render server's read wait give up is not waited for again. Err is the anchor that is not there exactly once.
+pub fn staged_3d_read_wait_text(text: String) -> std::result::Result<String, String> {
+    let mut text = text;
+    for (anchor, replacement) in GPU3D_READ_WAIT {
+        if text.matches(anchor).count() != 1 {
+            return Err(format!("DroidVMVirtioGpu3D.cpp no longer has exactly one {}", anchor.trim()));
+        }
+        text = text.replace(anchor, replacement);
+    }
+    Ok(text)
+}
+
 /// DroidVMVirtioGpu3D.cpp with the changes of staged/gpu.rs GPU3D; Err is the anchor that is not there exactly once.
 pub fn staged_3d_text(text: String) -> std::result::Result<String, String> {
     let mut text = text;
@@ -203,6 +255,16 @@ pub fn staged_3d_text(text: String) -> std::result::Result<String, String> {
         text = text.replace(anchor, replacement);
     }
     Ok(text)
+}
+
+/// DroidVMVirtioGpu.cpp as the archive compiles it: every edit list of the transport, in the build's order.
+pub fn staged_transport_source(text: String) -> std::result::Result<String, String> {
+    staged_transport_text(text).and_then(staged_transport_pci_text).and_then(staged_transport_stages_text)
+}
+
+/// DroidVMVirtioGpu3D.cpp as the archive compiles it: every edit list of the 3D half, in the build's order.
+pub fn staged_3d_source(text: String) -> std::result::Result<String, String> {
+    staged_3d_text(text).and_then(staged_3d_native_text).and_then(staged_3d_stages_text).and_then(staged_3d_room_text).and_then(staged_3d_read_wait_text)
 }
 
 /// Droid-VM's build of the NativeAdreno face, up to (not including) its accelerator step.
@@ -323,16 +385,11 @@ pub fn main() -> Result<()> {
     let staged_dir = out.join("staged");
     gen::mkdirs(&staged_dir)?;
     let staged_3d = staged_dir.join("DroidVMVirtioGpu3D.cpp");
-    gen::write_text(&staged_3d,
-                    &staged_3d_text(gen::read_text(&sources[2])?)
-                        .and_then(staged_3d_native_text)
-                        .map_err(|e| anyhow::anyhow!("build-oneios-gpu: {e}"))?)?;
+    gen::write_text(&staged_3d, &staged_3d_source(gen::read_text(&sources[2])?).map_err(|e| anyhow::anyhow!("build-oneios-gpu: {e}"))?)?;
     // DroidVMVirtioGpu.cpp the same way (staged/gpu.rs TRANSPORT: the control queue as long as the device takes).
     let staged_transport = staged_dir.join("DroidVMVirtioGpu.cpp");
     gen::write_text(&staged_transport,
-                    &staged_transport_text(gen::read_text(&sources[1])?)
-                        .and_then(staged_transport_pci_text)
-                        .map_err(|e| anyhow::anyhow!("build-oneios-gpu: {e}"))?)?;
+                    &staged_transport_source(gen::read_text(&sources[1])?).map_err(|e| anyhow::anyhow!("build-oneios-gpu: {e}"))?)?;
     let mut objects = Vec::new();
     for source in &sources {
         let compiled = if source == &sources[2] { &staged_3d } else if source == &sources[1] { &staged_transport } else { source };

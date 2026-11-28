@@ -1,0 +1,106 @@
+diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -5859,6 +5859,92 @@
+ }
+ #endif /* XNU_HOSTED */
+ 
++#if XNU_HOSTED || XNU_ONEIOS_NATIVE
++/*
++ * OneiOS (0089): a swap's disables of layers the display does not have. The display scans out one layer
++ * (NativeLegacyDisplay publishes IOMFBNumLayers MaxNumLayers 1 and copies only the swap's first surface), but the render
++ * server's CA::WindowServer::IOMFBDisplay::finish_update (24A446 QuartzCore 0x184471af8: +0xc28/+0xc5c and +0x1aac/
++ * +0x1ae0) calls swap_set_layer(1, NULL) and swap_set_layer(2, NULL) on a frame with no detached layer whose update
++ * has one of its flags set (by the timing of take17's lines: while an app's Metal layer or a video is on screen).
++ * kern_SwapSetLayer with a NULL surface sets the layer's bit in both the updated and the disabled mask and leaves its
++ * surface ID 0 (IOMobileFramebuffer 0x22ac0ca44; kern_SwapBegin zeroes the 0x6e0-byte swap). IOMobileFramebufferLegacy::swap_submit (selector 5 of IOMobileFramebufferUserClient,
++ * struct 0x6e0; 0xfffffe000a18c63c) looks up the surface of every updated layer with no test for 0 (the call at
++ * 0xfffffe000a18cc10), and IOSurfaceRoot's lookup (0xfffffe000a343de8) logs each ID 0 as an error:
++ * "SID: 0x0 task: <backboardd> buffer: 0  buffer->fClientTask = 0 not found", two lines a swap (60,824 in take17,
++ * only while YouTube, Maps, the wallpaper editor or Weather were on screen). With oneios-display-trim-layers=1 such
++ * a layer (index at or past MaxNumLayers, updated and disabled, surface ID 0, and never given a surface by a swap of
++ * this boot) is taken out of the swap before the method: both bits cleared, so the family sees the single-layer
++ * swap of the home screen and makes no lookup. Without the switch nothing changes. Either way the console says it,
++ * at the 1st, 100th, 10,000th and 1,000,000th such swap:
++ *   oneios-display: backboardd[55] swap 812 disables layers 0x6 with no surface on a display of 1 layer ...
++ */
++static void
++oneios_display_trim_layers(IOUserClient * client, uint32_t selector, char * swap, mach_msg_type_number_t size)
++{
++	enum : uint32_t { kSwapBytes = 0x6e0, kSwapID = 0x98, kSwapSurfaces = 0x9c, kSwapUpdated = 0x14c, kSwapDisabled = 0x150 };
++	static int trim = -1;
++	static uint32_t layers;         /* the display's MaxNumLayers, read at its first swap */
++	static uint32_t given;          /* layers 1 to 3 a swap of this boot gave a surface: never trimmed */
++	static SInt32 seen;
++	if (selector != 5 || size != kSwapBytes || !swap
++	    || strcmp(client->getMetaClass()->getClassName(), "IOMobileFramebufferUserClient")) {
++		return;
++	}
++	IOService * display = client->getProvider();
++	if (!display || strcmp(display->getMetaClass()->getClassName(), "NativeLegacyDisplay")) {
++		return;
++	}
++	if (trim < 0) {
++		uint32_t value = 0;
++		PE_parse_boot_argn("oneios-display-trim-layers", &value, sizeof(value));
++		trim = value == 1;
++	}
++	if (!layers) {
++		uint32_t count = 4;     /* no property: no layer is the display's lack */
++		OSObject * property = display->copyProperty("IOMFBNumLayers");
++		OSDictionary * dictionary = OSDynamicCast(OSDictionary, property);
++		OSNumber * number = dictionary ? OSDynamicCast(OSNumber, dictionary->getObject("MaxNumLayers")) : NULL;
++		if (number && number->unsigned32BitValue() >= 1 && number->unsigned32BitValue() <= 4) {
++			count = number->unsigned32BitValue();
++		}
++		OSSafeReleaseNULL(property);
++		layers = count;
++	}
++	uint32_t ids[4], updated, disabled, swapID;
++	memcpy(ids, swap + kSwapSurfaces, sizeof(ids));
++	memcpy(&updated, swap + kSwapUpdated, sizeof(updated));
++	memcpy(&disabled, swap + kSwapDisabled, sizeof(disabled));
++	memcpy(&swapID, swap + kSwapID, sizeof(swapID));
++	uint32_t empty = 0;
++	for (uint32_t layer = 1; layer < 4; layer++) {
++		const uint32_t bit = 1U << layer;
++		if (ids[layer]) {
++			given |= bit;
++		} else if (layer >= layers && (updated & bit) && (disabled & bit) && !(given & bit)) {
++			empty |= bit;
++		}
++	}
++	if (!empty) {
++		return;
++	}
++	if (trim) {
++		updated &= ~empty;
++		disabled &= ~empty;
++		memcpy(swap + kSwapUpdated, &updated, sizeof(updated));
++		memcpy(swap + kSwapDisabled, &disabled, sizeof(disabled));
++	}
++	const SInt32 count = OSIncrementAtomic(&seen) + 1;
++	if (count == 1 || count == 100 || count == 10000 || count == 1000000) {
++		char name[33] = {};
++		proc_name(proc_selfpid(), name, sizeof(name));
++		IOLog("oneios-display: %s[%d] swap %u disables layers %#x with no surface on a display of %u layer%s (each an IOSurface "
++		    "lookup of ID 0, logged \"SID: 0x0 ... not found\"): %s; %d such swaps so far\n", name, proc_selfpid(), swapID, empty,
++		    layers, layers == 1 ? "" : "s", trim ? "taken out of the swap" : "kept (oneios-display-trim-layers=1 takes them out)",
++		    (int) count);
++	}
++}
++#endif
++
+ /* Routine io_user_client_method */
+ kern_return_t
+ is_io_connect_method_var_output
+@@ -6055,6 +6141,9 @@
+ 		ret = gIOUCFilterCallbacks->io_filter_applier(client, filterPolicy, io_filter_type_external_method, selector);
+ 	}
+ 	if (kIOReturnSuccess == ret) {
++#if XNU_HOSTED || XNU_ONEIOS_NATIVE
++		oneios_display_trim_layers(client, selector, inband_input, inband_inputCnt);
++#endif
+ 		ret = client->callExternalMethod( selector, &args );
+ #if XNU_HOSTED
+ 		hosted_iouc_trace(client, selector, ret);

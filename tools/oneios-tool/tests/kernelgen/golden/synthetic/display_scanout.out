@@ -40,4 +40,12 @@ static bool oneiosOffer(void *display, IOMemoryDescriptor *memory, uint64_t stri
 // (before anchor 8)
         pending = {service, memory, stride, width, height, droidvm_virtgpu_submitted(), droidvm_virtgpu_holds(), pid,
                    format == 2 ? OneiOSHalf : 0};
+// (before anchor 9)
+volatile uint64_t droidvm_virtio_offer_gap_hist[41], droidvm_virtio_offer_gaps[2], droidvm_virtio_offer_refused;
+// OneiOS (take17): each gap between two swaps (us) and the time the later one was offered (us), for OneiOSAdreno.cpp's
+// oneios-hitch lines. Weak: without it nothing changes.
+void oneios_gpu_swap_gap(uint64_t, uint64_t) __attribute__((weak));
+// (before anchor 10)
+        if (gap < 50000) { droidvm_virtio_offer_gaps[0] = droidvm_virtio_offer_gaps[0] + 1; droidvm_virtio_offer_gaps[1] = droidvm_virtio_offer_gaps[1] + gap; }
+        if (oneios_gpu_swap_gap) oneios_gpu_swap_gap(gap, now);   // OneiOS (take17): two words stored, nothing printed here
 // (the end)

@@ -75,6 +75,7 @@ int oneios_hosted_disk_zero(const char *role, uint64_t bytes);
 volatile uint32_t oneios_hosted_disks = 0;
 volatile uint32_t oneios_hosted_disk_failures = 0;
 volatile uint64_t oneios_hosted_disk_requests = 0;
+void oneios_disk_report(uint32_t every);
 }
 
 // VirtIO 1.2 MMIO, modern split queue. All numbers here are protocol offsets.
@@ -143,6 +144,11 @@ class OneiOSHostedDisk : public IOBlockStorageDevice {
   char volumeUUID[37] = {};
   char seedSHA256[65] = {};
   uint64_t contentBytes = 0;
+  // For oneios_disk_report, under the gate (ticks): requests (timed out ones too, and their number) and their bytes, the wait
+  // for the device and its longest, the callers' wait for the gate and its longest, the chunks checked and the time hashing them. `told`: what was printed.
+  struct Work { uint64_t requests, timeouts, bytes, wait, waitMax, gate, gateMax, chunks, hash; } work = {}, told = {};
+  void lockGate();
+  void count(uint64_t asked);
 #if XNU_HOSTED
   uint32_t read32(unsigned offset) const { return oneios_hosted_mmio_read32(registers + offset); }
   void write32(unsigned offset, uint32_t value) { oneios_hosted_mmio_write32(registers + offset, value); }
@@ -196,6 +202,7 @@ public:
   const char *diskSeedSHA256() const { return seedSHA256; }
   uint64_t diskBytes() const { return contentBytes ? contentBytes : capacity * 512; }
   IOReturn zero(uint64_t bytes);
+  void report(uint32_t every);
 
   IOService *probe(IOService *, SInt32 *) override;
   bool start(IOService *) override;
@@ -488,6 +495,47 @@ bool OneiOSHostedDisk::configurePci()
 }
 #endif
 
+// The gate, with the time a caller waited for it counted.
+void OneiOSHostedDisk::lockGate()
+{
+  const uint64_t start = mach_absolute_time();
+  IOLockLock(gate);
+  const uint64_t waited = mach_absolute_time() - start;
+  work.gate += waited;
+  if (waited > work.gateMax) work.gateMax = waited;
+}
+
+// One line a disk that worked since the last one; called every 10 s by the GPU archive's report thread. The wait is the
+// device's part of a request; "gate" is all its callers' waits for other requests together.
+void OneiOSHostedDisk::report(uint32_t every)
+{
+  if (!gate) return;
+  IOLockLock(gate);
+  const Work now = work, was = told;
+  told = work;
+  work.waitMax = work.gateMax = 0;
+  IOLockUnlock(gate);
+  if (now.requests == was.requests) return;
+  const auto us = [](uint64_t ticks) { uint64_t ns = 0; absolutetime_to_nanoseconds(ticks, &ns); return ns / 1000; };
+  IOLog("oneios-disk: %u s: %s +%llu requests (%llu timed out) %llu KiB, device %llu ms (max %llu us), gate %llu ms (max %llu us), chunks checked +%llu (%llu ms)\n",
+        every, role[0] ? role : "?", now.requests - was.requests, now.timeouts - was.timeouts, (now.bytes - was.bytes) >> 10, us(now.wait - was.wait) / 1000, us(now.waitMax),
+        us(now.gate - was.gate) / 1000, us(now.gateMax), now.chunks - was.chunks, us(now.hash - was.hash) / 1000);
+}
+
+extern "C" void oneios_disk_report(uint32_t every)
+{
+  for (OneiOSHostedDisk *disk : OneiOSHostedDisk::disks) if (disk) disk->report(every);
+}
+
+// A request's end, answered or timed out: its wait for the device.
+void OneiOSHostedDisk::count(uint64_t asked)
+{
+  const uint64_t waited = mach_absolute_time() - asked;
+  work.requests++;
+  work.wait += waited;
+  if (waited > work.waitMax) work.waitMax = waited;
+}
+
 // One request: header, the transfer buffer (not for a flush), status. Called with the gate held.
 IOReturn OneiOSHostedDisk::transfer(uint32_t operation, uint64_t sector, uint32_t bytes)
 {
@@ -518,6 +566,7 @@ IOReturn OneiOSHostedDisk::transfer(uint32_t operation, uint64_t sector, uint32_
   ++availableIndex;
   available[1] = availableIndex;
   dmaBarrier();
+  const uint64_t asked = mach_absolute_time();
 #if !XNU_HOSTED
   if (pci) wr16(notifyAt, 0);                // queue 0
   else
@@ -528,6 +577,8 @@ IOReturn OneiOSHostedDisk::transfer(uint32_t operation, uint64_t sector, uint32_
   clock_interval_to_deadline(5000, kMillisecondScale, &deadline);
   while (used[1] == usedIndex) {             // a device model that answers later than its notify
     if (mach_absolute_time() >= deadline) {
+      count(asked);
+      work.timeouts++;
       reset();
       __atomic_fetch_add(&oneios_hosted_disk_failures, 1, __ATOMIC_RELAXED);
       return kIOReturnTimeout;
@@ -535,6 +586,8 @@ IOReturn OneiOSHostedDisk::transfer(uint32_t operation, uint64_t sector, uint32_
     dmaBarrier();
     IODelay(10);
   }
+  count(asked);
+  work.bytes += bytes;
   dmaBarrier();
   auto *element = reinterpret_cast<volatile Used *>(queue + 260) + usedIndex % queueSize;
   bool valid = used[1] == static_cast<uint16_t>(usedIndex + 1) && element->id == 0 && *status == 0 &&
@@ -645,9 +698,12 @@ IOReturn OneiOSHostedDisk::readChecked(IOMemoryDescriptor *buffer, uint64_t into
   if ((result = transfer(opRead, start / 512, length))) return result;
   uint8_t digest[SHA256_DIGEST_LENGTH];
   SHA256_CTX context;
+  const uint64_t hashing = mach_absolute_time();
   SHA256_Init(&context);
   SHA256_Update(&context, data, static_cast<size_t>(want));
   SHA256_Final(digest, &context);
+  work.hash += mach_absolute_time() - hashing;
+  work.chunks++;
   if (memcmp(digest, static_cast<const uint8_t *>(hashList->getBytesNoCopy()) + 32 + chunk * 32, sizeof(digest))) {
     uint32_t failures = __atomic_add_fetch(&oneios_native_chunk_failures, 1, __ATOMIC_RELAXED);
     if (failures <= 8) printf("OneiOSHostedDisk: %s: chunk %llu differs from its hash list: a read error\n", role, chunk);
@@ -735,7 +791,7 @@ IOReturn OneiOSHostedDisk::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 b
   if (!reading && !writable) return kIOReturnNotWritable;
   uint64_t actual = 0;
   IOReturn result = kIOReturnNotReady;
-  IOLockLock(gate);
+  lockGate();
   while (online && actual < count * 512) {
     uint32_t bytes = static_cast<uint32_t>(count * 512 - actual > transferSize ? transferSize : count * 512 - actual);
 #if !XNU_HOSTED
@@ -767,7 +823,7 @@ IOReturn OneiOSHostedDisk::doSynchronizeCache()
 {
   if (!online) return kIOReturnNotReady;
   if (!writable || !flushes) return kIOReturnSuccess;
-  IOLockLock(gate);
+  lockGate();
   IOReturn result = transfer(opFlush, 0, 0);
   IOLockUnlock(gate);
   return result;
@@ -781,7 +837,7 @@ IOReturn OneiOSHostedDisk::zero(uint64_t bytes)
   if (bytes > capacity * 512) bytes = capacity * 512;
   bytes &= ~UINT64_C(511);
   IOReturn result = kIOReturnSuccess;
-  IOLockLock(gate);
+  lockGate();
   bzero(transferBytes, transferSize);
   for (uint64_t at = 0; at < bytes && !result;) {
     uint32_t part = static_cast<uint32_t>(bytes - at > transferSize ? transferSize : bytes - at);

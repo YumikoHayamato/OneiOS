@@ -22,4 +22,8 @@ struct Frame { IOService *display; IOMemoryDescriptor *memory; uint64_t stride; 
 extern "C" bool droidvm_virtio_gpu_offer(void *display, IOMemoryDescriptor *memory, uint64_t stride, uint32_t width, uint32_t height) {
 // (before anchor 8)
         pending = {service, memory, stride, width, height, droidvm_virtgpu_submitted(), droidvm_virtgpu_holds(), pid};
+// (before anchor 9)
+volatile uint64_t droidvm_virtio_offer_gap_hist[41], droidvm_virtio_offer_gaps[2], droidvm_virtio_offer_refused;
+// (before anchor 10)
+        if (gap < 50000) { droidvm_virtio_offer_gaps[0] = droidvm_virtio_offer_gaps[0] + 1; droidvm_virtio_offer_gaps[1] = droidvm_virtio_offer_gaps[1] + gap; }
 // (the end)

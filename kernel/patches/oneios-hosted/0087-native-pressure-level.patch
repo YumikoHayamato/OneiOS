@@ -1,0 +1,49 @@
+diff --git a/bsd/kern/kern_memorystatus.c b/bsd/kern/kern_memorystatus.c
+index 71c1ac1..145f098 100644
+--- a/bsd/kern/kern_memorystatus.c
++++ b/bsd/kern/kern_memorystatus.c
+@@ -2998,17 +2998,41 @@ oneios_bands_print(void)
+ 	}
+ }
+ 
++/*
++ * OneiOS (0087): the memory pressure level, which every process with a memory pressure source is told as it changes
++ * (0 normal, 1 warning, 2 urgent, 3 critical: vm_pressure_response, with the page-shortage thresholds above), and
++ * the pages available in MiB, for the GPU archive's event lines (gpu/OneiOSAdreno.cpp watch::).
++ */
++#define ONEIOS_MIB(pages) ((uint32_t)(((uint64_t)(pages) * PAGE_SIZE) >> 20))
++uint32_t oneios_memory_pressure_level(void);
++uint32_t
++oneios_memory_pressure_level(void)
++{
++	return (uint32_t)memorystatus_vm_pressure_level;
++}
++
++uint32_t oneios_memory_available_mib(void);
++uint32_t
++oneios_memory_available_mib(void)
++{
++	return ONEIOS_MIB(MEMORYSTATUS_LOG_AVAILABLE_PAGES);
++}
++
+ /* In MiB; called every 10 s by the GPU archive's report thread (gpu/OneiOSAdreno.cpp). */
+ void oneios_memory_report(uint32_t every);
+ void
+ oneios_memory_report(uint32_t every)
+ {
+-#define ONEIOS_MIB(pages) ((uint32_t)(((uint64_t)(pages) * PAGE_SIZE) >> 20))
++	static const char *const levels[4] = { "normal", "warning", "urgent", "critical" };
++	const uint32_t level = oneios_memory_pressure_level();
++
++	/* 0087: the level at the end of the line, which keeps its form for the log tools */
+ 	printf("oneios-memory: %u s: available %u MiB (critical %u, idle %u, soft %u), free %u, wired %u, active %u, inactive %u, "
+-	    "speculative %u, compressor %u\n", every, ONEIOS_MIB(MEMORYSTATUS_LOG_AVAILABLE_PAGES),
++	    "speculative %u, compressor %u; pressure %s\n", every, ONEIOS_MIB(MEMORYSTATUS_LOG_AVAILABLE_PAGES),
+ 	    ONEIOS_MIB(memstat_critical_threshold), ONEIOS_MIB(memstat_idle_threshold), ONEIOS_MIB(memstat_soft_threshold),
+ 	    ONEIOS_MIB(vm_page_free_count), ONEIOS_MIB(vm_page_wire_count), ONEIOS_MIB(vm_page_active_count),
+-	    ONEIOS_MIB(vm_page_inactive_count), ONEIOS_MIB(vm_page_speculative_count), ONEIOS_MIB(vm_compressor_pool_size()));
++	    ONEIOS_MIB(vm_page_inactive_count), ONEIOS_MIB(vm_page_speculative_count), ONEIOS_MIB(vm_compressor_pool_size()),
++	    level < 4 ? levels[level] : "?");
+ 	oneios_bands_print();
+ }
+ #endif /* XNU_HOSTED || XNU_ONEIOS_NATIVE */

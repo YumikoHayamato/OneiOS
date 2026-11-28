@@ -15,7 +15,8 @@
 #
 # ONEIOS_MACHINE=native (what kernel/build-native.sh sets): the native kernel instead, XNU alone at EL1 (docs/native.md).
 # The same series with CONFIG_XNU_ONEIOS_NATIVE=y and no hosted machine layer (configs/oneios_native_defconfig: 0076
-# opens the OS layer to it), the archives a machine without a host takes (storage, board, aes, keystore, hid, gpu, display), the sealed
+# opens the OS layer to it), the archives a machine without a host takes (storage, board, aes, keystore, hid, audio, net, codec,
+# gpu, display), the sealed
 # kernel without the hosted fixups. Its own trees: out/kernel-native, out/native-device, out/kernel/current-native
 # (NATIVE_OUT=NAME: each with -NAME). HOSTED_OUT is not asked for.
 set -euo pipefail
@@ -120,12 +121,14 @@ if [ "$MACHINE" = native ]; then
   # the key store, touch and keys, the GPU's transport and the display (oneios_native_defconfig force-loads all but the
   # display, which UniXNU's build links with CONFIG_XNU_NATIVE_LEGACY_DISPLAY), and the speaker and microphone (the audio
   # archive: crosvm's virtio-snd card on its ECAM bus, xnuloader-crosvm --audio), and the Wi-Fi (the network archive: crosvm's
-  # virtio-net card on that bus, xnuloader-crosvm --wifi, bridged to the phone's wlan0 by wifictl tap).
+  # virtio-net card on that bus, xnuloader-crosvm --wifi, bridged to the phone's wlan0 by wifictl tap), and the video decoder
+  # (the codec archive: crosvm's virtio-media decoder on that bus, xnuloader-crosvm --media; off without oneios-codec=1).
   awk '/^[[:space:]]*"oneios-tool kernel gen board",?[[:space:]]*$/ {
          match($0, /^[[:space:]]*/); pad = substr($0, 1, RLENGTH); n++
          printf "%s\"oneios-tool kernel gen storage\",\n%s\"oneios-tool kernel gen board\",\n", pad, pad
          printf "%s\"oneios-tool kernel gen aes\",\n%s\"oneios-tool kernel gen keystore\",\n", pad, pad
          printf "%s\"oneios-tool kernel gen hid\",\n%s\"oneios-tool kernel gen audio\",\n%s\"oneios-tool kernel gen net\",\n", pad, pad, pad
+         printf "%s\"oneios-tool kernel gen codec\",\n", pad
          printf "%s\"oneios-tool kernel gen gpu\",\n%s\"oneios-tool kernel gen display\",\n", pad, pad
          next }
        { print }

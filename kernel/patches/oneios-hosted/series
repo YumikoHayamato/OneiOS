@@ -309,3 +309,49 @@
 # 30.1 s ... err=-3905") although the link was up, so it never saved the network or its password: the next session knew
 # 0 networks and the owner typed the password again. The #if also takes XNU_ONEIOS_NATIVE. README.md, "0083".
 0083-native-wifi-association-event.patch
+# native-memory-report (2026-11-25): lines only, no decision changed. take13 lost backboardd three times with no line of
+# jetsam's (memorystatus_log goes quiet once startup serial logging ends): oneios-memory: every 10 s (available, the
+# thresholds, free, wired, the queues, the compressor), oneios-jetsam: for each kill (its cause, the victim's bands and
+# footprint) and every exit by jetsam, oneios-band: for backboardd's and SpringBoard's band changes and who made them;
+# the ns16550 console's bytes and time in its registers. With oneios-cpu-why, oneios-disk, oneios-console and
+# oneios-signatures in the GPU and storage archives. README.md, "0084".
+0084-native-memory-report.patch
+# native-granule-probe (2026-11-26): one console line set at boot, nothing decided from it. Reads ID_AA64MMFR0/1/2_EL1 raw at
+# EL1 and prints them with TGran4/16/64 and TGran4_2/16_2/64_2 decoded ("oneios-granule:"), to learn whether Oryon under
+# Gunyah takes the 16 KB granule (stage 1) and whether the VM's stage 2 allows it. Native only (the hosted kernel runs at
+# EL0, where the register is Linux's sanitized copy). README.md, "0085".
+0085-native-granule-probe.patch
+# prune-jobs (2026-11-26): opt-in, off without its boot argument. oneios-prune-jobs=1 adds a conservative preset of launchd
+# jobs this VM has no use for (absent hardware, telemetry, Watch, Fitness, Intelligence, repair) to 0053's disabled.plist
+# list; =2 adds the moderate one (Health, calls, Maps, Screen Time, sync). The same lists are userland/config/daemons.toml's
+# groups prune1 and prune2 (image build: roottweak --group prune1). 0053's own default and argument are as before.
+# README.md, "0086".
+0086-prune-jobs.patch
+# native-pressure-level (take17, 2026-11-26; numbered 0087: 0085 and 0086 are the granule probe's and the job pruning's of
+# the same day's other work): lines only, no decision changed. oneios-memory ends with the memory pressure
+# level (normal, warning, urgent, critical), and the level and the pages available can be asked by the GPU archive's
+# event lines (gpu/OneiOSAdreno.cpp watch::: oneios-pressure as the level changes, oneios-video each second a decoder
+# runs). take16's YouTube at 1080p ran with 473 to 650 MiB available against a soft threshold of 676, so the level was
+# going back and forth while the picture stopped, and no line said when. README.md, "0087".
+0087-native-pressure-level.patch
+# native-gpu-role-client (take19, 2026-11-27): opt-in, off without its boot argument. RunningBoard looks up the IOGPU
+# service once (IOServiceMatching("IOGPU"): the GPU archive's AGXAccelerator, whose chain DroidVMGpu.cpp adopts IOGPU
+# into) and IOGPUDeviceCreate opens it with type 1, which the accelerator refuses (0xe00002c7); with the ref nil every app
+# transition logged "setGPURole:pid: failed due to nil IOGPU device ref" (634 in take17). oneios-gpu-role=1: such an
+# open by a process entitled to com.apple.private.set-gpu-role gets a role-only client (IOUserClient.cpp,
+# OneiOSGPURoleUserClient, chain IOGPUDeviceUserClient) that answers IOGPUDeviceCreate's reads empty and takes
+# IOGPUDeviceSetAppGPURole (selector 33); no GPU scheduling changes. "oneios-gpu-role:" lines. README.md, "0088".
+0088-native-gpu-role-client.patch
+# native-display-trim-layers (take19, 2026-11-27): a line always, the change opt-in. The render server disables
+# hardware layers 1 and 2 with a NULL surface in every swap while a Metal layer or a video is on screen; this display has
+# one layer, and IOMobileFramebufferLegacy::swap_submit looks each one up as surface ID 0, which IOSurface logs as
+# "SID: 0x0 task: ... buffer->fClientTask = 0 not found" (60,824 in take17, two a swap). oneios-display-trim-layers=1
+# takes such layers (at or past MaxNumLayers, no surface, never given one) out of the swap before the method;
+# "oneios-display: ... disables layers 0x6 with no surface ..." at the 1st, 100th, 10,000th such swap either way.
+# README.md, "0089".
+0089-native-display-trim-layers.patch
+# userland/apps (2026-11-27): the boot addon may carry oneios/services.d/NAME and oneios/enabled/NAME, written to
+# /private/var/oneios instead of /private/var/ngpu, so the seed's oneios-init starts a service that came with the addon
+# (the apps' registrar, appreg) without a new Data seed. Every other entry as before. Not run yet on the phone.
+# take19: only with the boot argument oneios-addon-services=1 (the -apps image); without it every entry goes to ngpu.
+0090-addon-oneios-services.patch

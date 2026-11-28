@@ -1,0 +1,75 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8956,7 +8956,36 @@
+  * LaunchServices.ApplicationsChanged. SiriAUSP, MacinTalkAUSP, MauiAUSP and KonaSynthesizer were started together and
+  * each was killed 3-4 s later while still in dyld (EXC_CRASH, SIGKILL, code 0x9000000), every 8-10 s for about 50 s
+  * (phone, 2026-11-12 14:12); the four corpses at a time filled the kernel's corpse limit, so a later crash had no report.
++ *
++ * 0086: oneios-prune-jobs=N (off, 0, without it) adds a preset of launchd jobs this VM has no use for to that list:
++ * 1 the conservative one (hardware that is not there, telemetry and diagnostics, Watch, Fitness, Intelligence and
++ * repair jobs: none of SpringBoard's, backboardd's, Wi-Fi's, audio's, input's, display's or locationd's), 2 that and
++ * the moderate one (Health, calls, Maps, Screen Time, sync: each may cost a feature or a reconnect loop, test it).
++ * Same lists as userland/config/daemons.toml's groups prune1 and prune2 (the image build's way: --group prune1);
++ * docs: kernel/patches/oneios-hosted/README.md, "0086". The disabled.plist lives in the Data store: the entries stay
++ * after the argument is gone (turn them on again with oneios-enable-jobs=LABEL,...). Another list in
++ * oneios-disable-jobs (its first 255 bytes) is kept and the preset follows it; "-" there is no list of its own.
+  */
++static const char oneios_prune_jobs_1[] =
++	    "com.apple.ReportMemoryException,com.apple.ReportSystemMemory,com.apple.sysdiagnose,"
++	    "com.apple.sysdiagnose_helper,com.apple.ptpd,com.apple.ptpcamerad,com.apple.aonsensed,"
++	    "com.apple.callverificationd,com.apple.caraccessoryd,com.apple.dockaccessoryd,com.apple.wcd,"
++	    "com.apple.activitysharingd,com.apple.sportsd,com.apple.homeenergyd,com.apple.imageplaygroundd,"
++	    "com.apple.privatecloudcomputed,com.apple.translationd,com.apple.bookdatastored,"
++	    "com.apple.facetimemessagestored,com.apple.mobilerepaird,com.apple.corerepaird,com.apple.feedbackd,"
++	    "com.apple.atc,com.apple.backupd";
++static const char oneios_prune_jobs_2[] =
++	    "com.apple.healthd,com.apple.healthappd,com.apple.fitcore,com.apple.fitcore.session,"
++	    "com.apple.healtheventsd,com.apple.healthcontentd,com.apple.healthrecordsd,"
++	    "com.apple.telephonyutilities.callservicesd,com.apple.callhistoryd,com.apple.geod,com.apple.suggestd,"
++	    "com.apple.mlhostd,com.apple.networkserviceproxy,com.apple.symptomsd.distributed,"
++	    "com.apple.ScreenTimeAgent,com.apple.ScreenTimeSettingsAgent,com.apple.FamilyControlsAgent,"
++	    "com.apple.ManagedSettingsAgent,com.apple.sosd,com.apple.voiced,com.apple.accessoryd,"
++	    "com.apple.airplayd,com.apple.cloudphotod,com.apple.purplebuddy.budd,com.apple.parsecd,"
++	    "com.apple.contacts.donation-agent,com.apple.cameraispd,com.apple.appleh16camerad,"
++	    "com.apple.dietappleh16camerad,com.apple.dietapplecamerad,com.apple.realitycamerad,"
++	    "com.apple.restorecameraispd,com.apple.stickersd,com.apple.avatarsd";
++
+ static void
+ oneios_jobs_disable(void)
+ {
+@@ -8964,10 +8994,31 @@
+ 	static const char empty[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+ 	    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+ 	    "<plist version=\"1.0\">\n<dict>\n</dict>\n</plist>\n";
+-	char labels[256] = "com.apple.accessibility.axassetsd";
++	/* 0086: the list is built in a static buffer (this runs once, before launchd): the boot argument's, then the preset's */
++	static char labels[2048];
+ 	vfs_context_t ctx = vfs_context_current();
+-	(void)PE_parse_boot_argn("oneios-disable-jobs", labels, sizeof(labels));
+-	if (labels[0] == 0 || !strcmp(labels, "-")) {
++	strlcpy(labels, "com.apple.accessibility.axassetsd", sizeof(labels));
++	(void)PE_parse_boot_argn("oneios-disable-jobs", labels, 256);
++	if (!strcmp(labels, "-")) {
++		labels[0] = 0;
++	}
++	uint32_t prune = 0;
++	(void)PE_parse_boot_argn("oneios-prune-jobs", &prune, sizeof(prune));
++	if (prune >= 1) {
++		const char *const presets[2] = { oneios_prune_jobs_1, oneios_prune_jobs_2 };
++		for (uint32_t level = 0; level < 2 && level < prune; level++) {
++			if (labels[0] != 0 && strlcat(labels, ",", sizeof(labels)) >= sizeof(labels)) {
++				break;
++			}
++			if (strlcat(labels, presets[level], sizeof(labels)) >= sizeof(labels)) {
++				printf("oneios-jobs: the prune list %u does not fit\n", level + 1);
++				labels[0] = 0;
++				break;
++			}
++		}
++		printf("oneios-jobs: oneios-prune-jobs=%u: %u bytes of labels\n", prune, (unsigned)strlen(labels));
++	}
++	if (labels[0] == 0) {
+ 		return;
+ 	}
+ 	const size_t cap = 256 * 1024;

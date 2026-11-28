@@ -32,6 +32,7 @@ extern "C" { volatile uint64_t oneios_actuator_frames; }
             else droidvm_audio_played = droidvm_audio_played + played;
 // (before anchor 7)
         if (!isActuator) droidvm_audio_periods = droidvm_audio_periods + 1;
+        if (isInput) oneios_mic_periods = oneios_mic_periods + 1;   // OneiOS (take17): the Mic's own
 // (before anchor 8)
     DroidVMAudioDevice *device = OSTypeAlloc(DroidVMAudioDevice);
     if (device) device->isActuator = oneios_publishing_actuator;   // OneiOS: before initRole sizes the ring
@@ -57,13 +58,17 @@ extern "C" { volatile uint64_t oneios_actuator_frames; }
           actuator, oneios_out_uid, oneios_in_uid, oneios_actuator_channels, oneios_output_latency);
 // (before anchor 12)
     droidvm_audio_clients = droidvm_audio_clients + 1;
+    oneios_audio_opens = oneios_audio_opens + 1;   // OneiOS
     if (device->isActuator) oneios_haptic_actuator_event(0, 0, 0);   // OneiOS: opened
+    if (device->isInput) oneiosMicTouch(0, 0);   // OneiOS (take17): the Mic's
 // (before anchor 13)
     droidvm_audio_clients = droidvm_audio_clients - 1;
     if (device && device->isActuator) oneios_haptic_actuator_event(1, 0, 0);   // OneiOS: closed
+    if (device && device->isInput) oneiosMicTouch(1, 0);
 // (before anchor 14)
     droidvm_audio_selectors = droidvm_audio_selectors + 1;
     if (device && device->isActuator) oneios_haptic_actuator_event(2, selector, 0);   // OneiOS: a selector
+    if (device && device->isInput) oneiosMicTouch(2, selector);
 // (before anchor 15)
         droidvm_audio_bad_selectors = droidvm_audio_bad_selectors + 1;
         if (device && device->isActuator) oneios_haptic_actuator_event(3, selector, 0);   // OneiOS: refused
@@ -79,12 +84,18 @@ extern "C" { volatile uint64_t oneios_actuator_frames; }
 // (before anchor 18)
     droidvm_audio_maps = droidvm_audio_maps + 1;
     if (device->isActuator) oneios_haptic_actuator_event(5, type, 0);   // OneiOS: a mapping
+    if (device->isInput) oneiosMicTouch(3, type);
 // (before anchor 19)
 uint32_t droidvm_snd_capture(int16_t *frames, uint32_t count);
 // OneiOS (fix-audio-latency): the speaker's ring (oneios-audio-ring) and its engine's timing (OneiOSAudio.c reports it).
 uint32_t oneios_speaker_ring = 1920;
 // OneiOS (fix-audio-volume): the speaker's volume step (0..128, VirtualAudio's), its gain (Q16) and how often it changed.
 volatile uint32_t oneios_speaker_volume = 128, oneios_speaker_gain = 65536, oneios_speaker_volume_sets;
+// OneiOS (take22): the step at or under which the speaker is silent. VirtualAudio's lowest volume for this route is
+// -58 dB (step 12: "Set decibel volume value of -58" at the slider's zero, take21's iOS log), not step 0, and its
+// own mute (a software volume command to a DSP) has nothing to act on here, so volume 0 was still heard: the host
+// plays at full scale. oneios-audio-zero-step=N moves the step (0: only step 0 is silent, as before take22).
+uint32_t oneios_speaker_zero_step = 12;
 volatile uint64_t oneios_speaker_periods, oneios_speaker_late_sum, oneios_speaker_late_max, oneios_speaker_leads,
     oneios_speaker_lead_sum, oneios_speaker_lead_min = ~0ULL, oneios_speaker_lead_max, oneios_speaker_lead_last, oneios_speaker_tight;
 // (before anchor 20)
@@ -93,6 +104,7 @@ volatile uint64_t oneios_speaker_periods, oneios_speaker_late_sum, oneios_speake
     bool speakerEngine() const { return !isInput && !isActuator; }   // OneiOS: hands a period on as it starts
     void oneiosSpeakerPeriod(uint64_t deadline, uint64_t done);
     uint32_t oneiosSetVolume(uint64_t value, IORegistryEntry *client);   // OneiOS: the speaker's volume control
+    uint32_t oneiosSetMicSources(const uint32_t *ids, uint32_t count, IORegistryEntry *client);   // OneiOS (take18)
 // (before anchor 21)
     ringFrames = speakerEngine() ? oneios_speaker_ring : RingFrames;   // OneiOS
     ring = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, Shared, ringFrames * 2 * channels(), page_size);
@@ -141,7 +153,13 @@ uint32_t DroidVMAudioDevice::oneiosSetVolume(uint64_t value, IORegistryEntry *cl
     const int32_t asked = int32_t(uint32_t(value));
     const uint32_t v = asked < 0 ? 0 : asked > int32_t(OneiosVolumeSteps) ? OneiosVolumeSteps : uint32_t(asked);
     const bool changed = v != oneios_speaker_volume;
-    oneios_speaker_gain = oneios_volume_gain[v];
+    static bool zeroRead;
+    if (!zeroRead) {
+        zeroRead = true;
+        PE_parse_boot_argn("oneios-audio-zero-step", &oneios_speaker_zero_step, sizeof(oneios_speaker_zero_step));
+        if (oneios_speaker_zero_step >= OneiosVolumeSteps) oneios_speaker_zero_step = OneiosVolumeSteps - 1;
+    }
+    oneios_speaker_gain = v <= oneios_speaker_zero_step ? 0 : oneios_volume_gain[v];
     oneios_speaker_volume = v;
     if (OSArray *a = oneiosControls(true)) {
         setProperty("controls", a);
@@ -154,10 +172,47 @@ uint32_t DroidVMAudioDevice::oneiosSetVolume(uint64_t value, IORegistryEntry *cl
         const uint32_t down = OneiosVolumeSteps - v;   // half dB below 0 dB
         if (n <= 16 || n % 64 == 0)
             IOLog("DroidVMAudio: speaker volume %u of %u (%s%u.%u dB, gain %u of 65536), change %u: iOS's volume, applied here "
-                  "(the host plays at full scale)\n", v, (unsigned)OneiosVolumeSteps, v == 0 ? "silent, -" : down ? "-" : "",
+                  "(the host plays at full scale)\n", v, (unsigned)OneiosVolumeSteps, oneios_speaker_gain == 0 ? "silent, -" : down ? "-" : "",
                   down / 2, down % 2 * 5, oneios_speaker_gain, n);
     }
     return v;
+}
+
+// OneiOS (take18): the Mic's selected input data sources, as the HAL sets them (SetControlValue: one; SetMultiControlValue:
+// a list, at most 4 kept). Every ID is taken, also one the control's items do not name: they are all the same mono
+// stream here, and a refusal would end VirtualAudio's route as the missing property did. The description again on the
+// device and the client (the HAL reads it through both). The first 16 changes are said with the caller, then every 64th.
+uint32_t DroidVMAudioDevice::oneiosSetMicSources(const uint32_t *ids, uint32_t count, IORegistryEntry *client) {
+    const uint32_t n = count < OneiosMicSources ? count : OneiosMicSources;
+    bool changed = n != oneios_mic_selected_count;
+    for (uint32_t i = 0; i < n; i++) {
+        if (oneios_mic_selected[i] != ids[i]) changed = true;
+        oneios_mic_selected[i] = ids[i];
+    }
+    oneios_mic_selected_count = n;
+    if (OSArray *a = oneiosMicControls()) {
+        setProperty("controls", a);
+        if (client) client->setProperty("controls", a);
+        a->release();
+    }
+    const uint32_t sets = oneios_mic_source_sets + 1;   // no read of a volatile assignment (C++20)
+    oneios_mic_source_sets = sets;
+    if (changed && (sets <= 16 || sets % 64 == 0)) {
+        char list[OneiosMicSources * 5 + 1], who[24] = "?";   // 'mc01 mc02 ...'
+        uint32_t at = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            if (i) list[at++] = ' ';
+            for (int shift = 24; shift >= 0; shift -= 8) {
+                const char c = char(ids[i] >> shift);
+                list[at++] = c >= ' ' && c <= '~' ? c : '?';
+            }
+        }
+        list[at] = 0;
+        proc_selfname(who, sizeof who);
+        IOLog("DroidVMAudio: mic: data sources %s (%u) set by %s[%d], set %u: all of them the one mono stream\n",
+              n ? list : "none", n, who, proc_selfpid(), sets);
+    }
+    return n;
 }
 // (before anchor 25)
         // OneiOS: the speaker takes a period as it starts (the HAL has written it a safety offset of one period
@@ -247,13 +302,149 @@ void oneiosVolume(int16_t *s, uint32_t n) {
     if (g >= 65536) return;
     for (uint32_t i = 0; i < n; i++) s[i] = int16_t((int32_t(s[i]) * g) >> 16);
 }
+// OneiOS (take18): the Mic's input data sources, as an iPhone's built-in microphone has them. VirtualAudio's route
+// for recording (RoutingHandler_PlaybackAndRecord_GenericConfig1) sets the built-in mic's sub-ports through the
+// device's input data sources (SubPortPolicy: AudioObjectGetPropertyDataSize of ['ssrc', 'inpt', 0]) and gives the
+// whole route up when the device has none (take17: "Error getting data size of property [ssrc/inpt/0] on device 37",
+// then "Routing is not supported", 30 times): Voice Memos' engine saw an input of 0 Hz (AURemoteIO -10851) and
+// Safari's capture did not start (-66637), and the HAL never asked the Mic for StartIO. 24A446's HAL serves 'ssrc'
+// from the scope's data source control ('dsrc', a selector: HALB_Info::TranslateDeviceAddressToControlAddress), whose
+// items are its "selectors" ({"value": ID, "name": text}) and, a multi-selector, its "value" an array of the
+// selected IDs (HALS_IOA2UCDevice::CopySelectorControlInfo_SelectorMap/_MultiSelectorValue). VirtualAudio reads and
+// sets a list (the size over 4). The IDs are an iPhone's microphones as VirtualAudio's built-in mic tables name them
+// ('mc01' bottom, 'mc02' front, 'mc03' back, 'mc04' a second bottom one; 1835216945.. as AVAudioSession shows them):
+// every one of them is the one mono stream here. The HAL changes the selection by SetControlValue (selector 2) or
+// SetMultiControlValue (selector 8: the control ID and the IDs in, the IDs taken out), and every ID asked is taken.
+enum : uint32_t { OneiosMicSourceID = 2, OneiosMicSources = 4 };
+const uint32_t oneios_mic_source_ids[OneiosMicSources] = { 0x6d633031, 0x6d633032, 0x6d633033, 0x6d633034 };   // 'mc01'..'mc04'
+const char *const oneios_mic_source_names[OneiosMicSources] = { "Bottom", "Front", "Back", "Bottom 2" };
+volatile uint32_t oneios_mic_selected[OneiosMicSources] = { 0x6d633031 }, oneios_mic_selected_count = 1, oneios_mic_source_sets;
+OSArray *oneiosMicControls() {
+    OSArray *list = OSArray::withCapacity(1), *items = OSArray::withCapacity(OneiosMicSources), *value = OSArray::withCapacity(OneiosMicSources);
+    OSDictionary *c = OSDictionary::withCapacity(12);
+    if (list && items && value && c) {
+        setNumber(c, "control ID", OneiosMicSourceID);
+        setNumber(c, "base class", 0x736c6374);   // 'slct'
+        setNumber(c, "class", 0x64737263);        // 'dsrc'
+        setNumber(c, "scope", 0x696e7074);        // 'inpt'
+        setNumber(c, "element", 0);
+        c->setObject("read only", kOSBooleanFalse);
+        c->setObject("multi-selector", kOSBooleanTrue);
+        for (uint32_t i = 0; i < OneiosMicSources; i++) {
+            OSDictionary *item = OSDictionary::withCapacity(2);
+            OSString *name = OSString::withCString(oneios_mic_source_names[i]);
+            if (item && name) { setNumber(item, "value", oneios_mic_source_ids[i]); item->setObject("name", name); items->setObject(item); }
+            OSSafeReleaseNULL(item); OSSafeReleaseNULL(name);
+        }
+        const uint32_t n = oneios_mic_selected_count < OneiosMicSources ? oneios_mic_selected_count : OneiosMicSources;
+        for (uint32_t i = 0; i < n; i++)
+            if (OSNumber *id = OSNumber::withNumber(uint64_t(oneios_mic_selected[i]), 32)) { value->setObject(id); id->release(); }
+        c->setObject("selectors", items);
+        c->setObject("value", value);
+        list->setObject(c);
+    }
+    OSSafeReleaseNULL(items); OSSafeReleaseNULL(value); OSSafeReleaseNULL(c);
+    return list;
+}
 // (before anchor 34)
-    if (OSArray *a = oneiosControls(speakerEngine())) { e->setProperty("controls", a); a->release(); }   // OneiOS: the speaker's volume
+    // OneiOS: the speaker's volume; the Mic's input data sources (take18)
+    if (OSArray *a = isInput ? oneiosMicControls() : oneiosControls(speakerEngine())) { e->setProperty("controls", a); a->release(); }
 // (before anchor 35)
     case 2: {                                              // SetControlValue: the speaker's volume (OneiOS)
+        if (device->isInput && a->scalarInputCount >= 2 && a->scalarInput[0] == OneiosMicSourceID) {   // the Mic's data source (take18)
+            const uint32_t id = uint32_t(a->scalarInput[1]);
+            device->oneiosSetMicSources(&id, 1, this);
+            if (a->scalarOutputCount >= 1) { a->scalarOutput[0] = id; a->scalarOutputCount = 1; }
+            return kIOReturnSuccess;
+        }
         if (!device->speakerEngine() || a->scalarInputCount < 2 || a->scalarInput[0] != OneiosVolumeID) return kIOReturnBadArgument;
         const uint32_t v = device->oneiosSetVolume(a->scalarInput[1], this);
         if (a->scalarOutputCount >= 1) { a->scalarOutput[0] = v; a->scalarOutputCount = 1; }
         return kIOReturnSuccess;
     }
+// (before anchor 36)
+volatile int droidvm_audio_family_status = -1, droidvm_audio_hog_owner = -1;
+volatile uint64_t oneios_audio_opens, oneios_audio_properties, oneios_audio_ports, oneios_audio_bad_maps;   // OneiOS
+// OneiOS (take17): the Mic's StartIOs and StopIOs, its engine's own periods, and the formats and rates a device refused.
+volatile uint64_t oneios_mic_ios[2], oneios_mic_periods, oneios_audio_refused_formats;
+// OneiOS (take17): what touches the Mic device at all: user clients opened [0] and closed [1], selectors [2] (a bit for
+// each selector seen in [5]), mappings [3] and property sets [4].
+volatile uint64_t oneios_mic_touch[6];
+// (before anchor 38)
+    if (!m) { oneios_audio_bad_maps = oneios_audio_bad_maps + 1; return kIOReturnBadArgument; }   // OneiOS: counted
+// (before anchor 39)
+IOReturn DroidVMAudioUserClient::setProperties(OSObject *properties) {
+    oneios_audio_properties = oneios_audio_properties + 1;   // OneiOS
+    if (device && device->isInput) oneiosMicTouch(4, 0);
+// (before anchor 40)
+IOReturn DroidVMAudioUserClient::registerNotificationPort(mach_port_t, UInt32, io_user_reference_t) {
+    oneios_audio_ports = oneios_audio_ports + 1;   // OneiOS
+// (before anchor 41)
+OSDefineMetaClassAndStructors(DroidVMAudioUserClient, IOUserClient)
+
+// OneiOS (take17): the Mic's StartIO and StopIO, each with its caller and answer (the first 24, then every 32nd), and a
+// sample rate or format a device refuses (counted with the refused selectors; the first 16 are said).
+extern "C" { void proc_selfname(char *, int); int proc_selfpid(void); }
+static void oneiosMicIO(bool start, uint32_t selector, IOReturn result) {
+    const uint64_t n = oneios_mic_ios[start ? 0 : 1] + 1;
+    oneios_mic_ios[start ? 0 : 1] = n;
+    if (n > 24 && n % 32) return;
+    char who[24] = "?";
+    proc_selfname(who, sizeof who);
+    IOLog("DroidVMAudio: mic: %s %llu (selector %u) by %s[%d]: %#x\n", start ? "StartIO" : "StopIO", n, selector, who,
+          proc_selfpid(), result);
+}
+static void oneiosRefused(DroidVMAudioDevice *device, uint32_t selector, uint32_t hz, uint32_t channels, uint32_t bits) {
+    droidvm_audio_bad_selectors = droidvm_audio_bad_selectors + 1;
+    const uint64_t n = oneios_audio_refused_formats + 1;
+    oneios_audio_refused_formats = n;
+    if (n > 16) return;
+    if (selector == 4)
+        IOLog("DroidVMAudio: %s: a sample rate of %u Hz asked: refused (the device has %u Hz alone)\n", device->uid, hz, unsigned(Rate));
+    else
+        IOLog("DroidVMAudio: %s: a format of %u channel(s) of %u bits at %u Hz asked: refused (the device has %u of 16 bits at %u Hz)\n",
+              device->uid, channels, bits, hz, device->channels(), unsigned(Rate));
+}
+// What touches the Mic device: counted (oneios_mic_touch), its opens and closes said with their caller (the first 12).
+static void oneiosMicTouch(uint32_t kind, uint32_t value) {
+    const uint64_t n = oneios_mic_touch[kind] + 1;
+    oneios_mic_touch[kind] = n;
+    if (kind == 2) oneios_mic_touch[5] = oneios_mic_touch[5] | 1ull << (value < 63 ? value : 63);
+    if (kind > 1 || n > 12) return;
+    char who[24] = "?";
+    proc_selfname(who, sizeof who);
+    IOLog("DroidVMAudio: mic: %s %llu by %s[%d]\n", kind ? "closed" : "opened", n, who, proc_selfpid());
+}
+// (before anchor 42)
+        IOReturn r = device->startIO();
+        if (device->isInput) oneiosMicIO(true, selector, r);   // OneiOS (take17)
+// (before anchor 43)
+        startedIO = false;
+        {   // OneiOS (take17): the Mic's stops are said
+            const IOReturn r = device->stopIO();
+            if (device->isInput) oneiosMicIO(false, selector, r);
+            return r;
+        }
+// (before anchor 44)
+        if (rate != fixed64(Rate)) oneiosRefused(device, selector, uint32_t(uint64_t(rate) >> 32), 0, 0);   // OneiOS (take17)
+        return rate == fixed64(Rate) ? kIOReturnSuccess : kIOReturnUnsupported;
+// (before anchor 45)
+        if (!(f.rate == fixed64(Rate) && f.id == FormatLinearPCM && f.channels == device->channels() && f.bits == 16))   // OneiOS (take17)
+            oneiosRefused(device, selector, uint32_t(uint64_t(f.rate) >> 32), f.channels, f.bits);
+        return f.rate == fixed64(Rate) && f.id == FormatLinearPCM && f.channels == device->channels() && f.bits == 16
+            ? kIOReturnSuccess : kIOReturnUnsupported;
+// (before anchor 46)
+    case 8: {                                              // SetMultiControlValue: the Mic's data sources (OneiOS take18)
+        const uint32_t *in = static_cast<const uint32_t *>(a->structureInput);
+        if (!device->isInput || !in || a->structureInputSize < 4 || a->structureInputSize % 4 || in[0] != OneiosMicSourceID)
+            return kIOReturnBadArgument;
+        const uint32_t n = device->oneiosSetMicSources(in + 1, a->structureInputSize / 4 - 1, this);
+        if (uint32_t *out = static_cast<uint32_t *>(a->structureOutput)) {
+            const uint32_t room = a->structureOutputSize / 4, k = n < room ? n : room;
+            for (uint32_t i = 0; i < k; i++) out[i] = in[1 + i];
+            a->structureOutputSize = k * 4;
+        }
+        return kIOReturnSuccess;
+    }
+    case 6: case 12:                                       // SetStreamActive, SetClientDescription
 // (the end)

@@ -26,8 +26,10 @@ CONFIG_XNU_BOOT_PROGRESS=n
 # for an AppleKeyStore service), as the hosted kernel has them; the GPU (gen gpu: Droid-VM's virtio-gpu transport,
 # which the display's scanout uses; without a 3D device, "display only"); and touch and keys (gen hid: NativeHidInput
 # fed by Droid-VM's virtio-input transport: on the bench QEMU's virtio-tablet-device as one finger and its keyboard).
+# Then the speaker (gen audio), the Wi-Fi (gen net) and the video decoder (gen codec: VideoToolbox's paravirtualized decoder
+# over crosvm's virtio-media decoder; it starts only with oneios-codec=1, which xnuloader-crosvm --media gives).
 # In the hosted kernel's link order; kernel/build-native.sh adds them, and the display (gen display), to the archives.
-CONFIG_XNU_EXTRA_LD_ARCHIVES="-Wl,-force_load,{tree}/build/oneios-drivers/liboneiosdrivers.a -Wl,-force_load,{tree}/build/oneios-board/liboneiosboard.a -Wl,-force_load,{tree}/build/oneios-hosted-storage/liboneioshostedstorage.a -Wl,-force_load,{tree}/build/oneios-gpu/liboneiosgpu.a -Wl,-force_load,{tree}/build/oneios-aes/liboneiosaes.a -Wl,-force_load,{tree}/build/oneios-keystore/liboneioskeystore.a -Wl,-force_load,{tree}/build/oneios-hid/liboneioshid.a -Wl,-force_load,{tree}/build/oneios-audio/liboneiosaudio.a -Wl,-force_load,{tree}/build/oneios-net/liboneiosnet.a"
+CONFIG_XNU_EXTRA_LD_ARCHIVES="-Wl,-force_load,{tree}/build/oneios-drivers/liboneiosdrivers.a -Wl,-force_load,{tree}/build/oneios-board/liboneiosboard.a -Wl,-force_load,{tree}/build/oneios-hosted-storage/liboneioshostedstorage.a -Wl,-force_load,{tree}/build/oneios-gpu/liboneiosgpu.a -Wl,-force_load,{tree}/build/oneios-aes/liboneiosaes.a -Wl,-force_load,{tree}/build/oneios-keystore/liboneioskeystore.a -Wl,-force_load,{tree}/build/oneios-hid/liboneioshid.a -Wl,-force_load,{tree}/build/oneios-audio/liboneiosaudio.a -Wl,-force_load,{tree}/build/oneios-net/liboneiosnet.a -Wl,-force_load,{tree}/build/oneios-codec/liboneioscodec.a"
 # The display (kernel/patches/oneios-hosted/display): UniXNU's NativeMobileDisplay under the collection's
 # IOMobileFramebufferLegacy, frames to the virtio-gpu scanout (QEMU's virtio-gpu-device on the bench). UniXNU's build links
 # build/native-legacy-display/libNativeLegacyDisplay.late.a and compiles bsd_init's two calls; 0076 turns the display on

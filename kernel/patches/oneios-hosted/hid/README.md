@@ -150,7 +150,7 @@ on the keyboard, which iOS takes for its trackpad mode, where keys type nothing 
 after three or four characters, 2026-11-13; not reproduced]. The iPhone's own touch path raises its queue the same way
 (the kernelcache has AppleSPUHIDDriver's `set %s kIOHIDEventServiceQueueSize to %d KB`). `OneiOSHidInput.cpp`
 `setQueueSize` can set `QueueSize` on the touch screen's and the buttons' event drivers as they attach, before
-backboardd opens them: `oneios-hid-queue-kib=N` (at most 4096; **default 0, off**: compiled on the PC, never booted, so it waits for a boot with `oneios-hid-queue-kib=256`); Apple's own boot
+backboardd opens them: `oneios-hid-queue-kib=N` (at most 4096; **default 0, off**; `xnuloader-crosvm --display` gives 256 unless the arguments have the switch, not booted yet); Apple's own boot
 argument `hidq_size=BYTES` still wins over the property. Log, once per service: `oneios-hid: touch screen: event queue
 256 KiB for its user clients (QueueSize)`, with `; already open: theirs stays 16 KiB until they open again` if
 backboardd was first. On the phone: the `N dropped` of the state line should stay 0 through a stall.
@@ -179,6 +179,9 @@ only with `XNU_ONEIOS_NATIVE` (the hosted kernel's transport is the same as befo
 
 The touch frames have no scan time on the S25 (its touchscreen sends no `MSC_TIMESTAMP`): they are counted as frames
 without one ("Latency").
+From 2026-11-26 the forwarder can send it (`displayctl touch --scan-time`, `vm-boot --touch-time`: the time Linux's input
+core stamped the frame with, as xnuhost sends it; runtime/display/README.md): nothing in the kernel changes, the line
+then reads `touch latency: N frames, the transport had each a/b/c us after its scan`. Not run on the phone yet.
 
 ## Pen (spen, 2026-11-15; off by default)
 

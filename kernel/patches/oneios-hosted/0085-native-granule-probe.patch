@@ -1,0 +1,54 @@
+diff --git a/osfmk/arm64/oneios_host.c b/osfmk/arm64/oneios_host.c
+--- a/osfmk/arm64/oneios_host.c
++++ b/osfmk/arm64/oneios_host.c
+@@ -94,6 +94,40 @@
+ #endif /* !XNU_HOSTED */
+ #endif /* XNU_HOSTED */
+ 
++#if XNU_ONEIOS_NATIVE && !XNU_HOSTED
++/*
++ * OneiOS (0085): the CPU's page-granule support, read raw at EL1 and printed once on the console (serial.txt), to learn
++ * whether the Oryon cores under Gunyah take a 16 KB granule (iPhones run XNU with 16 KB pages; this kernel runs 4 KB).
++ * EL0 sees only Linux's sanitized ID_AA64MMFR0_EL1 (0x20000111ff000000: no 4 KB either), which proves nothing. Fields:
++ * TGran4/16/64 (stage 1): 4 KB 0 yes, 1 yes with 52-bit, f no; 16 KB 0 no, 1 yes, 2 yes with 52-bit; 64 KB 0 yes, f no.
++ * TGran*_2 (stage 2, the hypervisor's table for this VM): 0 as the stage 1 field, 1 no, 2 yes, 3 yes with 52-bit.
++ * Lines only: nothing is decided from them. Not for the hosted kernel (EL0: the register is Linux's emulation there).
++ */
++extern int printf(const char *fmt, ...) __printflike(1, 2);
++
++static void
++oneios_granule_report(void)
++{
++	uint64_t m0, m1, m2;
++
++	__asm__ volatile ("mrs %0, ID_AA64MMFR0_EL1" : "=r"(m0));
++	__asm__ volatile ("mrs %0, ID_AA64MMFR1_EL1" : "=r"(m1));
++	__asm__ volatile ("mrs %0, ID_AA64MMFR2_EL1" : "=r"(m2));
++#define OF(v, lo) ((unsigned)(((v) >> (lo)) & 0xf))
++	printf("oneios-granule: ID_AA64MMFR0_EL1 0x%016llx MMFR1 0x%016llx MMFR2 0x%016llx\n",
++	    (unsigned long long)m0, (unsigned long long)m1, (unsigned long long)m2);
++	printf("oneios-granule: stage 1: TGran4 %x TGran16 %x TGran64 %x; stage 2: TGran4_2 %x TGran16_2 %x TGran64_2 %x; "
++	    "PARange %x ASIDBits %x\n", OF(m0, 28), OF(m0, 20), OF(m0, 24), OF(m0, 40), OF(m0, 32), OF(m0, 36),
++	    OF(m0, 0), OF(m0, 4));
++	printf("oneios-granule: 16 KB at stage 1: %s; at stage 2: %s; 4 KB at stage 1: %s; MMFR1 VMIDBits %x HAFDBS %x VH %x, "
++	    "MMFR2 VARange %x BBM %x TTL %x\n",
++	    OF(m0, 20) >= 1 ? "yes" : "no",
++	    OF(m0, 32) == 0 ? (OF(m0, 20) >= 1 ? "yes (as stage 1)" : "no (as stage 1)") : (OF(m0, 32) >= 2 ? "yes" : "no"),
++	    OF(m0, 28) == 0xf ? "no" : "yes", OF(m1, 4), OF(m1, 0), OF(m1, 8), OF(m2, 16), OF(m2, 52), OF(m2, 48));
++#undef OF
++}
++#endif /* XNU_ONEIOS_NATIVE && !XNU_HOSTED */
++
+ void oneios_board_late_start(void);
+ 
+ void
+@@ -101,6 +135,9 @@
+ {
+ 	droidvm_cpufreq_attach();
+ 	oneios_drivers_start();
++#if XNU_ONEIOS_NATIVE && !XNU_HOSTED
++	oneios_granule_report();
++#endif
+ #if XNU_HOSTED || XNU_ONEIOS_NATIVE
+ 	/*
+ 	 * Not here (0010-aes-after-boot-manifest.patch): AppleImage4 comes up as soon as it has its IOAESAccelerator,

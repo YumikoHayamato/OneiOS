@@ -73,4 +73,26 @@ uint64_t absolute(uint64_t frames) { uint64_t t; nanoseconds_to_absolutetime(fra
 // (before anchor 35)
     case 2:                                                // SetControlValue: no controls are published
         return kIOReturnBadArgument;
+// (before anchor 36)
+volatile int droidvm_audio_family_status = -1, droidvm_audio_hog_owner = -1;
+// (before anchor 38)
+    if (!m) return kIOReturnBadArgument;
+// (before anchor 39)
+IOReturn DroidVMAudioUserClient::setProperties(OSObject *properties) {
+// (before anchor 40)
+IOReturn DroidVMAudioUserClient::registerNotificationPort(mach_port_t, UInt32, io_user_reference_t) {
+// (before anchor 41)
+OSDefineMetaClassAndStructors(DroidVMAudioUserClient, IOUserClient)
+// (before anchor 42)
+        IOReturn r = device->startIO();
+// (before anchor 43)
+        startedIO = false;
+        return device->stopIO();
+// (before anchor 44)
+        return rate == fixed64(Rate) ? kIOReturnSuccess : kIOReturnUnsupported;
+// (before anchor 45)
+        return f.rate == fixed64(Rate) && f.id == FormatLinearPCM && f.channels == device->channels() && f.bits == 16
+            ? kIOReturnSuccess : kIOReturnUnsupported;
+// (before anchor 46)
+    case 6: case 12:                                       // SetStreamActive, SetClientDescription
 // (the end)

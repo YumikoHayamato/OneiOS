@@ -1,0 +1,50 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -8396,6 +8396,9 @@
+ 	}
+ 	return 0;
+ }
++/* OneiOS hosted (0090): addon entries written to /private/var/oneios (services.d, enabled) this boot; take19: only with the
++ * boot argument oneios-addon-services=1 (-1: not read yet). */
++volatile int native_gpu_addon_services = 0, native_gpu_addon_services_on = -1;
+ static void
+ native_gpu_addon_install(proc_t p, user_addr_t scratch)
+ {
+@@ -8463,7 +8466,25 @@
+ 		at += 24;
+ 		const char *name = (const char *)(addon + at);
+ 		at += (name_bytes + 7) & ~7ULL;
+-		snprintf(path, sizeof(path), "/private/var/ngpu/%s", name);
++		/*
++		 * OneiOS hosted (0090): the entries oneios/services.d/NAME and oneios/enabled/NAME go to /private/var/oneios, the
++		 * folder of the seed's service manager (oneios-init reads it when the kernel starts it, after this), so a service of
++		 * ours can come with the boot addon instead of a new Data seed: userland/apps's registrar (appreg) is one.
++		 * Only those two folders; every other entry stays under /private/var/ngpu. A kernel without this writes them to
++		 * /private/var/ngpu/oneios/..., where nothing reads them.
++		 */
++		if (native_gpu_addon_services_on < 0) {
++			uint32_t on = 0;
++			(void)PE_parse_boot_argn("oneios-addon-services", &on, sizeof(on));
++			native_gpu_addon_services_on = on == 1;
++		}
++		if (native_gpu_addon_services_on &&
++		    (!strncmp(name, "oneios/services.d/", 18) || !strncmp(name, "oneios/enabled/", 15))) {
++			snprintf(path, sizeof(path), "/private/var/%s", name);
++			native_gpu_addon_services++;
++		} else {
++			snprintf(path, sizeof(path), "/private/var/ngpu/%s", name);
++		}
+ 		uint8_t *data = kalloc_data(size ? size : 1, Z_WAITOK);
+ 		int error = data ? native_gpu_addon_inflate(addon + at, packed, data, size) : ENOMEM;
+ 		if (!error) {
+@@ -10027,6 +10048,9 @@
+ 	    &native_gpu_addon_status);
+ 	printf("oneios-gpu-addon: boot addon: %d files (-1 none), %d written, %d unchanged, %d failed, last error %d\n",
+ 	    native_gpu_addon_files, native_gpu_addon_written, native_gpu_addon_same, native_gpu_addon_failed, native_gpu_addon_error);
++	if (native_gpu_addon_services) {
++		printf("oneios-gpu-addon: %d service files of the addon in /private/var/oneios (0090)\n", native_gpu_addon_services);
++	}
+ 	printf("oneios-gpu-addon: %s over %s: stage %d, status %d (stage 5 status 0: mounted, the sealed driver and the plug-in both visible)\n",
+ 	    from_addon ? extensions_source : seed_source, extensions_point, native_gpu_addon_stage, native_gpu_addon_status);
+ #else

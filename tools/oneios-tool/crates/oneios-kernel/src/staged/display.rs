@@ -86,6 +86,17 @@ pub const SCANOUT: &[(&str, &str)] = &[
     ("        pending = {service, memory, stride, width, height, droidvm_virtgpu_submitted(), droidvm_virtgpu_holds(), pid};\n",
      concat!("        pending = {service, memory, stride, width, height, droidvm_virtgpu_submitted(), droidvm_virtgpu_holds(), pid,\n",
              "                   format == 2 ? OneiOSHalf : 0};\n")),
+    // take17 (2026-11-26): every gap between two swaps goes to OneiOSAdreno.cpp as the later swap is offered (hitch::): a
+    // freeze of a game is a gap of hundreds of ms in the middle of frames, which the 10 s histogram only counts ("pauses").
+    // Weak: without OneiOSAdreno.cpp nothing changes.
+    ("volatile uint64_t droidvm_virtio_offer_gap_hist[41], droidvm_virtio_offer_gaps[2], droidvm_virtio_offer_refused;\n",
+     concat!("volatile uint64_t droidvm_virtio_offer_gap_hist[41], droidvm_virtio_offer_gaps[2], droidvm_virtio_offer_refused;\n",
+             "// OneiOS (take17): each gap between two swaps (us) and the time the later one was offered (us), for OneiOSAdreno.cpp's\n",
+             "// oneios-hitch lines. Weak: without it nothing changes.\n",
+             "void oneios_gpu_swap_gap(uint64_t, uint64_t) __attribute__((weak));\n")),
+    ("        if (gap < 50000) { droidvm_virtio_offer_gaps[0] = droidvm_virtio_offer_gaps[0] + 1; droidvm_virtio_offer_gaps[1] = droidvm_virtio_offer_gaps[1] + gap; }\n",
+     concat!("        if (gap < 50000) { droidvm_virtio_offer_gaps[0] = droidvm_virtio_offer_gaps[0] + 1; droidvm_virtio_offer_gaps[1] = droidvm_virtio_offer_gaps[1] + gap; }\n",
+             "        if (oneios_gpu_swap_gap) oneios_gpu_swap_gap(gap, now);   // OneiOS (take17): two words stored, nothing printed here\n")),
 ];
 
 /// UniXNU's NativeLegacyDisplay.cpp: its GOP path maps the boot video write-back in the native kernel. In a VM of
@@ -130,3 +141,29 @@ pub const NATIVE_PROBE: &[(&str, &str)] = &[(
         "#endif\n"
     ),
 )];
+
+/// UniXNU's NativeLegacyDisplay.cpp, after LEGACY_BOOT_VIDEO (native-perf, 2026-11-26; both kernels): the refresh tick asks
+/// OneiOSDisplay.cpp where the next one goes. The timer was last + 1/120 s of the guest's counter whatever the panel did;
+/// with the phone publishing the panel's vsync (`vm-boot --vsync-lock`, runtime/pace) the next tick is put on the panel's
+/// grid, the compositor is told the panel's period, and a tick that fired within a quarter period of its place carries the
+/// place's time, as a vblank's timestamp does. `oneios_display_vsync_next` is weak and answers the free-running time when
+/// nothing is published (display/vsync_lock.h): without it, or without a publisher, the tick is what it was. Each anchor
+/// must be there exactly once.
+pub const LEGACY_VSYNC: &[(&str, &str)] = &[
+    ("extern \"C\" void native_legacy_vsync_notify(void *display,uint64_t timestamp,uint64_t continuousTime,uint64_t interval);\n",
+     concat!("extern \"C\" void native_legacy_vsync_notify(void *display,uint64_t timestamp,uint64_t continuousTime,uint64_t interval);\n",
+             "// OneiOS: the tick after this one (OneiOSDisplay.cpp, vsync_lock.h): its time, the period the compositor is told and the\n",
+             "// time this tick is given. Weak: without it the tick is the free-running one (staged/display.rs LEGACY_VSYNC).\n",
+             "extern \"C\" uint64_t oneios_display_vsync_next(uint64_t now,uint64_t scheduled,uint64_t nextFree,uint64_t nominal,uint64_t *interval,\n",
+             "    uint64_t *stamp) __attribute__((weak));\n")),
+    ("        native_legacy_vsync_notify(this,now,mach_continuous_time(),vsyncInterval);\n",
+     concat!("        uint64_t oneiosNext=vsyncNext+vsyncInterval,oneiosInterval=vsyncInterval,oneiosStamp=now;   // OneiOS: LEGACY_VSYNC\n",
+             "        const bool oneiosLate=oneiosNext<=now;\n",
+             "        if(oneiosLate)oneiosNext=now+vsyncInterval;\n",
+             "        if(oneios_display_vsync_next)oneiosNext=oneios_display_vsync_next(now,vsyncNext,oneiosNext,vsyncInterval,&oneiosInterval,&oneiosStamp);\n",
+             "        native_legacy_vsync_notify(this,oneiosStamp,mach_continuous_time()-(now-oneiosStamp),oneiosInterval);\n")),
+    (concat!("        vsyncNext+=vsyncInterval;\n",
+             "        if(vsyncNext<=now){vsyncNext=now+vsyncInterval;native_legacy_vsync_observed(3,vsyncHz);}\n"),
+     concat!("        vsyncNext=oneiosNext;\n",
+             "        if(oneiosLate)native_legacy_vsync_observed(3,vsyncHz);\n")),
+];

@@ -1,0 +1,224 @@
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2058,6 +2058,15 @@
+ 		proc_handle_critical_exit(p, rv);
+ 	}
+ 
++#if XNU_HOSTED || XNU_ONEIOS_NATIVE
++	/* OneiOS (0084): every exit by jetsam, with its band at the exit */
++	if (p->p_exit_reason && p->p_exit_reason->osr_namespace == OS_REASON_JETSAM) {
++		printf("oneios-jetsam: exit %s[%d] code %llu band %d (requested %d, assertion %d)\n", proc_best_name(p), proc_getpid(p),
++		    (unsigned long long)p->p_exit_reason->osr_code, p->p_memstat_effectivepriority, p->p_memstat_requestedpriority,
++		    p->p_memstat_assertionpriority);
++	}
++#endif /* XNU_HOSTED || XNU_ONEIOS_NATIVE */
++
+ 	/* Bring-up: why the home-screen processes exit (the abort message travels in the exit reason). */
+ 	if (!strcmp(p->p_name, "chronod") || !strcmp(p->p_name, "backboardd") || !strcmp(p->p_name, "SpringBoard")) {
+ 		char *desc = p->p_exit_reason ? exit_reason_get_string_desc(p->p_exit_reason) : NULL;
+diff --git a/bsd/kern/kern_memorystatus.c b/bsd/kern/kern_memorystatus.c
+--- a/bsd/kern/kern_memorystatus.c
++++ b/bsd/kern/kern_memorystatus.c
+@@ -2372,6 +2372,10 @@
+ 	return error;
+ }
+ 
++#if XNU_HOSTED || XNU_ONEIOS_NATIVE
++static void oneios_bands_print(void);   /* OneiOS 0084 */
++#endif /* XNU_HOSTED || XNU_ONEIOS_NATIVE */
++
+ /*
+  * Wrapper for processes exiting with memorystatus details
+  */
+@@ -2429,7 +2433,17 @@
+ 	}
+ 	/* jetsam_do_kill drops a reference. */
+ 	os_reason_ref(jetsam_reason);
++#if XNU_HOSTED || XNU_ONEIOS_NATIVE
++	/* OneiOS (0084): each kill of memory, high water, a limit or idleness as it is decided (not the CPU limit's, below) */
++	printf("oneios-jetsam: kill %s[%d] cause %u band %d (requested %d, assertion %d, state 0x%x), %llu KiB of limit %d MiB; "
++	    "available %llu pages, critical %u\n", proc_best_name(p), victim_pid, cause, p->p_memstat_effectivepriority,
++	    p->p_memstat_requestedpriority, p->p_memstat_assertionpriority, p->p_memstat_state, footprint >> 10,
++	    p->p_memstat_memlimit, (uint64_t)MEMORYSTATUS_LOG_AVAILABLE_PAGES, memstat_critical_threshold);
++#endif /* XNU_HOSTED || XNU_ONEIOS_NATIVE */
+ 	error = jetsam_do_kill(p, jetsam_flags, jetsam_reason);
++#if XNU_HOSTED || XNU_ONEIOS_NATIVE
++	oneios_bands_print();   /* OneiOS 0084: after the kill, not to hold it up */
++#endif /* XNU_HOSTED || XNU_ONEIOS_NATIVE */
+ 	if (footprint_out) {
+ 		*footprint_out = ((error == 0) ? footprint : 0);
+ 	}
+@@ -2909,6 +2923,96 @@
+ 	return proc->p_memstat_state & P_MEMSTAT_INTERNAL_RANGE;
+ }
+ 
++#if XNU_HOSTED || XNU_ONEIOS_NATIVE
++/*
++ * OneiOS (0084): what the memory looks like and what jetsam does, on the console with printf: memorystatus_log's own
++ * lines go quiet once startup serial logging ends. Only lines: no decision is changed.
++ *
++ * The band changes of backboardd and SpringBoard, kept in a ring here (proc_list_lock is held: nothing may be printed)
++ * and printed by the next kill or the next report, with the process on whose behalf it was made (kernel_task for
++ * jetsam's own). A change the same as one still to be printed only counts there, so a process that goes back and forth
++ * takes two entries; when the ring is full the first changes stay and the later ones are counted as lost.
++ */
++#define ONEIOS_BANDS 64
++static struct {
++	char    name[MAXCOMLEN + 1], by[MAXCOMLEN + 1];
++	int     pid, by_pid;
++	int32_t from, to, requested, assertion;
++	uint32_t options, again;
++} oneios_band_changes[ONEIOS_BANDS];
++static uint32_t oneios_bands_made, oneios_bands_printed, oneios_bands_lost;     /* proc_list_lock */
++
++static void
++oneios_band_note_locked(proc_t p, int32_t to, memstat_priority_options_t options)
++{
++	proc_t by = current_proc();
++
++	if (p->p_memstat_effectivepriority == to ||
++	    (strcmp(p->p_name, "backboardd") && strcmp(p->p_name, "SpringBoard"))) {
++		return;
++	}
++	for (uint32_t i = oneios_bands_printed; i != oneios_bands_made; i++) {
++		typeof(oneios_band_changes[0]) *old = &oneios_band_changes[i % ONEIOS_BANDS];
++		if (old->pid == proc_getpid(p) && old->from == p->p_memstat_effectivepriority && old->to == to &&
++		    old->by_pid == (by ? proc_getpid(by) : -1) && old->requested == p->p_memstat_requestedpriority &&
++		    old->assertion == p->p_memstat_assertionpriority && old->options == (uint32_t)options) {
++			old->again++;
++			return;
++		}
++	}
++	if (oneios_bands_made - oneios_bands_printed == ONEIOS_BANDS) {
++		oneios_bands_lost++;
++		return;
++	}
++	typeof(oneios_band_changes[0]) *c = &oneios_band_changes[oneios_bands_made++ % ONEIOS_BANDS];
++	strlcpy(c->name, p->p_name, sizeof(c->name));
++	strlcpy(c->by, by ? by->p_name : "?", sizeof(c->by));
++	c->pid = proc_getpid(p);
++	c->by_pid = by ? proc_getpid(by) : -1;
++	c->from = p->p_memstat_effectivepriority;
++	c->to = to;
++	c->requested = p->p_memstat_requestedpriority;
++	c->assertion = p->p_memstat_assertionpriority;
++	c->options = (uint32_t)options;
++	c->again = 0;
++}
++
++static void
++oneios_bands_print(void)
++{
++	for (;;) {
++		typeof(oneios_band_changes[0]) c;
++		uint32_t lost;
++
++		proc_list_lock();
++		if (oneios_bands_printed == oneios_bands_made) {
++			proc_list_unlock();
++			return;
++		}
++		c = oneios_band_changes[oneios_bands_printed++ % ONEIOS_BANDS];
++		lost = oneios_bands_lost;
++		oneios_bands_lost = 0;
++		proc_list_unlock();
++		printf("oneios-band: %s[%d] %d -> %d (requested %d, assertion %d, options 0x%x) by %s[%d], again %u, lost %u\n",
++		    c.name, c.pid, c.from, c.to, c.requested, c.assertion, c.options, c.by, c.by_pid, c.again, lost);
++	}
++}
++
++/* In MiB; called every 10 s by the GPU archive's report thread (gpu/OneiOSAdreno.cpp). */
++void oneios_memory_report(uint32_t every);
++void
++oneios_memory_report(uint32_t every)
++{
++#define ONEIOS_MIB(pages) ((uint32_t)(((uint64_t)(pages) * PAGE_SIZE) >> 20))
++	printf("oneios-memory: %u s: available %u MiB (critical %u, idle %u, soft %u), free %u, wired %u, active %u, inactive %u, "
++	    "speculative %u, compressor %u\n", every, ONEIOS_MIB(MEMORYSTATUS_LOG_AVAILABLE_PAGES),
++	    ONEIOS_MIB(memstat_critical_threshold), ONEIOS_MIB(memstat_idle_threshold), ONEIOS_MIB(memstat_soft_threshold),
++	    ONEIOS_MIB(vm_page_free_count), ONEIOS_MIB(vm_page_wire_count), ONEIOS_MIB(vm_page_active_count),
++	    ONEIOS_MIB(vm_page_inactive_count), ONEIOS_MIB(vm_page_speculative_count), ONEIOS_MIB(vm_compressor_pool_size()));
++	oneios_bands_print();
++}
++#endif /* XNU_HOSTED || XNU_ONEIOS_NATIVE */
++
+ /*
+  * Description:
+  *	Moves a process from one jetsam bucket to another.
+@@ -3051,6 +3155,9 @@
+ 			_memstat_reschedule_idle_demotion_locked();
+ 		}
+ 
++#if XNU_HOSTED || XNU_ONEIOS_NATIVE
++		oneios_band_note_locked(p, priority, options);  /* OneiOS 0084 */
++#endif /* XNU_HOSTED || XNU_ONEIOS_NATIVE */
+ 		KDBG(MEMSTAT_CODE(BSD_MEMSTAT_CHANGE_PRIORITY) | DBG_FUNC_NONE,
+ 		    proc_getpid(p), priority, p->p_memstat_effectivepriority);
+ 		p->p_memstat_effectivepriority = priority;
+@@ -5491,6 +5598,12 @@
+ 		memorystatus_log_error("memorystatus: unable to allocate memory for jetsam reason\n");
+ 	}
+ 
++#if XNU_HOSTED || XNU_ONEIOS_NATIVE
++	/* OneiOS (0084): this path does not go through memorystatus_do_kill */
++	printf("oneios-jetsam: kill %s[%d] cpu limit, band %d (requested %d, assertion %d, state 0x%x)\n", proc_best_name(p),
++	    proc_getpid(p), p->p_memstat_effectivepriority, p->p_memstat_requestedpriority, p->p_memstat_assertionpriority,
++	    p->p_memstat_state);
++#endif /* XNU_HOSTED || XNU_ONEIOS_NATIVE */
+ 	retval = jetsam_do_kill(p, jetsam_flags, jetsam_reason);
+ 
+ 	if (retval) {
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -733,6 +733,15 @@
+ 
+ /*****************************************************************************/
+ 
++#if XNU_HOSTED || XNU_ONEIOS_NATIVE
++/*
++ * 0084: what the polled console costs: bytes sent and counter ticks in its register accesses (each one an exit to the
++ * VMM). The counter is read as it is: mach_absolute_time needs the per-CPU data, which the first characters precede.
++ */
++uint64_t oneios_console_bytes = 0, oneios_console_ticks = 0;
++
++#endif /* XNU_HOSTED || XNU_ONEIOS_NATIVE */
++
+ #if defined(XNU_ONEIOS_NATIVE) && XNU_ONEIOS_NATIVE
+ 
+ /*
+@@ -753,16 +762,32 @@
+ #define NS16550_LSR_DR   0x01   /* data ready */
+ #define NS16550_LSR_THRE 0x20   /* transmit holding register empty */
+ 
++static inline uint64_t
++ns16550_ticks(void)
++{
++	uint64_t now;
++	__asm__ volatile ("mrs %0, cntvct_el0" : "=r"(now));
++	return now;
++}
++
+ static unsigned int
+ ns16550_uart_transmit_ready(void)
+ {
+-	return (ns16550_registers[NS16550_LSR] & NS16550_LSR_THRE) != 0;
++	const uint64_t start = ns16550_ticks();
++	const bool ready = (ns16550_registers[NS16550_LSR] & NS16550_LSR_THRE) != 0;
++
++	oneios_console_ticks += ns16550_ticks() - start;
++	return ready;
+ }
+ 
+ static void
+ ns16550_uart_transmit_data(uint8_t c)
+ {
++	const uint64_t start = ns16550_ticks();
++
+ 	ns16550_registers[NS16550_RBR_THR] = c;
++	oneios_console_ticks += ns16550_ticks() - start;
++	oneios_console_bytes++;
+ }
+ 
+ static unsigned int

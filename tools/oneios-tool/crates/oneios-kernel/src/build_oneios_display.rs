@@ -3,9 +3,12 @@
 //! The hosted kernel's display archive, built between the two kernel passes from the compile records of the first:
 //!
 //!   build/native-legacy-display/libNativeLegacyDisplay.late.a
-//!       NativeLegacyDisplay.cpp, NativeGOPPresenter.cpp   UniXNU's NativeMobileDisplay (external/NativeMobileDisplay),
-//!                                                         unchanged: the owned backend of the original
-//!                                                         IOMobileFramebufferLegacy
+//!       NativeLegacyDisplay.cpp, NativeGOPPresenter.cpp   UniXNU's NativeMobileDisplay (external/NativeMobileDisplay): the
+//!                                                         owned backend of the original IOMobileFramebufferLegacy.
+//!                                                         Both are staged (the boot video mapped write-back,
+//!                                                         LEGACY_BOOT_VIDEO / GOP_BOOT_VIDEO), and NativeLegacyDisplay.cpp's
+//!                                                         refresh tick also asks OneiOSDisplay.cpp (LEGACY_VSYNC; the answer
+//!                                                         is its own free-running time unless oneios-vsync-lock=1)
 //!       LegacyDisplayProbe.cpp                            Droid-VM's board probe (UniXNU-droidvm package/), staged with
 //!                                                         five lines added (staged/display.rs)
 //!       DroidVMVirtioGpuDisplay.cpp                       Droid-VM's scanout client of the virtio GPU, staged with each
@@ -40,7 +43,7 @@
 
 use crate::gen::{self, fail, Compile, Ctx, Stubs};
 use crate::macho_object::Object;
-use crate::staged::{display::{DISPLAY, GOP_BOOT_VIDEO, LEGACY_BOOT_VIDEO, NATIVE_PROBE, SCANOUT}, display_header};
+use crate::staged::{display::{DISPLAY, GOP_BOOT_VIDEO, LEGACY_BOOT_VIDEO, LEGACY_VSYNC, NATIVE_PROBE, SCANOUT}, display_header};
 use anyhow::{anyhow, Result};
 use oneios_common::pyjson::Value;
 use siphasher::sip::SipHasher24;
@@ -305,6 +308,18 @@ pub fn staged_legacy(text: String) -> Result<String> {
     })
 }
 
+/// NativeLegacyDisplay.cpp, after staged_legacy, with staged/display.rs's LEGACY_VSYNC: the tick asks where the next one goes.
+pub fn staged_legacy_vsync(text: String) -> Result<String> {
+    gen::replace_once(text, LEGACY_VSYNC, |anchor| {
+        format!("build-oneios-display: NativeLegacyDisplay.cpp no longer has exactly one {}", anchor.trim())
+    })
+}
+
+/// NativeLegacyDisplay.cpp as the archive compiles it: every edit list of the file, in the build's order.
+pub fn staged_legacy_source(text: String) -> Result<String> {
+    staged_legacy(text).and_then(staged_legacy_vsync)
+}
+
 /// NativeGOPPresenter.cpp with staged/display.rs's GOP_BOOT_VIDEO.
 pub fn staged_gop(text: String) -> Result<String> {
     gen::replace_once(text, GOP_BOOT_VIDEO, |anchor| {
@@ -356,7 +371,7 @@ pub fn main() -> Result<()> {
     // Both staged with the boot video mapped write-back in the native kernel (staged/display.rs LEGACY_BOOT_VIDEO,
     // GOP_BOOT_VIDEO); their headers still come from NativeMobileDisplay (-I).
     let legacy = out.join("NativeLegacyDisplay.cpp");
-    gen::write_text(&legacy, &staged_legacy(gen::read_text(&display.join("NativeLegacyDisplay.cpp"))?)?)?;
+    gen::write_text(&legacy, &staged_legacy_source(gen::read_text(&display.join("NativeLegacyDisplay.cpp"))?)?)?;
     let gop = out.join("NativeGOPPresenter.cpp");
     gen::write_text(&gop, &staged_gop(gen::read_text(&display.join("NativeGOPPresenter.cpp"))?)?)?;
     let native = compile_cpp(&legacy, &flags(&["-I", &out_s, "-I", &display_s, "-DPE_parse_boot_argn=oneios_display_boot_arg"]))?;

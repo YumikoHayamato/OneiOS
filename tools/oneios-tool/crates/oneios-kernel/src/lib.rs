@@ -2,7 +2,7 @@
 //!
 //!   kernel gen NAME          one board archive of the kernel build: what UniXNU's driver runs between the two kernel
 //!                            passes (board.toml [kernel] archives), in the build tree, with UNIXNU_DEVICE set.
-//!                            NAME: board, storage, aes, keystore, net, hid, audio, gpu, display
+//!                            NAME: board, storage, aes, keystore, net, hid, audio, codec, gpu, display
 //!   kernel build-record      the record of a finished VM kernel build (build-linux.sh, build-macos.sh)
 //!   kernel drivers           drivers/ of the repository into liboneiosdrivers.a (--check: compile only)
 //!   kernel compile-command   the compile command the archives are built with, for a record
@@ -20,6 +20,7 @@
 
 pub mod build_oneios_aes;
 pub mod build_oneios_audio;
+pub mod build_oneios_codec;
 pub mod build_oneios_board;
 pub mod build_oneios_display;
 pub mod build_oneios_gpu;
@@ -61,6 +62,8 @@ pub enum Archive {
     Hid,
     /// The speaker, the microphone and the actuator (liboneiosaudio.a)
     Audio,
+    /// The hardware video decoder: VideoToolbox's paravirtualized codecs over virtio-media (liboneioscodec.a)
+    Codec,
     /// virtio-gpu 3D and Metal's kernel side (liboneiosgpu.a)
     Gpu,
     /// The display (libNativeLegacyDisplay.late.a)
@@ -73,6 +76,26 @@ pub enum Family {
     Hid,
     /// IOEthernetController and IOEthernetInterface (IONetworking-24A446-v54.json)
     Net,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum StagedSource {
+    /// DroidVMVirtioGpu.cpp (staged/gpu.rs TRANSPORT, TRANSPORT_PCI, TRANSPORT_STAGES)
+    Transport,
+    /// DroidVMVirtioGpu3D.cpp (staged/gpu.rs GPU3D, GPU3D_NATIVE, GPU3D_STAGES, GPU3D_ROOM, GPU3D_READ_WAIT)
+    Gpu3d,
+    /// DroidVMVirtioGpuDisplay.cpp (staged/display.rs SCANOUT)
+    Scanout,
+    /// NativeLegacyDisplay.cpp (staged/display.rs LEGACY_BOOT_VIDEO, LEGACY_VSYNC)
+    Legacy,
+    /// DroidVMAudio.cpp (staged/audio.rs AUDIO)
+    Audio,
+    /// DroidVMVirtioSnd.c (staged/audio.rs SND_TRANSPORT_PCI)
+    Snd,
+    /// DroidVMVirtioMedia.c (staged/codec_transport.rs MEDIA_TRANSPORT_PCI)
+    Media,
+    /// DroidVMVTHost.cpp (staged/codec_decode.rs CODEC_DECODER, CODEC_CROSVM)
+    Vthost,
 }
 
 #[derive(Subcommand)]
@@ -107,6 +130,15 @@ pub enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+    /// A pinned source of external/ as the kernel build compiles it (its edit lists applied), on standard output:
+    /// with `compile-command`, the compile check of an edit list without a build tree
+    Staged {
+        #[arg(value_enum)]
+        which: StagedSource,
+        /// This repository's checkout (default: the current directory)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
     /// The compile command the board archives are built with, from a compile record (a JSON list)
     CompileCommand {
         /// A compile record of the kernel build (build/xnu/ios-obj/<CONFIG>/.../*.json)
@@ -130,6 +162,24 @@ fn compile_command(record: PathBuf, source: PathBuf, object: PathBuf, repo: Opti
     Ok(())
 }
 
+fn staged(which: StagedSource, repo: Option<PathBuf>) -> anyhow::Result<()> {
+    use anyhow::{anyhow, Context};
+    use std::io::Write;
+    let external = repo.unwrap_or_else(|| PathBuf::from(".")).join("external");
+    let read = |name: &str| std::fs::read_to_string(external.join(name)).with_context(|| format!("{} (scripts/setup/get-references.sh)", external.join(name).display()));
+    let text = match which {
+        StagedSource::Transport => build_oneios_gpu::staged_transport_source(read("UniXNU-droidvm/package/DroidVMVirtioGpu.cpp")?).map_err(|e| anyhow!("{e}"))?,
+        StagedSource::Gpu3d => build_oneios_gpu::staged_3d_source(read("UniXNU-droidvm/package/DroidVMVirtioGpu3D.cpp")?).map_err(|e| anyhow!("{e}"))?,
+        StagedSource::Scanout => build_oneios_display::staged_scanout(read("UniXNU-droidvm/package/DroidVMVirtioGpuDisplay.cpp")?)?,
+        StagedSource::Legacy => build_oneios_display::staged_legacy_source(read("NativeMobileDisplay/NativeLegacyDisplay.cpp")?)?,
+        StagedSource::Audio => build_oneios_audio::staged_text(read("UniXNU-droidvm/package/DroidVMAudio.cpp")?)?,
+        StagedSource::Snd => build_oneios_audio::staged_irq_text(build_oneios_audio::staged_transport_text(read("UniXNU-droidvm/package/DroidVMVirtioSnd.c")?)?)?,
+        StagedSource::Media => build_oneios_codec::staged_transport(read("UniXNU-droidvm/package/DroidVMVirtioMedia.c")?)?,
+        StagedSource::Vthost => build_oneios_codec::staged_text(read("UniXNU-droidvm/package/DroidVMVTHost.cpp")?)?,
+    };
+    std::io::stdout().write_all(text.as_bytes()).context("standard output")
+}
+
 pub fn main(command: Command) -> i32 {
     let result = match command {
         Command::Gen { name } => match name {
@@ -140,6 +190,7 @@ pub fn main(command: Command) -> i32 {
             Archive::Net => build_oneios_net::main(),
             Archive::Hid => build_oneios_hid::main(),
             Archive::Audio => build_oneios_audio::main(),
+            Archive::Codec => build_oneios_codec::main(),
             Archive::Gpu => build_oneios_gpu::main(),
             Archive::Display => build_oneios_display::main(),
         }.map(|()| 0),
@@ -148,6 +199,7 @@ pub fn main(command: Command) -> i32 {
         Command::Layout { which: Family::Net, args } => net_layout::main(args).map(|()| 0),
         Command::PortLegacyDisplay(args) => port_legacy_display::main(args).map(|()| 0),
         Command::CompileCommand { record, source, object, repo } => compile_command(record, source, object, repo).map(|()| 0),
+        Command::Staged { which, repo } => staged(which, repo).map(|()| 0),
         Command::Drivers(args) => drivers_build::main(args).map(|()| 0),
         Command::HostedFixup { kernel } => hosted_fixup::main(&kernel).map(|()| 0),
         Command::KdkHeaders(args) => kdk_headers::main(args).map(|()| 0),

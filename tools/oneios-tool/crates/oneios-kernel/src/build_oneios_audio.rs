@@ -46,7 +46,7 @@
 //! DroidVMAudio.cpp, which is the upstream source with the edit list applied.
 
 use crate::gen::{self, fail, Compile, Ctx};
-use crate::staged::{audio::{AUDIO, SND_TRANSPORT_PCI}, OUTPUT_LATENCY};
+use crate::staged::{audio::{AUDIO, SND_IRQ, SND_TRANSPORT_PCI}, OUTPUT_LATENCY};
 use anyhow::Result;
 use oneios_common::pyjson::Value;
 use std::path::{Path, PathBuf};
@@ -68,9 +68,17 @@ pub fn staged_transport_text(text: String) -> Result<String> {
     })
 }
 
+/// take18: the staged transport with the control replies by interrupt, opt-in (staged/audio.rs SND_IRQ: oneios-audio-irq=1
+/// and xnuloader-crosvm --audio-intid), on staged_transport_text's text; compiled only with XNU_ONEIOS_NATIVE as it is.
+pub fn staged_irq_text(text: String) -> Result<String> {
+    gen::replace_once(text, SND_IRQ, |anchor| {
+        format!("build-oneios-audio: the staged DroidVMVirtioSnd.c no longer has exactly one `{}` (SND_IRQ)", gen::first(anchor.trim(), 90))
+    })
+}
+
 fn stage_transport(transport: &Path, out: &Path) -> Result<PathBuf> {
     let staged = out.join("DroidVMVirtioSnd.c");
-    gen::write_text(&staged, &staged_transport_text(gen::read_text(transport)?)?)?;
+    gen::write_text(&staged, &staged_irq_text(staged_transport_text(gen::read_text(transport)?)?)?)?;
     Ok(staged)
 }
 
@@ -142,9 +150,23 @@ mod tests {
         assert!(staged.contains(&format!("#else\n{}#endif\n", SND_TRANSPORT_PCI[0].0)));
         assert!(staged.contains("!memcmp(value, \"oneios,virtio-snd-pci\", 22))\n"));
         // a late reply taken off before the next request, the speaker's START tried once more, no microphone unless asked
-        assert!(staged.contains("snd_control_late++; return false; }   // 2 s; its reply is taken later\n#else\n"));
+        assert!(staged.contains("snd_control_late++; snd_control_said(snd_control_began, 0, true); return false;\n        }\n#else\n"));
+        // take17: the microphone is set up by its own thread with its own wait, started only when ready, and its chains are
+        // posted by slot; the hosted kernel keeps the source's capture and its START
+        assert!(staged.contains("snd_control_wait_ms = 60000;\n    const bool ready = set_params(snd.in_stream, snd.in_channels);"));
+        assert!(staged.contains("        if (input && oneios_snd_mic_state != 2) {\n"));
+        assert!(staged.contains("    lck_mtx_unlock(snd_lock);\n}\n#else\n    if (snd.in_stream >= 0 && input != snd.in_running) {\n        if (input) {\n            snd.used[SND_RX] = used(SND_RX)[1];\n            rx_post_all();\n"));
+        assert!(staged.contains("    return count;\n}\n#else\nuint32_t droidvm_snd_capture(int16_t *frames, uint32_t count) {\n"));
+        assert!(staged.contains("oneios_snd_mic_state = snd.in_stream >= 0 ? 1 : 0;\n    }\n#else\n    if (snd.in_stream >= 0 && !set_params("));
+        assert_eq!(staged.matches("volatile uint32_t oneios_snd_mic_state, oneios_snd_rx_peak;\n").count(), 1);
         assert!(staged.contains("PE_parse_boot_argn(\"oneios-audio-mic\", &mic, sizeof(mic));"));
-        assert!(staged.contains("pcm_command(SND_R_PCM_STOP, snd.out_stream);\n                snd.out_running = pcm_command(SND_R_PCM_START"));
+        // a stream's START: refused, it is stopped and tried once more; not answered in its wait, its answer is waited for
+        // (a retry would find the queue taken); the hosted kernel keeps the source's
+        assert!(staged.contains("        const bool answered = snd_control_late_answer(13000, &status);\n"));
+        assert!(staged.contains("    pcm_command(SND_R_PCM_STOP, stream);\n"));
+        assert!(staged.contains("            snd.out_running = snd_stream_start(snd.out_stream, false);"));
+        assert!(staged.contains("#else\n            snd.out_running = pcm_command(SND_R_PCM_START, snd.out_stream);\n#endif\n"));
+        assert!(staged.contains("            snd.in_running = snd_stream_start(snd.in_stream, true);\n"));
         assert!(staged_transport_text(made_up.repeat(2)).is_err());
     }
 }

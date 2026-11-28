@@ -7,8 +7,8 @@ host-call ABI (`runtime/xnuhost/include/xnuhost/hostcall.h`). Date: 2026-11-10.
 `arm_init`, the whole VM bootstrap and into the first kernel thread (`kernel_bootstrap_thread`). It stops in
 corecrypto's start-up self-test. No user-mode code path has run. Nothing has run on the phone. Details below.
 
-The archives of this layer (the disks, software AES, the key store, the Wi-Fi, HID, audio, the GPU, the display) are
-each built by `oneios-tool kernel gen NAME` (`tools/oneios-tool/crates/oneios-kernel`, one module per archive), which
+The archives of this layer (the disks, software AES, the key store, the Wi-Fi, HID, audio, the GPU, the display; and, in
+the native kernel only, the video decoder: `codec/`, take18b) are each built by `oneios-tool kernel gen NAME` (`tools/oneios-tool/crates/oneios-kernel`, one module per archive), which
 `kernel/build-hosted.sh` adds to the board's archives. Until 2026-11-13 these were Python scripts in the archives'
 folders (`NAME/build-oneios-NAME.py`); where a comment in a source or a patch here still names one, it means the
 module `build_oneios_NAME.rs` (the scripts' outputs are frozen in `tools/oneios-tool/tests/kernelgen/golden`).
@@ -617,6 +617,19 @@ helper's measured latency; default 720 frames, was 6480), fixes the ring's wrap 
 whole number of 240-frame periods: a period read, zeroed or written up to 208 frames past the ring's buffer; the
 zero time stamp only every 245760 frames) and reports the speaker engine's timing (`ONEIOS AUDIO: speaker engine:`).
 `drivers/audio/README.md`, `docs/hardware.md` section 6 "Latency end to end".
+
+Since take17 (2026-11-26) the native kernel's transport (`staged/audio.rs` `SND_TRANSPORT_PCI`; the hosted kernel
+keeps the source's code under `#else`) sets the microphone's stream up in a thread of its own with a wait of 60 s
+(crosvm opens the phone's input at the stream's PREPARE, 10 s with One UI stopped; the boot thread's 2 s wait gave
+the stream up in take16), sends one control request at a time (`snd_lock`), starts the microphone only once its
+stream is ready, posts only the receive chains the device gave back, waits for the answer of a START that was not
+answered in its 2 s (13 s more; a retry could not be sent while the queue's one chain is the device's) and stops and
+starts once more a START that was refused. `OneiOSAudio.c` and the staged `DroidVMAudio.cpp` say what happens to the
+Mic device: `ONEIOS AUDIO: mic: 10 s:` (two lines: what touched and started it, what the device gave and whether it
+was sound), `DroidVMAudio: mic: opened|closed|StartIO|StopIO N ... by NAME[PID]`, a refused rate or format, and
+`droidvm-snd:` lines for the stream's set-up and every slow, refused or unanswered control request.
+`oneios-audio-mic-selftest=SECONDS` captures straight off the transport at boot (`ONEIOS AUDIO: mic self-test, run
+N`). `docs/hardware.md` section 6, "The native VM's microphone"; `docs/native.md`, "What take16's lines say".
 
 ### The Actuator device (media, 2026-11-12)
 
@@ -1274,6 +1287,158 @@ compiled with the native kernel's own recorded command (`oneios-tool kernel comp
 `cmp w8, #0x1` (KEV_VENDOR_APPLE), `cmp w8, #0x6` (KEV_IEEE80211_CLASS), `mov w8, #0x800`, `csel`. Not built into a
 kernel and not run. On the phone: `ONEIOS WIFI: event 9 for en0, 540 bytes -> 0`, Settings shows the network joined at
 once, and the next session joins it without a touch (`wifi: join:` in `wifi.txt` with nothing typed).
+
+## 0084-native-memory-report.patch (2026-11-25)
+
+Lines only, hosted and native (`#if XNU_HOSTED || XNU_ONEIOS_NATIVE`); no jetsam decision changes. Printed with `printf`
+or `IOLog`: `memorystatus_log` goes through the startup serial log, silent after the 300th process, so take13's three
+kills of backboardd left no line. `oneios-gpu-report=0` turns the 10 s lines off (not the `oneios-jetsam:` ones).
+
+- `oneios-memory: 10 s: available N MiB (critical N, idle N, soft N), free, wired, active, inactive, speculative, compressor`.
+- `oneios-jetsam: kill NAME[PID] cause C band B (requested, assertion, state), KiB of limit MiB; available pages, critical`:
+  in `memorystatus_do_kill`, so every memory, limit and idle kill has it; a CPU limit's kill has its own line (`kill NAME[PID] cpu limit`).
+  The swap-exhaustion kills (`kern_proc.c`, a signal with jetsam's reason) have only the exit line. `cause` is `kMemorystatusKilled...` (2 high water, 4 memory shortage; `sys/kern_memorystatus.h`).
+- `oneios-jetsam: exit NAME[PID] code C band B (requested, assertion)`: each exit whose reason is jetsam's.
+- `oneios-band: backboardd[PID] FROM -> TO ... by NAME[PID]`: band changes of backboardd and SpringBoard, kept in a ring under
+  `proc_list_lock` (64 distinct changes) and printed by the next kill or report; a repeat before that only counts (`again`), and
+  `lost` counts those past 64 (the first ones are kept). This says whether backboardd is demoted, and by whom.
+- `oneios-cpu-why: NAME[PID] fN pN cN uN mN xN` (`gpu/OneiOSAdreno.cpp`): faults, page-ins, copy-on-write faults, unix and mach
+  system calls and context switches of the busiest processes in the kernel, whole entries only (a second line if needed); `+` a process first seen. Such a process's whole time
+  now counts in `oneios-cpu` (it counted nothing in its first window).
+- `oneios-disk:` (`storage/OneiOSHostedDisk.cpp`): requests (and those timed out), bytes, device wait, gate wait, chunks checked and hashing, per disk.
+- `oneios-console:` the polled port's bytes and the time in its registers; `oneios-signatures:` 0014's reading and hashing.
+- `ONEIOS AUDIO: 10 s:` (`audio/OneiOSAudio.c`): the window's periods, selectors, mappings (and refused), setProperties, notification ports, errors,
+  opened clients (counted in `staged/audio.rs`); absent when none moved. Registry reads are not counted.
+- The seconds of `oneios-memory`, `oneios-disk`, `oneios-console` and `oneios-signatures` are `oneios-cpu`'s measured ones (the
+  first report: since boot; on the PC's hosted kernel, as its clock counts).
+
+Compiled on the PC only (the recorded native commands), not built into a kernel, not run.
+
+## 0085-native-granule-probe.patch (2026-11-26)
+
+Lines only, native kernel at EL1 (`#if XNU_ONEIOS_NATIVE && !XNU_HOSTED`, `osfmk/arm64/oneios_host.c`, called from
+`oneios_board_late_start`). Once per boot, with `printf`, so it is in serial.txt (`grep -a oneios-granule`):
+
+- `oneios-granule: ID_AA64MMFR0_EL1 0x... MMFR1 0x... MMFR2 0x...`: the raw registers.
+- `oneios-granule: stage 1: TGran4 a TGran16 b TGran64 c; stage 2: TGran4_2 .. TGran16_2 .. TGran64_2 ..`: 4 KB 0 yes / f no; 16 KB 0 no / 1 yes / 2 yes
+  with 52-bit; 64 KB 0 yes / f no; the `_2` fields (what the hypervisor's stage 2 allows) 0 = as stage 1, 1 no, 2 yes, 3 yes with 52-bit.
+- `oneios-granule: 16 KB at stage 1: yes|no; at stage 2: ...`: the answer, plus VMIDBits, HAFDBS, VH, VARange, BBM, TTL.
+
+If Gunyah traps and rewrites the ID registers for the VM, the values are what the guest is allowed to use, which is what matters.
+The whole native kernel builds with the series through 0086 (kernel/build-native.sh), the three `mrs` are in the Mach-O; not prelinked, not run. It reads the boot vCPU only (Oryon has two core types: a later probe could read it per core), and TGran*_2 is the CPU's stage-2 capability, not what Gunyah configured for this VM.
+
+## 0086-prune-jobs.patch (2026-11-26)
+
+Opt-in, off without its boot argument; nothing changes for an image that does not pass it. Native and hosted (the 0053 function it
+extends). `oneios-prune-jobs=N` (number) adds a preset of launchd jobs to the ones 0053 writes into the Data store's `disabled.plist`
+before launchd: `1` the conservative list (hardware the VM has not, telemetry and diagnostics, Watch, Fitness, Intelligence, repair, USB sync;
+`com.apple.ReportMemoryException`, `ptpd`, `aonsensed`, `wcd`, `imageplaygroundd`, ...), `2` that and the moderate one (Health, calls, Maps, Screen
+Time, Siri suggestions, network proxy, camera ISP jobs; each may cost a feature or make a client reconnect in a loop). The lists are
+`oneios_prune_jobs_1` and `_2` in `kern_exec.c` and, word for word, `userland/config/daemons.toml`'s groups `prune1` and `prune2`
+(`userland/tests/test_roottweak.py` compares them): the kernel's way is for a Data store that exists, the image build's (`roottweak ... --group
+prune1`, a new seed) for new ones. Lines: `oneios-jobs: oneios-prune-jobs=N: B bytes of labels`, then one `oneios-jobs: LABEL: ...` line per label as in 0053.
+
+- `oneios-disable-jobs=` (first 255 bytes) and its default (axassetsd) are as before; the preset follows the list, and `-` there still means no list of its own.
+- The entries stay in the Data store after the argument is gone. To undo: `oneios-enable-jobs=LABEL,...` once (0044), or a fresh Data store.
+- CLAutoCohort is not a job: `oneios-feature-off=CoreLocation/CLAutoCohort,...` stays in the boot arguments (locationd crash-loops without it).
+- The labels were checked as `Label` keys of the image's `/System/Library/LaunchDaemons` (657 jobs) and against `[keep]`/`[idle]`; the daemons are the
+  ones seen in take15 and take16's serial.txt. Not run on the phone. The whole native kernel builds with the series through 0086 (kernel/build-native.sh); not prelinked, not run.
+
+## 0087-native-pressure-level.patch and the lines written as things happen (take17, 2026-11-26)
+
+Lines only; no decision changes. (0085 and 0086 are the granule probe and the job pruning of the same day's other
+work, in their own worktrees.) The patch adds `oneios_memory_pressure_level()` and `oneios_memory_available_mib()`
+to `kern_memorystatus.c` and ends `oneios-memory:` with `; pressure normal|warning|urgent|critical`
+(`memorystatus_vm_pressure_level`: in this kernel `warning` begins when the pages available fall under the soft
+threshold and ends above 115 % of it, `osfmk/vm/vm_pageout.c`). The rest is the GPU archive's
+(`gpu/OneiOSAdreno.cpp` `watch::`, its arithmetic in `gpu/watch.h`, host-tested in
+`runtime/xnuhost/tests/test_xnuhost.c` `test_watch`): a sampler thread that walks the process list every 100 ms
+while swaps come (every second otherwise) and writes, each with the time of day in UTC:
+
+- `oneios-hitch: HH:MM:SS: N ms without a swap (the one before came after M ms); one process busy|the CPUs
+  busy|nothing busy (all A ms of CPU in T ms of ticks); the GPU: apps +S submits, the render server +R, blobs +B;
+  hitch K (U not printed)` and `oneios-hitch: HH:MM:SS: the busiest in it: NAME[PID] N ms, ...`: a gap of 150 ms
+  (`oneios-hitch-ms=N`; 0: none) to 5 s between two swaps when the swap before the gap came within 50 ms of its own
+  predecessor. The swap path only stores the gap (`oneios_gpu_swap_gap`, a weak call from the staged
+  `DroidVMVirtioGpuDisplay.cpp`, `staged/display.rs` SCANOUT); the sampler prints it one tick later. At most six a
+  10 s and 400 a boot.
+- `oneios-gpu-room: HH:MM:SS: NAME passed 90 % of its GPU addresses: A -> B of N MiB (most M)` and `NAME let go of X
+  MiB: A -> B of N MiB`: a client's blobs against a context's part of the GPU addresses, N = 2048 MiB, the slice the
+  phone's crosvm cuts for each context (`VA slices: 64 x 2GB` in crosvm.log; `oneios-gpu-room-mib=N` for a renderer
+  that cuts another). The context's Turnip is told its slice by GET_PARAM in its own ring, which the kernel does not
+  read; the kernel sees the DRM capset, which names the device's whole range, said once: `the device has 131072 MiB
+  of GPU addresses from 0x40001e8000 (the DRM capset); a context's part is taken as 2048 MiB`
+  (`oneios_gpu_capset_seen`, a weak call from the staged `DroidVMVirtioGpu3D.cpp` `getCaps`, `staged/gpu.rs`
+  GPU3D_ROOM). In the 10 s report one `oneios-gpu-room:` line of every client at a tenth of that part or more.
+- `oneios-pressure: HH:MM:SS: normal -> warning; available N MiB`: the level as it changes.
+- `oneios-video: HH:MM:SS: decoder locks +N (videocodecd +A, mediaplaybackd +B), swaps +S; backboardd GPU O+W of R
+  MiB (P %); available N MiB, pressure LEVEL`: each second in which a video decoder locked surfaces for the CPU, and
+  five more. At most 1500 a boot. backboardd's figures are its largest context's (take18: it has one per connection,
+  and take17 printed the last one, empty: `0+0 of 0 MiB` in every line).
+- `oneios-clock: HH:MM:SS UTC, up N s, round R; the sampler: W walks, C us of CPU, M ms from start to end (the
+  longest U us)`: the first line of each 10 s report, so that the rounds can be set beside crosvm.log (UTC) and the
+  phone's own logs, with the sampler's own cost: the CPU time of its walks is the cost, the time from a walk's start
+  to its end is longer when the thread waited for a CPU. A walk reads each task's own time sums
+  (`recount_task_times`: no lock, no walk of its threads).
+
+`oneios-watch=0`: no sampler (the report's `oneios-clock` and `oneios-gpu-room` stay). A line is made whole and under
+the console's 255 bytes. Built into the native kernel and booted on the PC's bench (`docs/native.md`); not run on
+the phone.
+
+## 0088-native-gpu-role-client.patch (take19, 2026-11-27)
+
+Opt-in (`oneios-gpu-role=1`; off by default), hosted and native (`#if XNU_HOSTED || XNU_ONEIOS_NATIVE`,
+`iokit/Kernel/IOUserClient.cpp`). **What failed (24A446, read in the shared cache):** `-[RBXNUWrapper init]`
+(RunningBoard 0x23f84f714) calls `IOServiceGetMatchingService(IOServiceMatching("IOGPU"))` and `IOGPUDeviceCreate` once;
+the match is the GPU archive's `AGXAccelerator` (DroidVMGpu.cpp adopts `IOGPU` into its chain), and
+`IOGPUDeviceCreateWithOptions` (IOGPU 0x20bf84488) opens it with type `1 | options << 16`, which NativeAdreno refuses
+(`oneios-gpu-open: runningboardd[31] AGXAccelerator type 0x1 -> 0xe00002c7`; iOS's log: "Failed to create an
+IOGPUDevice... IOServiceOpen returned kIOReturn(0xFFFFFFFFE00002C7)", "Unable to create IOGPU device ref"). With the ref
+nil, `-[RBXNUWrapper setGPURoleWithGPUDevice:forPid:]` (0x23f8296c0) logs "setGPURole:pid: failed due to nil IOGPU
+device ref" at every app transition (634 in take17) and returns: no system call. The same transition's other half,
+`setpriority(PRIO_DARWIN_GPU, pid, role)` (`+[RBXNUWrapper setGPURoleWithKernel:forPid:]`), succeeds ("Set Darwin GPU
+to ...", 366 in take17): the kernel's `task_set_gpu_role` already holds every process's role (deny, background, UI,
+focal UI).
+
+**The patch:** an open of `AGXAccelerator` with IOGPU's type (1, options below 0x100 above it) by a process with
+`com.apple.private.set-gpu-role` (runningboardd) gets `OneiOSGPURoleUserClient`, whose class chain adopts
+`IOGPUDeviceUserClient` (an `IOUserClient`; runningboardd is sandboxed). It answers `IOGPUDeviceCreate`'s reads
+(selectors 0, 2, 4: 0x40, 0x218, 0x20 bytes) with zeros and `IOGPUDeviceSetAppGPURole` (selector 33, scalars {pid,
+role}, role 0 focal UI, 1 UI, 2 other) with success; every other selector is unsupported. Lines:
+`oneios-gpu-role: runningboardd[31] opens AGXAccelerator with IOGPU's type 0x1: a role client (chain adopted: yes) ...`
+and `oneios-gpu-role: pid P role R (...), call N` (the first 32, then every 1000th); 0031's `oneios-gpu-open:` line
+then ends `-> 0x0, OneiOSGPURoleUserClient`. **It changes no GPU scheduling** and cannot touch the close stutter:
+the guest's GPU work goes over one virtio-gpu queue to host KGSL contexts whose priority was fixed when each was made
+(the render server's deadline queue, the apps' default), and nothing can change a made context's priority; the failing
+call cost runningboardd an error line, off the render path. What it gives: no error line a transition, and the
+roles in the console. Compiled (syntax) with the native kernel's recorded command for `IOUserClient.cpp`; `git apply`
+checked after 0087; not built into a kernel, not run.
+
+## 0089-native-display-trim-layers.patch (take19, 2026-11-27)
+
+A console line always; the change opt-in (`oneios-display-trim-layers=1`; off by default). Hosted and native,
+`iokit/Kernel/IOUserClient.cpp` (`is_io_connect_method`, before the method). **The cause (24A446, kernelcache and shared
+cache):** IOSurface's root lookup (kernelcache 0xfffffe000a343de8) prints `SID: 0x%X task: %p buffer: %p
+buffer->fClientTask = %p not found` for an ID of 0 before looking (`cbz w1`). It is reached by
+`IOSurfaceRootUserClient` selector 4 (`s_lookup_surface`, `IOSurfaceLookup`) and by the exported
+`IOSurfaceRoot::lookupSurface(id, task)`, which `IOMobileFramebufferLegacy::swap_submit` (0xfffffe000a18c63c) calls for
+every layer the swap updates, with no test for 0 (0xfffffe000a18cc10). The render server's
+`CA::WindowServer::IOMFBDisplay::finish_update` (QuartzCore 0x184471af8, +0xc28/+0xc5c and +0x1aac/+0x1ae0) calls
+`swap_set_layer(1, NULL)` and `swap_set_layer(2, NULL)` on frames with no detached layer whose update has one of its
+flags set; `kern_SwapSetLayer` with a NULL surface sets the layer's updated and disabled bits and leaves ID 0. So two
+lookups of ID 0 a swap, in backboardd's task: take17's 60,824 lines, two a swap, only while YouTube, Maps, the
+wallpaper editor or Weather were on screen. Neither the Metal plug-in (no `IOSurfaceLookup`) nor this kernel's GPU
+and display code (no `lookupSurface`) asks for ID 0.
+
+**The patch:** for `IOMobileFramebufferUserClient` selector 5 (the 0x6e0-byte swap, in-band) of `NativeLegacyDisplay`,
+a layer at or past the display's `IOMFBNumLayers` `MaxNumLayers` (1) that the swap updates and disables with surface
+ID 0, and that no swap of this boot gave a surface, is counted; with the switch its two bits are cleared, so the family
+gets the single-layer swap of the home screen (which the display's validator accepts the same way) and makes no lookup.
+The display scans out only the swap's first surface, so nothing on screen changes. Line, at the 1st, 100th, 10,000th
+and 1,000,000th such swap: `oneios-display: backboardd[55] swap N disables layers 0x6 with no surface on a display of
+1 layer (each an IOSurface lookup of ID 0, ...): kept (oneios-display-trim-layers=1 takes them out)|taken out of the
+swap; N such swaps so far`. The line alone confirms the attribution on the next boot. Compiled (syntax) with the native
+kernel's recorded command; `git apply` checked after 0088; not built into a kernel, not run.
 
 ## net/: the Wi-Fi, en0 on the phone's radio (radio, radio2, 2026-11-12)
 

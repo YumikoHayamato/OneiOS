@@ -110,6 +110,19 @@ so those archives keep their own names.
   client can find the display. `sheng-vsync-fixed=1` reports one fixed rate instead. With no boot argument at
   all (a kernel started without xnuhost's) the tick is 60 Hz and the family's 1/60 s stays. The tick with a
   client, and what backboardd makes of the properties, have not run.
+  **On the panel's grid (native-perf, 2026-11-26).** The staged `NativeLegacyDisplay.cpp` asks `OneiOSDisplay.cpp` where
+  the next tick goes (`staged/display.rs` `LEGACY_VSYNC`, `oneios_display_vsync_next`, weak). In a VM of crosvm the phone
+  can write the panel's vsync into the frame sequence's page (`vm-boot --vsync-lock`, `runtime/pace`; the record and the
+  arithmetic are `vsync_lock.h`, shared with that tool): with a whole record less than 2 s old and a display's period
+  the next tick is the grid's first point half a period or more away, the vsync message carries the panel's period,
+  and a tick that fired within a quarter period of its place carries the place's time. Otherwise (no publisher, the
+  hosted kernel, the bench, and every Image without the boot argument `oneios-vsync-lock=1`: its default is 0, and then the page is not read nor is a record of the kernel's written) the answer is the free-running time the timer had. A change of
+  state is one line (`oneios-display: the refresh tick is on the panel's grid (period N ns, phase P us)`, `... runs free
+  again`; the first 16 only). Compiled with the native kernel's recorded command and the arithmetic host-tested
+  (runtime/xnuhost `test_vsync_lock`); in no kernel image yet, never run.
+- **The swaps' pace.** `oneios-display-pace:` and `oneios-display-wait:` (every round of the GPU's report in which a
+  swap came): the scanout's own counters of the gaps between swaps, as refreshes, and of what each swap waited for
+  (`../gpu/frame_stages.h`; docs/native.md "Frame pacing").
 - **Swaps.** A swap is accepted when it is one full-panel, untransformed surface in B,G,R,A (or Apple's `&BGA`
   spelling, or half-float `RGhA`), or a blank frame. An accepted B,G,R,A frame is offered to the virtio scanout,
   which presents the surface's own pages (no copy in the guest) and completes the swap; a half-float frame, or one
@@ -117,10 +130,15 @@ so those archives keep their own names.
   retires the swap and wakes the client either way. With `oneios-display-wide=1` (xnuhost's `display-format=rgba16f`)
   a half-float frame is offered to the virtio scanout as it is too, in xnuhost's format `0x52476841` ('RGhA', 8
   bytes a pixel): "Colour, depth and the panel" below.
+- **Disables of layers the display has not (take19).** While an app's Metal layer or a video is on screen the render
+  server's swaps also disable hardware layers 1 and 2 with no surface; the family looks each up as IOSurface ID 0 and
+  IOSurface logs "SID: 0x0 ... not found", two lines a swap. `oneios-display: ... disables layers 0x6 with no surface
+  ...` counts them; `oneios-display-trim-layers=1` takes them out of the swap (0089, `../README.md`).
 
 Switches (boot arguments; an absent one has the value shown while the display is on):
 `oneios-display=1` (0: no display at all, the console only), `oneios-display-wide=0` (1: half-float frames to the
-scanout as they are; xnuhost passes it with `display-format=rgba16f`), `offline-legacy-unit-scale=3`, `sheng-vsync=60` (xnuhost
+scanout as they are; xnuhost passes it with `display-format=rgba16f`), `oneios-display-trim-layers=0` (1: a swap's
+disables of layers the display has not are taken out of it, 0089), `offline-legacy-unit-scale=3`, `sheng-vsync=60` (xnuhost
 always passes these two, from its `scale` and the panel's rate, unless the command line already has them), and
 Droid-VM's stages, which there is no reason to change: `offline-mobile-graphics-load`, `offline-legacy-register`,
 `offline-legacy-gop`, `offline-legacy-phase=4`, `offline-legacy-pm`, `offline-legacy-validate`,

@@ -365,3 +365,145 @@ pub const GPU3D_NATIVE: &[(&str, &str)] = &[(
             "        create.contextInit |= uint32_t(hint[0]) << 8 | uint32_t(hint[1]) << 16;\n",
             "#endif\n"),
 )];
+
+/// DroidVMVirtioGpu.cpp's lines that change for the frame-stage lines (native-perf, 2026-11-26; after TRANSPORT and
+/// TRANSPORT_PCI, both kernels): the transport already stamps every command when it is taken off the used ring
+/// (`slot.doneUs`) and keeps the device's leg of the unfenced ones (`droidvm_virtio_gpu_legs`); a fenced one (a 3D
+/// submission) left no trace of it, and `oneios-gpu-report`'s "frames" could not tell the host's time from the time until
+/// the client looked. So: each slot keeps how many unfenced commands the device had still to answer as it was posted (a
+/// blob made or released, a mapping: crosvm's one worker takes them first), `unfenced` counts those, and `times()` gives a
+/// returned command's stamps before `poll()` frees its slot. `times()` takes the transport's lock, as `post()` and `poll()` do, so
+/// the 3D half calls it only with oneios-gpu-stages=1. Nothing is printed here: OneiOSAdreno.cpp's
+/// `stages::` does that (gpu/frame_stages.h). Each anchor must be there exactly once.
+pub const TRANSPORT_STAGES: &[(&str, &str)] = &[
+    ("    uint32_t postedInFlight;\n",
+     concat!("    uint32_t postedInFlight;\n",
+             "    uint32_t postedAhead;   // OneiOS: the unfenced commands the device had not answered as this one was posted\n")),
+    ("uint16_t available, consumed;\n",
+     concat!("uint16_t available, consumed;\n",
+             "uint32_t unfenced;   // OneiOS: unfenced commands posted and not yet taken off the used ring (with the lock held)\n")),
+    ("    slot.postedUs = nowUs(); slot.postedInFlight = inFlight; slot.detached = false;\n",
+     concat!("    slot.postedUs = nowUs(); slot.postedInFlight = inFlight; slot.detached = false;\n",
+             "    slot.postedAhead = unfenced; if (!slot.fenced) ++unfenced;   // OneiOS: staged/gpu.rs TRANSPORT_STAGES\n")),
+    ("            slot.doneUs = nowUs();\n",
+     concat!("            slot.doneUs = nowUs();\n",
+             "            if (!slot.fenced && unfenced) --unfenced;   // OneiOS: the device has answered it\n")),
+    ("// A command nobody waits for: posted as any, its slot goes back to the queue when the device returns it (reap()), the answer\n",
+     concat!("// OneiOS: a returned command's stamps, before poll() frees its slot: [0] posted (before the doorbell), [1] taken off the\n",
+             "// used ring (both us, nowUs()), [2] the commands in flight as it was posted, itself among them, [3] of those the unfenced\n",
+             "// ones, which the device had still to do first. False while the device has it, or for another command's ticket.\n",
+             "bool times(uint32_t ticket, uint64_t *out) {\n",
+             "    const uint32_t s = ticket & 0xff;\n",
+             "    if (s >= Slots || !lock || !out) return false;\n",
+             "    IOLockLock(lock);\n",
+             "    reap();\n",
+             "    const Slot &slot = slots[s];\n",
+             "    const bool done = slot.generation == ticket >> 8 && slot.state == Done;\n",
+             "    if (done) { out[0] = slot.postedUs; out[1] = slot.doneUs; out[2] = slot.postedInFlight; out[3] = slot.postedAhead; }\n",
+             "    IOLockUnlock(lock);\n",
+             "    return done;\n",
+             "}\n",
+             "// A command nobody waits for: posted as any, its slot goes back to the queue when the device returns it (reap()), the answer\n")),
+];
+
+/// DroidVMVirtioGpu3D.cpp's lines that change for the frame-stage lines (after GPU3D and GPU3D_NATIVE, both kernels): as
+/// the render server's waiter takes a fenced submission's answer (reapFences, where "frames" is counted), the command's
+/// own stamps go to OneiOSAdreno.cpp (`oneios_gpu_stage_fence`, weak: without it nothing changes and `times()` is never
+/// called): whether they were had (a command returned between the two looks has none), the four of `times()`, and now.
+/// Only for the process "frames" is about (backboardd), and only with boot argument oneios-gpu-stages=1 (`oneios_gpu_stage_wanted`,
+/// weak: without it, or with the argument 0 (the default), `times()` is not called and its lock is not taken). Each anchor must be there exactly once.
+pub const GPU3D_STAGES: &[(&str, &str)] = &[
+    ("volatile uint64_t droidvm_virtgpu_rs_fences[3], droidvm_virtgpu_rs_fence_hist[10];\n",
+     concat!("volatile uint64_t droidvm_virtgpu_rs_fences[3], droidvm_virtgpu_rs_fence_hist[10];\n",
+             "// OneiOS: the stages of each of those (OneiOSAdreno.cpp stages::, gpu/frame_stages.h; staged/gpu.rs GPU3D_STAGES).\n",
+             "void oneios_gpu_stage_fence(uint32_t, const uint64_t *, uint64_t) __attribute__((weak));\n",
+             "bool oneios_gpu_stage_wanted(void) __attribute__((weak));   // boot argument oneios-gpu-stages=1; default off\n")),
+    ("namespace DroidVMVirtioGpu {\nnamespace {\nenum : uint32_t { MaxClients = 64,",
+     concat!("namespace DroidVMVirtioGpu {\n",
+             "bool times(uint32_t, uint64_t *);   // OneiOS: the staged DroidVMVirtioGpu.cpp's (TRANSPORT_STAGES)\n",
+             "namespace {\nenum : uint32_t { MaxClients = 64,")),
+    ("        if (!poll(c->pending[i].ticket, &result)) { ++i; continue; }\n",
+     concat!("        uint64_t stamps[4] = {};   // OneiOS: the command's own, before poll() frees its slot\n",
+             "        const bool stamped = oneios_gpu_stage_fence && oneios_gpu_stage_wanted && oneios_gpu_stage_wanted() &&\n",
+             "                             !strncmp(c->name, \"backboardd\", sizeof c->name) &&\n",
+             "                             times(c->pending[i].ticket, stamps);\n",
+             "        if (!poll(c->pending[i].ticket, &result)) { ++i; continue; }\n")),
+    ("            if (us > droidvm_virtgpu_rs_fences[2]) droidvm_virtgpu_rs_fences[2] = us;\n",
+     concat!("            if (us > droidvm_virtgpu_rs_fences[2]) droidvm_virtgpu_rs_fences[2] = us;\n",
+             "            if (oneios_gpu_stage_fence) oneios_gpu_stage_fence(stamped, stamps, nowUsLocal());\n")),
+];
+
+/// DroidVMVirtioGpu3D.cpp's lines that change for the GPU address room (take17, 2026-11-26; after GPU3D_STAGES, both
+/// kernels). The phone's crosvm gives every context 2 GiB of GPU addresses (its drm2kgsl: crosvm.log's `VA slices: 64 x
+/// 2GB`), which the context's Turnip is told by GET_PARAM in its own ring and takes as its whole budget; the render
+/// server maps every client's surfaces beside its own blocks, and with 1080p video it held 1.9 to 2.0 GiB of blobs in
+/// take14, take15 and take16 alike. The kernel does not read that ring: what it sees is the DRM capset, which names
+/// the device's whole range (`va_start`, `va_size`: 128 GiB there). That range goes to OneiOSAdreno.cpp as a process
+/// asks for the capset (`oneios_gpu_capset_seen`, weak: without it nothing changes), which says it once and prints
+/// each client's blobs against a context's part, a figure of its own (`oneios-gpu-room:`, `oneios-gpu-room-mib`).
+/// Each anchor must be there exactly once.
+pub const GPU3D_ROOM: &[(&str, &str)] = &[
+    ("void oneios_gpu_hint(uint8_t *) __attribute__((weak));\n",
+     concat!("void oneios_gpu_hint(uint8_t *) __attribute__((weak));\n",
+             "// OneiOS (take17): the GPU address range the DRM capset names (the device's whole range), as a process asks\n",
+             "// for it: its pid, the range's start and size (OneiOSAdreno.cpp watch::; staged/gpu.rs GPU3D_ROOM).\n",
+             "void oneios_gpu_capset_seen(uint32_t, uint64_t, uint64_t) __attribute__((weak));\n")),
+    ("    if (!status) memcpy(out, answer + sizeof(Header), outSize);\n",
+     concat!("    if (!status) memcpy(out, answer + sizeof(Header), outSize);\n",
+             "    if (!status && in.capset_id == CapsetIdDrm && bytes >= sizeof(CapsetDrm) && oneios_gpu_capset_seen) {\n",
+             "        CapsetDrm caps;   // OneiOS (take17): two words stored under the clients' lock, nothing printed here\n",
+             "        memcpy(&caps, answer + sizeof(Header), sizeof caps);\n",
+             "        oneios_gpu_capset_seen(uint32_t(proc_selfpid()), caps.vaStart, caps.vaSize);\n",
+             "    }\n")),
+];
+
+/// DroidVMVirtioGpu3D.cpp's lines that change for the render server's read wait (take20, 2026-11-27; after GPU3D_ROOM, both
+/// kernels). NativeMetal 0004 (take18) has backboardd ask, before each submission, that the kernel wait (awaitWriters, at
+/// most droidvm_surface_read_wait_ms, 100) for other processes' GPU work begun before it that writes a surface it reads; that
+/// work's ticket ends when its command buffer completes in the writing process. take19's second session (-loggpu,
+/// 11:51:55-11:54:26 UTC, the owner's "continuous lag on the Home screen after closing the notification panel, until an app
+/// opens; pulling the panel down again fixes it"): oneios-gpu-sync `reads that waited for writers +97, gave up +97, max ever
+/// 101174 us` and the same in ten rounds: every frame of the render server waited the whole 100 ms for a writer whose ticket
+/// never ended (`holds 94458 us a swap`), so the Home screen drew 10 frames a second while it moved and nothing when the
+/// finger lifted. A writer that made a read give up is no longer waited for by any read of the render server (its use is
+/// marked stale: `oneios_gpu_read_wait_stale`); its ticket still ends as before when its command buffer completes, and CPU
+/// locks still wait for it. So such a writer costs
+/// one frame 100 ms, not every frame until it runs again. OneiOSAdreno.cpp says each one (the first 64 of a boot: process,
+/// surface, ticket) and counts them; its `oneios_gpu_read_wait_stale_on` (boot argument oneios-read-wait-stale=0) turns the
+/// change off; both weak: without OneiOSAdreno.cpp nothing changes. Each anchor must be there exactly once.
+pub const GPU3D_READ_WAIT: &[(&str, &str)] = &[
+    ("bool oneios_gpu_reader_waits(int) __attribute__((weak));\n",
+     concat!("bool oneios_gpu_reader_waits(int) __attribute__((weak));\n",
+             "// OneiOS (take20): whether a writer that made the render server's read wait give up is no longer waited for, and each\n",
+             "// such writer (surface, pid, ticket) as it is marked (OneiOSAdreno.cpp; staged/gpu.rs GPU3D_READ_WAIT).\n",
+             "bool oneios_gpu_read_wait_stale_on(void) __attribute__((weak));\n",
+             "void oneios_gpu_read_wait_stale(uint32_t, int, uint64_t) __attribute__((weak));\n")),
+    // the use's own mark (aggregate initializations leave it false); `write` stays as it was, for the CPU locks and the trail
+    ("struct SurfaceUse { uint32_t surface; bool write; Client *client; uint64_t ticket; };\n",
+     concat!("struct SurfaceUse { uint32_t surface; bool write; Client *client; uint64_t ticket; bool stale; };   // OneiOS take20: stale\n")),
+    ("            if (other.surface == mine.surface && other.write && other.ticket < ticket && other.client->pid != c->pid) return true;\n",
+     concat!("            if (other.surface == mine.surface && other.write && !other.stale && other.ticket < ticket && other.client->pid != c->pid) return true;\n")),
+    ("void awaitWriters(Client *c, uint64_t ticket) {\n",
+     concat!("// OneiOS (take20, staged/gpu.rs GPU3D_READ_WAIT): gSurfaceLock held, after `ticket`'s read wait gave up: the other\n",
+             "// processes' writes begun before it of the surfaces it reads are marked stale, so no read of the render server waits for\n",
+             "// them again; their tickets end as before, and CPU locks still wait for them (waitSurface does not look at the mark).\n",
+             "void staleWriters(Client *c, uint64_t ticket) {\n",
+             "    for (uint32_t i = 0; i < gSurfaceUseCount; ++i) {\n",
+             "        const SurfaceUse &mine = gSurfaceUses[i];\n",
+             "        if (mine.client != c || mine.ticket != ticket || mine.write) continue;\n",
+             "        for (uint32_t j = 0; j < gSurfaceUseCount; ++j) {\n",
+             "            SurfaceUse &other = gSurfaceUses[j];\n",
+             "            if (other.surface != mine.surface || !other.write || other.stale || other.ticket >= ticket || other.client->pid == c->pid) continue;\n",
+             "            other.stale = true;\n",
+             "            oneios_gpu_read_wait_stale(other.surface, other.client->pid, other.ticket);\n",
+             "        }\n",
+             "    }\n",
+             "}\n",
+             "void awaitWriters(Client *c, uint64_t ticket) {\n")),
+    ("        if (woke == THREAD_TIMED_OUT) { droidvm_surface_read_waits[1] = droidvm_surface_read_waits[1] + 1; break; }\n",
+     concat!("        if (woke == THREAD_TIMED_OUT) {\n",
+             "            droidvm_surface_read_waits[1] = droidvm_surface_read_waits[1] + 1;\n",
+             "            if (oneios_gpu_read_wait_stale_on && oneios_gpu_read_wait_stale && oneios_gpu_read_wait_stale_on()) staleWriters(c, ticket);\n",
+             "            break;\n",
+             "        }\n")),
+];

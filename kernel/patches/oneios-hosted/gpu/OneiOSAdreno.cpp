@@ -133,6 +133,10 @@ void oneios_adreno_parent_slide(void)
         IOLog("oneios-adreno: AGXAccelerator's superclass is %p, expected %p\n", meta->superClassLink, boundParent());
 }
 
+// take20: the writers the render server's read wait gave up on and no longer waits for (staged/gpu.rs GPU3D_READ_WAIT;
+// defined with its hooks at the end of this file).
+extern "C" volatile uint64_t oneios_gpu_read_wait_stale_count;
+
 namespace {
 void selftest(void *, wait_result_t)
 {
@@ -254,8 +258,8 @@ void hosted_gpu_text_flush(uint64_t quiet_ns) __attribute__((weak));
 // Which processes use the CPU, the same interval: the client that keeps a still screen redrawing (SpringBoard committing,
 // or only backboardd running an animation of its own), and the heat. The busiest eight, as a percentage of one CPU:
 //   oneios-cpu: 10 s: backboardd[53] 62%, SpringBoard[30] 35%, kernel_task[0] 20%, ... (all 140%)
-// From each task's recorded user and system time (TASK_POWER_INFO); a process that started or ended inside the interval
-// counts from where it was seen.
+// From each task's recorded user and system time (TASK_POWER_INFO); a process first seen in this walk counts from its
+// start (its first seconds are an app's launch), unless its pid's slot was in use in the walk before.
 extern "C" {
 typedef struct proc *proc_t;
 typedef int (*proc_iterate_fn_t)(proc_t, void *);
@@ -266,12 +270,18 @@ kern_return_t task_info(task_t, task_flavor_t, task_info_t, mach_msg_type_number
 void absolutetime_to_nanoseconds(uint64_t, uint64_t *);
 // hosted 0075 (hosted_user.c): the time all processors have idled since boot, up to now, and how many there are
 uint64_t hosted_processors_idle_mach(uint32_t *count) __attribute__((weak));
+// 0084 (kern_memorystatus.c, pe_serial.c), 0014 (ubc_subr.c) and the disk driver (storage/OneiOSHostedDisk.cpp)
+void oneios_memory_report(uint32_t every) __attribute__((weak));
+void oneios_disk_report(uint32_t every) __attribute__((weak));
+extern uint64_t oneios_console_bytes, oneios_console_ticks;
+extern uint64_t cs_native4k_read_ticks, cs_native4k_hash_ticks, cs_native4k_bytes;
 }
 #include "cpu_window.h"
 namespace cpu {
-struct Seen { int pid; uint32_t round; uint64_t mach, sys; };
+struct Events { uint32_t faults, pageins, cow, calls, machs, csw; };
+struct Seen { int pid; uint32_t round; uint64_t mach, sys; Events events; };
 Seen seen[1024];
-struct Busy { int pid; uint64_t mach, sys; char name[24]; };
+struct Busy { int pid; uint64_t mach, sys; Events events; bool fresh; char name[24]; };
 struct Walk { uint32_t round; Busy top[8]; uint64_t all; };
 int visit(proc_t p, void *arg)
 {
@@ -285,19 +295,31 @@ int visit(proc_t p, void *arg)
     const uint64_t now = info.total_user + info.total_system, sys = info.total_system;
     Seen &e = seen[unsigned(pid) % 1024];
     const bool known = e.pid == pid && e.round + 1 == w.round && now >= e.mach;
-    const uint64_t used = known ? now - e.mach : 0, used_sys = known && sys >= e.sys ? sys - e.sys : 0;
-    e.pid = pid; e.round = w.round; e.mach = now; e.sys = sys;
+    const bool fresh = !known && w.round > 1 && e.round + 1 < w.round;   // the slot was free in the walk before: new
+    const uint64_t used = known ? now - e.mach : fresh ? now : 0, used_sys = known && sys >= e.sys ? sys - e.sys : fresh ? sys : 0;
+    // What the kernel time was for: faults, page-ins, system calls, context switches (TASK_EVENTS_INFO, since its start).
+    task_events_info_data_t ev = {};
+    count = TASK_EVENTS_INFO_COUNT;
+    Events total = {}, did = {};
+    if (task_info(task, TASK_EVENTS_INFO, reinterpret_cast<task_info_t>(&ev), &count) == KERN_SUCCESS) {
+        total = { uint32_t(ev.faults), uint32_t(ev.pageins), uint32_t(ev.cow_faults), uint32_t(ev.syscalls_unix), uint32_t(ev.syscalls_mach), uint32_t(ev.csw) };
+        const Events was = known ? e.events : Events{};
+        did = { total.faults - was.faults, total.pageins - was.pageins, total.cow - was.cow, total.calls - was.calls,
+                total.machs - was.machs, total.csw - was.csw };
+    }
+    e.pid = pid; e.round = w.round; e.mach = now; e.sys = sys; e.events = total;
     w.all += used;
     unsigned at = 8;
     while (at > 0 && w.top[at - 1].mach < used) at--;
     if (at < 8 && used) {
         memmove(&w.top[at + 1], &w.top[at], (7 - at) * sizeof(Busy));
-        w.top[at].pid = pid; w.top[at].mach = used; w.top[at].sys = used_sys;
+        w.top[at].pid = pid; w.top[at].mach = used; w.top[at].sys = used_sys; w.top[at].events = did; w.top[at].fresh = fresh;
         strlcpy(w.top[at].name, proc_best_name(p), sizeof w.top[at].name);
     }
     return 0;   // PROC_RETURNED
 }
-void report(uint32_t every, uint32_t round)
+// Returns the measured seconds of the window, for the other lines of the same report (round 1: since boot).
+uint32_t report(uint32_t every, uint32_t round)
 {
     // The span is the time since the last walk, measured: in a stall the report thread wakes late (the phone,
     // 2026-11-13 10:4x: the display's own 10 s line came after 30 s), and dividing by the nominal `every` gave a
@@ -317,9 +339,9 @@ void report(uint32_t every, uint32_t round)
     const bool first = round < 2 || !last || (ncpu && !idle_last);
     last = walked;
     idle_last = idle_now;
-    if (first) return;   // the first walk only records where each process was
     span = oneios_cpu_span_ns(span, every);
     every = uint32_t((span + 500000000ull) / 1000000000ull);
+    if (first) return every;   // the first walk only records where each process was
     const uint64_t busy = oneios_cpu_busy_ns(span, ncpu, idle);
     char text[220];
     size_t at = 0;
@@ -345,6 +367,48 @@ void report(uint32_t every, uint32_t round)
         if (at >= sizeof text - 1) break;
     }
     if (at) IOLog("oneios-cpu-sys: %u s: %s (kernel time of the same processes)\n", every, text);
+    // What that kernel time was for, of those with 5% of a CPU of it or more (the four busiest at most): page faults (f, of them
+    // page-ins p and copy-on-write c), system calls of unix (u) and mach (m), context switches (x). "+": seen first now. An entry is
+    // never cut: one that does not fit whole starts another line (IOLog cuts a line near 255 characters).
+    at = 0;
+    for (unsigned i = 0, n = 0; i < 8 && n < 4 && w.top[i].mach; i++) {
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(w.top[i].sys, &ns);
+        if (ns * 100 / span < 5) continue;
+        n++;
+        const Events &d = w.top[i].events;
+        char entry[128];   // at most 16 + 13 + 1 + 6 x 12 characters
+        const size_t length = size_t(snprintf(entry, sizeof entry, "%.16s[%d]%s f%u p%u c%u u%u m%u x%u", w.top[i].name, w.top[i].pid,
+                                              w.top[i].fresh ? "+" : "", d.faults, d.pageins, d.cow, d.calls, d.machs, d.csw));
+        if (at && at + 2 + length >= sizeof text) {
+            IOLog("oneios-cpu-why: %u s: %s\n", every, text);
+            at = 0;
+        }
+        at += snprintf(text + at, sizeof text - at, "%s%s", at ? ", " : "", entry);
+    }
+    if (at) IOLog("oneios-cpu-why: %u s: %s\n", every, text);
+    return every;
+}
+// The console's own cost and the code signatures' 16 KiB to 4 KiB preparation, when they moved.
+void costs(uint32_t every)
+{
+    static uint64_t console[2], signatures[3];
+    if (oneios_console_bytes != console[0]) {
+        const uint64_t bytes = oneios_console_bytes, ticks = oneios_console_ticks;
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(ticks - console[1], &ns);
+        IOLog("oneios-console: %u s: %llu bytes, %llu ms in the port's registers\n", every, bytes - console[0], ns / 1000000);
+        console[0] = bytes; console[1] = ticks;
+    }
+    if (cs_native4k_bytes != signatures[0]) {
+        const uint64_t bytes = cs_native4k_bytes, reads = cs_native4k_read_ticks, hashes = cs_native4k_hash_ticks;
+        uint64_t read = 0, hash = 0;
+        absolutetime_to_nanoseconds(reads - signatures[1], &read);
+        absolutetime_to_nanoseconds(hashes - signatures[2], &hash);
+        IOLog("oneios-signatures: %u s: %llu KiB prepared, %llu ms reading, %llu ms hashing\n", every, (bytes - signatures[0]) >> 10,
+              read / 1000000, hash / 1000000);
+        signatures[0] = bytes; signatures[1] = reads; signatures[2] = hashes;
+    }
 }
 }  // namespace cpu
 
@@ -552,10 +616,16 @@ const char *slotName(uint32_t s) { return s < 64 && droidvm_virtgpu_client_memor
 // The sync line: the tunnel's own IOSurface counters (DroidVMVirtioGpu3D.cpp surfaceAccess, surfaceTrap, awaitWriters).
 void printSync(uint32_t every)
 {
-    static uint64_t was[8], wasOptions[4], wasReads[4];
+    static uint64_t was[8], wasOptions[4], wasReads[4], staleWas;
     uint64_t st[8], op[4], rd[4];
     for (unsigned i = 0; i < 8; i++) st[i] = droidvm_surface_stats[i];
     for (unsigned i = 0; i < 4; i++) { op[i] = droidvm_surface_lock_options[i]; rd[i] = droidvm_surface_read_waits[i]; }
+    const uint64_t stale = oneios_gpu_read_wait_stale_count;
+    // take20: the writers the read wait gave up on, on a line of their own (the sync line is ~240 bytes already)
+    if (stale != staleWas)
+        IOLog("oneios-gpu-sync: %u s: writers the render server's read wait gave up on, no longer waited for: +%llu (%llu since the boot)\n", every,
+              stale - staleWas, stale);
+    staleWas = stale;
     if (!memcmp(st, was, sizeof st) && !memcmp(op, wasOptions, sizeof op) && !memcmp(rd, wasReads, sizeof rd)) return;
     const uint64_t locks = (op[0] + op[1] + op[2] + op[3]) - (wasOptions[0] + wasOptions[1] + wasOptions[2] + wasOptions[3]);
     const uint64_t waited = st[4] - was[4];
@@ -722,6 +792,8 @@ extern "C" void oneios_gpu_surface_done(uint32_t id, uint32_t write, uint32_t sl
     }
     IOSimpleLockUnlock(slock);
 }
+// The video decoders' surface locks, for the sampler's oneios-video line (watch:: below; take17).
+namespace watch { extern volatile uint64_t decoderLocks[2]; }
 // A CPU lock of a surface (IOSurfaceRootUserClient's lock trap), in the locking process; only surfaces the GPU used.
 extern "C" void oneios_gpu_surface_lock(uint32_t id, uint32_t options)
 {
@@ -729,6 +801,8 @@ extern "C" void oneios_gpu_surface_lock(uint32_t id, uint32_t options)
     if (!slock || !surfaces) return;
     char name[16] = "";
     proc_selfname(name, sizeof name);
+    if (!strncmp(name, "videocodecd", sizeof name)) __atomic_add_fetch(&watch::decoderLocks[0], 1, __ATOMIC_RELAXED);
+    else if (!strncmp(name, "mediaplaybackd", sizeof name)) __atomic_add_fetch(&watch::decoderLocks[1], 1, __ATOMIC_RELAXED);
     const uint32_t now = blobs::secondsNow();
     IOSimpleLockLock(slock);
     if (const Surface *s = surface(id, now, false)) {
@@ -961,6 +1035,605 @@ void print(uint64_t (&wasMade)[64], uint64_t (&wasGone)[64])
 }
 }  // namespace blobs
 
+// ---- the stages of the render server's fenced submissions (native-perf, 2026-11-26; docs/native.md "Frame pacing")
+// oneios-gpu-report's "frames" is one time for three things: the host's part (the doorbell, crosvm's worker, drm2kgsl,
+// KGSL, the GPU, the fence coming back), the time until some guest thread looked at the used ring, and the time until
+// the client's own waiter took its fence. The staged transport stamps a command as it is taken off the used ring
+// (staged/gpu.rs TRANSPORT_STAGES) and the 3D half hands the stamps over here as "frames" is counted (GPU3D_STAGES):
+//   oneios-gpu-stages: 10 s: +1132 stamped (+3 not); host <.25/<.5/<1/<2/<4/<8/<16/<32 ms +0/+2/+40/+310/+420/+300/+50/+8
+//     longer +2 mean 6100 us
+//       "host": from the post (before the doorbell) to the command off the used ring. "not": the command came back
+//       between the two looks of one reap, so its stamps were not had (it is in "frames" only).
+//   oneios-gpu-look: 10 s: after that, the waiter had it in <.25/<.5/<1/<2/<4 ms +900/+150/+60/+20/+2 longer +0 mean 180 us
+//       the guest's own part: what a waiter that polls, or a late wake-up, adds to "frames".
+//   oneios-gpu-ahead: 10 s: nothing ahead +800 mean 5200 us (over 8 ms +120, over 16 ms +10); unfenced ahead +332 mean
+//     8300 us (over 8 ms +160, over 16 ms +44), 2.1 of them a time; 3.4 in flight at a post
+//       the host's time of the submissions posted with no unfenced command unanswered, and of those posted behind some
+//       (a blob made or released, a mapping: crosvm's one worker does them first). Much more time behind them is the
+//       queue's; the same time is the GPU's.
+// And the transport's own counters, which nothing printed (DroidVMVirtioGpu.cpp), when they moved:
+//   oneios-gpu-waits: 10 s: waits +5000 (watch +3000, behind it +2000), looks +40000, interrupt sleeps +0 (not needed +0,
+//     to the guard +0), interrupts +0, deadlines +12; intid 0 (off), spin 300 us
+//       an interrupt sleep that runs to its 20 ms guard is an interrupt that did not come.
+//   oneios-gpu-doorbell: 10 s: +3000 <32/<64/<128/<256/<512/<1024 us +0/+2100/+800/+90/+8/+2 longer +0[; interrupt to the
+//     look +N <32/... ...]
+//   oneios-gpu-legs: 10 s: blobs made +921 in <.5/<1/<2/<4/<8/<16/<33 ms +800/+60/+30/+20/+8/+3/+0 longer +0; released +..
+//       the device's time for the unfenced commands, from the doorbell to the answer off the ring (a second line for the
+//       ccmds and the rest).
+// oneios-gpu-stages=1 turns these lines on (default 0: off, and the transport's stamps are not asked for; oneios-gpu-report=0
+// turns every report off). The display-pace and -wait lines do not depend on it.
+extern "C" {
+extern volatile uint64_t droidvm_virtio_gpu_waits[9];
+extern volatile uint32_t droidvm_virtio_gpu_legs[4][2][12], droidvm_virtio_gpu_kick_us[12], droidvm_virtio_gpu_irq_reap_us[12];
+extern volatile uint32_t droidvm_virtio_gpu_intid, droidvm_virtio_gpu_irq, droidvm_virtio_gpu_spin_us;
+// ../display/OneiOSDisplay.cpp: the swaps' own line (oneios-display-pace). Weak: a kernel without the display has none.
+void oneios_display_pace_report(uint32_t every) __attribute__((weak));
+}
+#include "frame_stages.h"
+namespace stages {
+oneios_stage_hist hostLeg, lookLeg;
+// Submissions whose stamps were not had; then by what was ahead of them at the post, [0] nothing, [1] unfenced commands:
+// how many, the host's time (us), of them 8 ms or more, 16 ms or more. Then the unfenced commands ahead and the commands
+// in flight at the posts, summed.
+uint64_t unstamped, split[2][4], aheadSum, inFlightSum;
+void add(uint64_t *to, uint64_t by) { __atomic_add_fetch(to, by, __ATOMIC_RELAXED); }
+uint64_t get(const uint64_t *from) { return __atomic_load_n(from, __ATOMIC_RELAXED); }
+
+void text(char *out, size_t size, const uint64_t *d, unsigned n)
+{
+    size_t at = 0;
+    out[0] = 0;
+    for (unsigned i = 0; i < n && at + 1 < size; i++) at += size_t(snprintf(out + at, size - at, "%s+%llu", i ? "/" : "", d[i]));
+}
+
+// oneios-gpu-stages=1 (default 0: off): the transport's stamps are asked for, per fenced submission, and the stage lines printed.
+// Off, nothing here runs on a submission: the 3D half's weak hook below answers 0 and times() is never called.
+bool enabled()
+{
+    static uint32_t on = 2;
+    if (on == 2) { uint32_t v = 0; PE_parse_boot_argn("oneios-gpu-stages", &v, sizeof v); on = v ? 1 : 0; }
+    return on == 1;
+}
+
+void report(uint32_t every)
+{
+    // The swaps' own lines (display-pace and -wait) read counters the display keeps anyway: they do not depend on the stages.
+    if (oneios_display_pace_report) oneios_display_pace_report(every);
+    if (!enabled()) return;
+    static oneios_stage_hist hostWas, lookWas;
+    static uint64_t unstampedWas, splitWas[2][4], aheadWas, inFlightWas;
+    oneios_stage_hist h, l;
+    oneios_stage_read(&hostLeg, &h);
+    oneios_stage_read(&lookLeg, &l);
+    const uint64_t un = get(&unstamped);
+    if (h.count != hostWas.count || un != unstampedWas) {
+        char line[120];
+        oneios_stage_text(line, sizeof line, &h, &hostWas, 8);
+        IOLog("oneios-gpu-stages: %u s: +%llu stamped (+%llu not); host <.25/<.5/<1/<2/<4/<8/<16/<32 ms %s\n", every,
+              h.count - hostWas.count, un - unstampedWas, line);
+        oneios_stage_text(line, sizeof line, &l, &lookWas, 5);
+        IOLog("oneios-gpu-look: %u s: after that, the waiter had it in <.25/<.5/<1/<2/<4 ms %s\n", every, line);
+        uint64_t d[2][4];
+        for (unsigned k = 0; k < 2; k++) for (unsigned i = 0; i < 4; i++) { const uint64_t v = get(&split[k][i]); d[k][i] = v - splitWas[k][i]; splitWas[k][i] = v; }
+        const uint64_t ahead = get(&aheadSum), flight = get(&inFlightSum), n = d[0][0] + d[1][0];
+        const uint64_t aheadTenths = d[1][0] ? (ahead - aheadWas) * 10 / d[1][0] : 0, flightTenths = n ? (flight - inFlightWas) * 10 / n : 0;
+        IOLog("oneios-gpu-ahead: %u s: nothing ahead +%llu mean %llu us (over 8 ms +%llu, over 16 ms +%llu); unfenced ahead +%llu mean %llu us "
+              "(over 8 ms +%llu, over 16 ms +%llu), %llu.%llu of them a time; %llu.%llu in flight at a post\n", every,
+              d[0][0], d[0][0] ? d[0][1] / d[0][0] : 0, d[0][2], d[0][3], d[1][0], d[1][0] ? d[1][1] / d[1][0] : 0, d[1][2], d[1][3],
+              aheadTenths / 10, aheadTenths % 10, flightTenths / 10, flightTenths % 10);
+        aheadWas = ahead; inFlightWas = flight;
+        hostWas = h; lookWas = l; unstampedWas = un;
+    }
+    // The transport's waits.
+    static uint64_t waitsWas[9];
+    uint64_t w[9], dw[9];
+    bool moved = false;
+    for (unsigned i = 0; i < 9; i++) { w[i] = droidvm_virtio_gpu_waits[i]; dw[i] = w[i] - waitsWas[i]; moved |= dw[i] != 0; }
+    if (moved) {
+        IOLog("oneios-gpu-waits: %u s: waits +%llu (watch +%llu, behind it +%llu), looks +%llu, interrupt sleeps +%llu (not needed +%llu, "
+              "to the guard +%llu), interrupts +%llu, deadlines +%llu; intid %u (%s), spin %u us\n", every, dw[0], dw[1], dw[2], dw[3], dw[4],
+              dw[5], dw[7], dw[6], dw[8], droidvm_virtio_gpu_intid, droidvm_virtio_gpu_intid && droidvm_virtio_gpu_irq ? "on" : "off",
+              droidvm_virtio_gpu_spin_us);
+        memcpy(waitsWas, w, sizeof w);
+    }
+    // The doorbell, and with the interrupt on, from the interrupt to the look that took its answer.
+    static uint32_t kickWas[ONEIOS_LEG_BUCKETS], irqWas[ONEIOS_LEG_BUCKETS];
+    uint32_t kick[ONEIOS_LEG_BUCKETS], irq[ONEIOS_LEG_BUCKETS];
+    for (unsigned i = 0; i < ONEIOS_LEG_BUCKETS; i++) { kick[i] = droidvm_virtio_gpu_kick_us[i]; irq[i] = droidvm_virtio_gpu_irq_reap_us[i]; }
+    uint64_t dk[ONEIOS_KICK_SHOWN], di[ONEIOS_KICK_SHOWN];
+    const uint64_t kicks = oneios_kick_delta(kick, kickWas, dk), irqs = oneios_kick_delta(irq, irqWas, di);
+    if (kicks || irqs) {
+        char a[100], b[100], tail[150];
+        text(a, sizeof a, dk, ONEIOS_KICK_SHOWN - 1);
+        tail[0] = 0;
+        if (irqs) {
+            text(b, sizeof b, di, ONEIOS_KICK_SHOWN - 1);
+            snprintf(tail, sizeof tail, "; interrupt to the look +%llu %s longer +%llu", irqs, b, di[ONEIOS_KICK_SHOWN - 1]);
+        }
+        IOLog("oneios-gpu-doorbell: %u s: +%llu <32/<64/<128/<256/<512/<1024 us %s longer +%llu%s\n", every, kicks, a, dk[ONEIOS_KICK_SHOWN - 1], tail);
+        memcpy(kickWas, kick, sizeof kick);
+        memcpy(irqWas, irq, sizeof irq);
+    }
+    // The device's time for the unfenced commands, by kind (droidvm_virtio_gpu_legs[kind][0]).
+    static uint32_t legsWas[4][ONEIOS_LEG_BUCKETS];
+    static const char *const kinds[4] = {"ccmds", "blobs made", "released", "the rest"};
+    static const unsigned order[4] = {1, 2, 0, 3};
+    char line[250];
+    size_t at = 0;
+    for (unsigned k = 0; k < 4; k++) {
+        const unsigned kind = order[k];
+        uint32_t now[ONEIOS_LEG_BUCKETS];
+        for (unsigned i = 0; i < ONEIOS_LEG_BUCKETS; i++) now[i] = droidvm_virtio_gpu_legs[kind][0][i];
+        uint64_t d[ONEIOS_LEG_SHOWN];
+        const uint64_t n = oneios_leg_delta(now, legsWas[kind], d);
+        memcpy(legsWas[kind], now, sizeof now);
+        if (!n) continue;
+        char numbers[100], one[160];
+        text(numbers, sizeof numbers, d, ONEIOS_LEG_SHOWN - 1);
+        const size_t length = size_t(snprintf(one, sizeof one, "%s +%llu in <.5/<1/<2/<4/<8/<16/<33 ms %s longer +%llu", kinds[kind], n, numbers,
+                                              d[ONEIOS_LEG_SHOWN - 1]));
+        // two kinds to a line at most, and never a cut one (IOLog cuts near 255 characters)
+        if (at && at + 2 + length >= 200) { IOLog("oneios-gpu-legs: %u s: %s\n", every, line); at = 0; }
+        at += size_t(snprintf(line + at, sizeof line - at, "%s%s", at ? "; " : "", one));
+    }
+    if (at) IOLog("oneios-gpu-legs: %u s: %s\n", every, line);
+}
+}  // namespace stages
+
+// The 3D half's reapFences, as it counts one of the render server's fenced submissions into "frames": `stamped` 0 when
+// the command's stamps were not had, else t[0] its post and t[1] its answer off the used ring (us, the transport's
+// clock, as `now`), t[2] the commands in flight at its post and t[3] the unfenced ones among them.
+// The 3D half asks before it takes a command's stamps (times() takes the transport's lock): only with oneios-gpu-stages=1.
+extern "C" bool oneios_gpu_stage_wanted(void)
+{
+    return stages::enabled();
+}
+
+// take20: the first frames after a rest (watch.h's oneios-wake). The swap path (oneios_gpu_swap_gap, under the display's
+// frame lock) begins a wake and adds its gaps; the fence path below adds the render server's host legs of its fenced frames
+// reaped after the wake began, each in a slot of its own (several threads reap); the sampler prints the line once the wake is
+// complete and only then lets the next one begin (`active`). At most 300 a boot. Only with oneios-gpu-stages=1 for the legs
+// (the fence path's stamps); the gaps come either way.
+#include "watch.h"   // its include below (the watch's section) is then a no-op
+namespace wakes {
+oneios_wake wake;
+volatile uint32_t active;      // 1 from a wake's begin until its line is printed
+volatile uint32_t lines;
+void leg(uint64_t device, uint64_t posted)
+{
+    if (!__atomic_load_n(&active, __ATOMIC_ACQUIRE) || posted < wake.at_us) return;
+    const uint32_t slot = __atomic_fetch_add(&wake.legs, 1, __ATOMIC_RELAXED);
+    if (slot < ONEIOS_WAKE_FRAMES) wake.leg_us[slot] = device > 0xffffffffull ? 0xffffffffu : uint32_t(device);
+}
+}  // namespace wakes
+
+extern "C" void oneios_gpu_stage_fence(uint32_t stamped, const uint64_t *t, uint64_t now)
+{
+    using namespace stages;
+    if (!stamped || !t || t[1] < t[0] || now < t[1]) {
+        add(&unstamped, 1);
+        return;
+    }
+    const uint64_t device = t[1] - t[0];
+    wakes::leg(device, t[0]);
+    oneios_stage_add(&hostLeg, device);
+    oneios_stage_add(&lookLeg, now - t[1]);
+    uint64_t *s = split[t[3] ? 1 : 0];
+    add(&s[0], 1);
+    add(&s[1], device);
+    if (device >= 8000) add(&s[2], 1);
+    if (device >= 16000) add(&s[3], 1);
+    add(&aheadSum, t[3]);
+    add(&inFlightSum, t[2]);
+}
+
+// ---- the lines written as things happen (take17, 2026-11-26; watch.h says why; docs/native.md "What take16's lines say")
+// A sampler thread: every 100 ms while swaps come (every second otherwise) it notes which processes had the CPUs and what
+// the GPU's clients submitted, and from that and three hooks it writes, each line with the time of day (UTC):
+//   oneios-hitch: 12:27:12: 739 ms without a swap (the one before came after 16 ms); one process busy (all 771 ms of CPU
+//     in 900 ms of ticks); the GPU: apps +0 submits, the render server +2, blobs +14; hitch 5 (0 not printed)
+//   oneios-hitch: 12:27:12: the busiest in it: com.apple.WebKit[287] 702 ms, backboardd[55] 12 ms
+//       a gap of oneios-hitch-ms (150) to 5000 ms between two swaps, when the swap before the gap came within 50 ms of
+//       its own predecessor (frames were coming). "one process busy": it had a CPU for half the gap or more; "the CPUs
+//       busy": several did; "nothing busy": a wait, or one animation's end and the next one's start. The CPU times are
+//       the ticks' that cover the gap and the 100 ms after it (a thread's time is added to its task when it next
+//       switches: cpu_window.h), so they can be a little more than the gap. At most six a 10 s, 2000 a boot (take19; 400 before).
+//   oneios-gpu-room: 12:29:21: backboardd passed 90 % of its GPU addresses: 1422 -> 1979 of 2048 MiB (most 1979)
+//   oneios-gpu-room: 12:30:21: backboardd let go of 1309 MiB: 1979 -> 670 of 2048 MiB
+//       a client's blobs (own and wired, as oneios-gpu-clients) against a context's part of the GPU addresses: 2048
+//       MiB, the slice the phone's crosvm cuts for each context (oneios-gpu-room-mib=N for another; watch::room). The
+//       DRM capset names the device's whole range, said once as it is first asked (DroidVMVirtioGpu3D.cpp getCaps,
+//       staged/gpu.rs GPU3D_ROOM): `the device has 131072 MiB of GPU addresses from 0x40001e8000 (the DRM capset)`.
+//   oneios-pressure: 12:29:22: normal -> warning; available 604 MiB
+//       the memory pressure level (0087), as it changes: every process with a memory pressure source is then told.
+//   oneios-video: 12:29:41: decoder locks +61 (videocodecd +61, mediaplaybackd +0), swaps +58; backboardd GPU 1682+297 of
+//     2048 MiB (96 %); available 573 MiB, pressure warning
+//       each second in which a video decoder locked surfaces for the CPU (about one a frame it writes), and five more
+//       after the last (a picture that stops is `locks +0`). At most 1500 a boot.
+// And in the 10 s report: `oneios-clock:` the time of day of each round with the sampler's own cost in it (its walks of
+// the process list, their CPU time and the time they took), and `oneios-gpu-room:` every client that holds a tenth of
+// a context's part or more.
+// take20 (watch.h says why): the hitch's second line ends "; slow blobs (8 ms or more) +M" when M is not 0 (CREATE_BLOB
+// commands in the gap whose device leg took 8 ms or more, the transport's own buckets), and two lines more:
+//   oneios-frames: 10:47:13: ... (the 10 s report) `oneios-frames: 10 s: gaps right after frames of 25-50/50-100/100-150 ms
+//     +12/+3/+1; the longest: 87 ms at 10:47:03.214, 64 ms at 10:47:03.402, 41 ms at 10:47:09.977`
+//   oneios-wake: 10:50:40: after 33.4 s without a swap: the next swaps 8.3/8.4/25.0/... ms apart; the render server's next
+//     fenced frames 31.2/12.0/4.1/... ms on the host
+//   oneios-frames=0      neither of the two (the hitch lines' blob count stays)
+//   oneios-watch=0       no sampler: none of these lines but the report's two
+//   oneios-hitch-ms=N    the shortest gap that is a line (default 150; 0: no oneios-hitch line)
+//   oneios-gpu-room-mib=N  a context's part of the GPU addresses (default 2048)
+#include <kern/clock.h>
+#include "watch.h"
+extern "C" {
+// DroidVMVirtioGpu3D.cpp as staged (staged/gpu.rs GPU3D_ROOM) and DroidVMVirtioGpuDisplay.cpp (staged/display.rs SCANOUT).
+void oneios_gpu_capset_seen(uint32_t pid, uint64_t start, uint64_t size);
+void oneios_gpu_swap_gap(uint64_t gap_us, uint64_t now_us);
+// 0087 (kern_memorystatus.c)
+uint32_t oneios_memory_available_mib(void) __attribute__((weak));
+uint32_t oneios_memory_pressure_level(void) __attribute__((weak));
+// osfmk/kern/thread.h: the calling thread's CPU time, mach units. (recount_task_times, a task's user and system time
+// summed over its CPU kinds, is kern/recount.h's, which the kernel's headers above bring in.)
+uint64_t thread_get_runtime_self(void);
+}
+namespace watch {
+uint64_t nowUs() { uint64_t ns = 0; absolutetime_to_nanoseconds(mach_absolute_time(), &ns); return ns / 1000; }
+// "12:29:41": the time of day `ago_us` before now, UTC (the guest's clock is the phone's, 0078): crosvm.log's own, and an
+// hour (or two) behind the phone's thermal.txt and logcat in Italy.
+void clockText(char *out, size_t size, uint64_t ago_us)
+{
+    clock_sec_t secs = 0;
+    clock_usec_t usecs = 0;
+    clock_get_calendar_microtime(&secs, &usecs);
+    const uint64_t at = uint64_t(secs) - (ago_us + 500000) / 1000000;
+    const uint32_t day = uint32_t(at % 86400);
+    snprintf(out, size, "%02u:%02u:%02u", day / 3600, day / 60 % 60, day % 60);
+}
+// take20: the same to the millisecond ("12:29:41.375"), for oneios-frames.
+void clockTextMs(char *out, size_t size, uint64_t ago_us)
+{
+    clock_sec_t secs = 0;
+    clock_usec_t usecs = 0;
+    clock_get_calendar_microtime(&secs, &usecs);
+    const uint64_t nowUsDay = uint64_t(secs) * 1000000ull + usecs;
+    const uint64_t at = nowUsDay > ago_us ? nowUsDay - ago_us : 0;
+    const uint32_t day = uint32_t(at / 1000000ull % 86400), ms = uint32_t(at / 1000ull % 1000);
+    snprintf(out, size, "%02u:%02u:%02u.%03u", day / 3600, day / 60 % 60, day % 60, ms);
+}
+const char *levelName(uint32_t level)
+{
+    static const char *const names[4] = {"normal", "warning", "urgent", "critical"};
+    return level < 4 ? names[level] : "?";
+}
+
+// The GPU addresses a context has. Droid-VM's renderer gives every context a slice of its one range (crosvm.log: `VA
+// slices: 64 x 2GB over VBO 0x2000000000`) and tells the context's Turnip by GET_PARAM in the context's own ring, which
+// the kernel does not read: the kernel sees the DRM capset, and that names the whole range (128 GiB on this phone:
+// `va_start=0x40001e8000 va_size=0x2000000000`). So a context's part is a figure here: 2048 MiB, the slice of the
+// phone's crosvm f7c6ce8, or oneios-gpu-room-mib=N for a renderer that cuts another (its `VA slices` line says it);
+// never more than the capset's range. The capset's range is kept as first seen (under the 3D half's clients lock)
+// and said once.
+uint64_t deviceStart;
+volatile uint64_t deviceSize;
+uint32_t roomMiB = 2048;
+uint64_t room()
+{
+    const uint64_t figure = uint64_t(roomMiB) << 20, device = deviceSize;
+    return device && device < figure ? device : figure;
+}
+
+// The gaps the swap path found (the display's frame lock is held there: it stores, the sampler prints).
+struct Gap { uint64_t gap, at, before; };
+Gap gaps[8];
+volatile uint32_t gapHead;
+uint64_t beforeUs;                     // the swap path's own: the gap before this one
+volatile uint64_t lastSwapUs, swapCount;
+uint32_t leastMs = 150;
+// take20 (watch.h): the gaps oneios-frames counts (the swap path's: one writer, under the display's frame lock), and the
+// switch of the frames and wake lines (oneios-frames=0: neither).
+volatile uint64_t framesCount[3], framesHead;
+oneios_frame_gap framesRing[ONEIOS_FRAMES_RING];
+uint32_t framesOn = 1;
+
+// The surface locks of the video decoders (oneios_gpu_surface_lock, the locking process's thread).
+volatile uint64_t decoderLocks[2];     // videocodecd, mediaplaybackd
+
+// The sampler's own cost, for the 10 s report's oneios-clock line: its walks of the process list, the CPU time they
+// took (the thread's own, which is the cost), the time from each walk's start to its end (longer when the thread
+// waited for a CPU) and the longest of those.
+volatile uint64_t walks, walkUs, walkMostUs, walkCpuUs;
+
+// The sampler's walk: each process's CPU time since the tick before (its own table, so that the 10 s report's is not
+// disturbed). A process first seen counts from its next tick. The time is the task's own sum (recount_task_times: a
+// few words read, no lock): TASK_POWER_INFO, which the 10 s report asks, takes the task's lock and each of its
+// threads' at splsched, and this walk is ten a second.
+struct Seen { int pid; uint64_t mach; };
+Seen seen[4096];
+int visit(proc_t p, void *arg)
+{
+    oneios_watch_tick &t = *static_cast<oneios_watch_tick *>(arg);
+    task_t task = proc_task(p);
+    const int pid = proc_pid(p);
+    if (!task || pid < 0) return 0;
+    const struct recount_times_mach times = recount_task_times(task);
+    const uint64_t now = times.rtm_user + times.rtm_system;
+    Seen &e = seen[unsigned(pid) % 4096];
+    const uint64_t used = e.pid == pid && now >= e.mach ? now - e.mach : 0;
+    e.pid = pid;
+    e.mach = now;
+    if (!used) return 0;
+    uint64_t ns = 0;
+    absolutetime_to_nanoseconds(used, &ns);
+    const uint32_t us = ns / 1000 > 0xffffffffull ? 0xffffffffu : uint32_t(ns / 1000);
+    t.all_us += us;
+    if (us >= 500) oneios_watch_put(t.procs, &t.count, pid, proc_best_name(p), us);
+    return 0;   // PROC_RETURNED
+}
+
+uint32_t hitches, hitchesUnprinted;
+void hitch(const oneios_watch_tick *ring, uint64_t head, const Gap &g, uint64_t now)
+{
+    static uint32_t inWindow;
+    static uint64_t windowAt;
+    hitches++;
+    if (g.at - windowAt > 10000000) { windowAt = g.at; inWindow = 0; }
+    // take19: 2000 a boot (take18 used its 400 by 06:51, 25 minutes in: the last closes had no line)
+    if (inWindow++ >= 6 || hitches > 2000) { hitchesUnprinted++; return; }
+    oneios_watch_sum sum;
+    oneios_watch_sum_window(ring, head, g.at - g.gap, g.at + 100000, &sum);
+    char when[12], text[160];
+    clockText(when, sizeof when, now > g.at ? now - g.at : 0);
+    size_t at = 0;
+    text[0] = 0;
+    for (uint32_t i = 0; i < sum.count && i < ONEIOS_WATCH_SHOWN && sum.procs[i].us >= 1000 && at < 120; i++)
+        at += size_t(snprintf(text + at, sizeof text - at, "%s%.16s[%d] %u ms", at ? ", " : "", sum.procs[i].name, sum.procs[i].pid, sum.procs[i].us / 1000));
+    const int kind = oneios_hitch_kind(&sum, g.gap);
+    // two lines, each made here and under the console's 255 bytes a line (a longer one is cut and loses its end)
+    char line[250];
+    snprintf(line, sizeof line, "oneios-hitch: %s: %llu ms without a swap (the one before came after %llu ms); %s (all %llu ms of CPU in "
+             "%llu ms of ticks); the GPU: apps +%u submits, the render server +%u, blobs +%u; hitch %u (%u not printed)", when, g.gap / 1000,
+             g.before / 1000, kind == 2 ? "one process busy" : kind == 1 ? "the CPUs busy" : "nothing busy", sum.all_us / 1000,
+             sum.span_us / 1000, sum.app_submits, sum.rs_submits, sum.blobs, hitches, hitchesUnprinted);
+    IOLog("%s\n", line);
+    // take20: the blobs whose CREATE_BLOB took the device 8 ms or more, on the second line (at most 242 bytes with it): the first
+    // line is take19's, whose worst case already fills line[] (249 bytes with 4-digit counts and a 6-digit "came after")
+    char slow[48] = "";
+    if (sum.slow_blobs) snprintf(slow, sizeof slow, "; slow blobs (8 ms or more) +%u", sum.slow_blobs);
+    IOLog("oneios-hitch: %s: the busiest in it: %s%s\n", when, at ? text : "none over 1 ms", slow);
+}
+
+// Once a second: each client's room, the pressure level, and the decoders' second.
+void second(uint64_t now, uint64_t swaps)
+{
+    static uint64_t roomWas[64], roomMost[64], locksWas[2], swapsWas;
+    static uint32_t roomLines, levelWas, videoTail, videoLines;
+    static bool deviceSaid;
+    char when[12];
+    clockText(when, sizeof when, 0);
+    // the device's range, said once, by the sampler rather than under the 3D half's lock
+    if (!deviceSaid && deviceSize) {
+        deviceSaid = true;
+        IOLog("oneios-gpu-room: %s: the device has %llu MiB of GPU addresses from %#llx (the DRM capset); a context's part is taken as "
+              "%llu MiB (oneios-gpu-room-mib)\n", when, deviceSize >> 20, deviceStart, room() >> 20);
+    }
+    uint64_t compositor[3] = {};   // the render server's own bytes, wired bytes, range
+    for (unsigned s = 0; s < 64; s++) {
+        const DroidVMClientMemory &c = droidvm_virtgpu_client_memory[s];
+        const uint64_t used = c.name[0] ? c.pageBytes + c.userBytes : 0, size = used ? room() : 0;
+        // take18: backboardd has a slot (a context, its own range) per connection, most of them small or empty, and the last
+        // one named it used to win: take17's 219 lines all said "backboardd GPU 0+0 of 0 MiB" while the room lines had its
+        // main context at 1844 to 1910 MiB. The render server's largest context is the one against its range.
+        if (!strncmp(c.name, "backboardd", sizeof c.name) && used >= compositor[0] + compositor[1]) {
+            compositor[0] = c.pageBytes; compositor[1] = c.userBytes; compositor[2] = size;
+        }
+        if (used > roomMost[s] || !used) roomMost[s] = used;
+        const int event = oneios_room_event(roomWas[s], used, size);
+        if (event && roomLines < 300) {
+            roomLines++;
+            if (event == 1)
+                IOLog("oneios-gpu-room: %s: %.16s passed 90 %% of its GPU addresses: %llu -> %llu of %llu MiB (most %llu)\n", when, c.name,
+                      roomWas[s] >> 20, used >> 20, size >> 20, roomMost[s] >> 20);
+            else
+                IOLog("oneios-gpu-room: %s: %.16s let go of %llu MiB: %llu -> %llu of %llu MiB\n", when, c.name, (roomWas[s] - used) >> 20,
+                      roomWas[s] >> 20, used >> 20, size >> 20);
+        }
+        roomWas[s] = used;
+    }
+    const uint32_t level = oneios_memory_pressure_level ? oneios_memory_pressure_level() : 0;
+    const uint32_t available = oneios_memory_available_mib ? oneios_memory_available_mib() : 0;
+    if (level != levelWas) {
+        IOLog("oneios-pressure: %s: %s -> %s; available %u MiB\n", when, levelName(levelWas), levelName(level), available);
+        levelWas = level;
+    }
+    const uint64_t locks[2] = {decoderLocks[0], decoderLocks[1]}, d[2] = {locks[0] - locksWas[0], locks[1] - locksWas[1]};
+    locksWas[0] = locks[0];
+    locksWas[1] = locks[1];
+    if (d[0] + d[1]) videoTail = 6;
+    if (videoTail && videoLines < 1500) {
+        videoTail--;
+        videoLines++;
+        IOLog("oneios-video: %s: decoder locks +%llu (videocodecd +%llu, mediaplaybackd +%llu), swaps +%llu; backboardd GPU %llu+%llu of %llu MiB "
+              "(%u %%); available %u MiB, pressure %s\n", when, d[0] + d[1], d[0], d[1], swaps - swapsWas, compositor[0] >> 20, compositor[1] >> 20,
+              compositor[2] >> 20, oneios_room_percent(compositor[0] + compositor[1], compositor[2]), available, levelName(level));
+    }
+    swapsWas = swaps;
+    (void)now;
+}
+
+// The 10 s report's line: every client that holds a tenth of its range or more, in lines of at most ~200 bytes.
+void reportRooms()
+{
+    char text[200];
+    size_t at = 0;
+    for (unsigned s = 0; s < 64; s++) {
+        const DroidVMClientMemory &c = droidvm_virtgpu_client_memory[s];
+        const uint64_t used = c.name[0] ? c.pageBytes + c.userBytes : 0, size = used ? room() : 0;
+        if (!size || used * 10 < size) continue;
+        char one[72];
+        const int n = snprintf(one, sizeof one, "%.16s %llu of %llu MiB (%u %%)", c.name, used >> 20, size >> 20, oneios_room_percent(used, size));
+        if (at && at + 2 + size_t(n) >= sizeof text) {
+            IOLog("oneios-gpu-room: %s\n", text);
+            at = 0;
+        }
+        at += size_t(snprintf(text + at, sizeof text - at, "%s%s", at ? ", " : "", one));
+    }
+    if (at) IOLog("oneios-gpu-room: %s\n", text);
+}
+
+// take20: the 10 s report's oneios-frames line (watch.h): the round's gaps of 25 ms up to the hitch lines' least right after
+// frames, by class, and the longest three with their time of day. Nothing when the round had none.
+void reportFrames(uint32_t every)
+{
+    static uint64_t countsWas[3], taken;
+    if (!framesOn) return;
+    const uint64_t have = __atomic_load_n(&framesHead, __ATOMIC_ACQUIRE);
+    const uint64_t c[3] = {framesCount[0], framesCount[1], framesCount[2]};
+    const uint64_t d[3] = {c[0] - countsWas[0], c[1] - countsWas[1], c[2] - countsWas[2]};
+    memcpy(countsWas, c, sizeof c);
+    if (!d[0] && !d[1] && !d[2]) { taken = have; return; }
+    oneios_frame_gap top[ONEIOS_FRAMES_KEPT];
+    oneios_frames_longest(framesRing, taken, have, top);
+    taken = have;
+    const uint64_t now = nowUs();
+    char text[3][32];
+    for (unsigned i = 0; i < ONEIOS_FRAMES_KEPT; i++) {
+        text[i][0] = 0;
+        if (!top[i].gap_us) continue;
+        char when[16];
+        clockTextMs(when, sizeof when, now > top[i].at_us ? now - top[i].at_us : 0);
+        snprintf(text[i], sizeof text[i], "%s%llu ms at %s", i ? ", " : "", top[i].gap_us / 1000, when);
+    }
+    IOLog("oneios-frames: %u s: gaps right after frames of 25-50/50-100/100-%u ms +%llu/+%llu/+%llu; the longest: %s%s%s\n", every,
+          leastMs ? leastMs : 150, d[0], d[1], d[2], text[0], text[1], text[2]);
+}
+
+void run(void *, wait_result_t)
+{
+    static oneios_watch_tick ring[ONEIOS_WATCH_TICKS];   // 26 KiB: not a kernel stack's
+    static uint64_t submitsWas[64];
+    uint64_t head = 0, blobsWas = droidvm_virtgpu_stats[2], secondAt = nowUs();
+    // take20: CREATE_BLOB commands whose device leg took 8 ms or more (the transport's buckets <16384 us, <32768 us, more)
+    auto slowBlobs = []() -> uint32_t {
+        return droidvm_virtio_gpu_legs[1][0][9] + droidvm_virtio_gpu_legs[1][0][10] + droidvm_virtio_gpu_legs[1][0][11];
+    };
+    uint32_t slowWas = slowBlobs();
+    uint32_t taken = gapHead;
+    for (;;) {
+        // every 100 ms while swaps come or a gap waits for its tick, every second otherwise
+        const bool busy = nowUs() - lastSwapUs < 3000000 || taken != gapHead;
+        IOSleep(busy ? 100 : 1000);
+        oneios_watch_tick &t = ring[head % ONEIOS_WATCH_TICKS];
+        memset(&t, 0, sizeof t);
+        const uint64_t began = nowUs(), cpuBegan = thread_get_runtime_self();
+        // PROC_NOWAITTRANS: without it proc_iterate waits for each process that is in an exec (proc_transwait), and
+        // a tick was as late as the exec was long (on the PC's bench a walk took 8.9 s of which 1.4 ms on a CPU). The
+        // visit reads the task's time sums and the name only; a process's task is its proc's own memory.
+        proc_iterate(1 /* PROC_ALLPROCLIST */ | 4 /* PROC_NOWAITTRANS */, visit, &t, nullptr, nullptr);
+        t.at_us = nowUs();
+        uint64_t cpuNs = 0;
+        absolutetime_to_nanoseconds(thread_get_runtime_self() - cpuBegan, &cpuNs);
+        walks = walks + 1;
+        walkCpuUs = walkCpuUs + cpuNs / 1000;
+        walkUs = walkUs + (t.at_us - began);
+        if (t.at_us - began > walkMostUs) walkMostUs = t.at_us - began;
+        for (unsigned s = 0; s < 64; s++) {
+            const uint64_t n = __atomic_load_n(&trail::slots[s].submits, __ATOMIC_RELAXED), made = n - submitsWas[s];
+            submitsWas[s] = n;
+            if (!made || !head) continue;   // the first tick's are since boot
+            if (!strncmp(droidvm_virtgpu_client_memory[s].name, "backboardd", sizeof droidvm_virtgpu_client_memory[s].name)) t.rs_submits += uint32_t(made);
+            else t.app_submits += uint32_t(made);
+        }
+        const uint64_t blobsNow = droidvm_virtgpu_stats[2];
+        t.blobs = uint32_t(blobsNow - blobsWas);
+        const uint32_t slowNow = slowBlobs();
+        t.slow_blobs = slowNow - slowWas;
+        slowWas = slowNow;
+        blobsWas = blobsNow;
+        head++;
+        // the gaps whose end is a tick old: their lines (those overwritten in the ring meanwhile are only counted)
+        for (uint32_t have = __atomic_load_n(&gapHead, __ATOMIC_ACQUIRE); taken != have;) {   // pairs with the swap path's release store
+            if (have - taken > 8) { hitches += have - taken - 8; hitchesUnprinted += have - taken - 8; taken = have - 8; }
+            const Gap g = gaps[taken % 8];
+            if (t.at_us < g.at + 100000) break;
+            taken++;
+            hitch(ring, head, g, t.at_us);
+        }
+        // take20: a complete wake (watch.h's oneios-wake), once; the next one can begin after it
+        if (__atomic_load_n(&wakes::active, __ATOMIC_ACQUIRE) && oneios_wake_complete(&wakes::wake, t.at_us)) {
+            const oneios_wake &w = wakes::wake;
+            char when[12], gapsText[80], legsText[80];
+            clockText(when, sizeof when, t.at_us > w.at_us ? t.at_us - w.at_us : 0);
+            const uint32_t legs = w.legs < ONEIOS_WAKE_FRAMES ? w.legs : ONEIOS_WAKE_FRAMES;
+            oneios_wake_list(gapsText, sizeof gapsText, w.gap_us, w.gaps);
+            oneios_wake_list(legsText, sizeof legsText, w.leg_us, legs);
+            IOLog("oneios-wake: %s: after %llu.%llu s without a swap: the next swaps %s ms apart; the render server's next fenced frames "
+                  "%s ms on the host\n", when, w.rest_us / 1000000, w.rest_us / 100000 % 10, gapsText, legsText);
+            wakes::lines = wakes::lines + 1;
+            __atomic_store_n(&wakes::active, 0, __ATOMIC_RELEASE);
+        }
+        if (t.at_us - secondAt >= 1000000) {
+            second(t.at_us, swapCount);
+            secondAt = t.at_us;
+        }
+    }
+}
+
+void start()
+{
+    uint32_t on = 1;
+    PE_parse_boot_argn("oneios-watch", &on, sizeof on);
+    PE_parse_boot_argn("oneios-frames", &framesOn, sizeof framesOn);
+    PE_parse_boot_argn("oneios-hitch-ms", &leastMs, sizeof leastMs);
+    PE_parse_boot_argn("oneios-gpu-room-mib", &roomMiB, sizeof roomMiB);
+    if (!roomMiB) roomMiB = 2048;
+    if (!on) { leastMs = 0; return; }
+    thread_t thread = nullptr;
+    if (kernel_thread_start(run, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
+}
+}  // namespace watch
+
+extern "C" void oneios_gpu_capset_seen(uint32_t, uint64_t start, uint64_t size)
+{
+    using namespace watch;
+    if (!size || deviceSize) return;
+    deviceStart = start;
+    deviceSize = size;        // last: the sampler takes the start once the size is set
+}
+
+extern "C" void oneios_gpu_swap_gap(uint64_t gap, uint64_t now)
+{
+    using namespace watch;
+    const uint64_t before = beforeUs;
+    beforeUs = gap;
+    lastSwapUs = now;
+    swapCount = swapCount + 1;
+    if (framesOn) {
+        // take20: oneios-frames (the 10 s report prints it) and oneios-wake (the sampler prints it)
+        if (oneios_frames_is(gap, before, uint64_t(leastMs) * 1000)) {
+            framesCount[oneios_frames_class(gap)] = framesCount[oneios_frames_class(gap)] + 1;
+            const uint64_t f = framesHead;
+            framesRing[f % ONEIOS_FRAMES_RING] = {gap, now};
+            __atomic_store_n(&framesHead, f + 1, __ATOMIC_RELEASE);   // pairs with reportFrames' acquire load
+        }
+        oneios_wake &w = wakes::wake;
+        if (__atomic_load_n(&wakes::active, __ATOMIC_ACQUIRE)) {
+            if (w.gaps < ONEIOS_WAKE_FRAMES) {
+                w.gap_us[w.gaps] = gap > 0xffffffffull ? 0xffffffffu : uint32_t(gap);
+                w.gaps = w.gaps + 1;
+            }
+        } else if (oneios_wake_is(gap) && wakes::lines < 300) {
+            memset(&w, 0, sizeof w);
+            w.at_us = now;
+            w.rest_us = gap;
+            __atomic_store_n(&wakes::active, 1, __ATOMIC_RELEASE);   // the fence path's legs and the sampler from here on
+        }
+    }
+    if (!oneios_hitch_is(gap, before, uint64_t(leastMs) * 1000)) return;
+    const uint32_t h = gapHead;
+    gaps[h % 8] = {gap, now, before};
+    __atomic_store_n(&gapHead, h + 1, __ATOMIC_RELEASE);
+}
+
 namespace {
 void report(void *, wait_result_t)
 {
@@ -970,7 +1643,24 @@ void report(void *, wait_result_t)
     uint64_t was[8] = {}, fences[3] = {}, hist[10] = {}, closed[2] = {}, live[4] = {}, askedBefore = 0;
     for (uint32_t round = 1;; round++) {
         IOSleep(every * 1000);
-        cpu::report(every, round);
+        {   // take17: the round's time of day (UTC) and the seconds since boot, for the phone's own logs, and what the
+            // sampler (watch::run) cost in the round: its walks of the process list and the time they took
+            static uint64_t walksWas, walkUsWas, walkCpuWas;
+            char when[12];
+            watch::clockText(when, sizeof when, 0);
+            const uint64_t walks = watch::walks, us = watch::walkUs, most = watch::walkMostUs, cpu = watch::walkCpuUs;
+            watch::walkMostUs = 0;
+            IOLog("oneios-clock: %s UTC, up %llu s, round %u; the sampler: %llu walks, %llu us of CPU, %llu ms from start to end (the "
+                  "longest %llu us)\n", when, watch::nowUs() / 1000000, round, walks - walksWas, cpu - walkCpuWas, (us - walkUsWas) / 1000,
+                  most);
+            walksWas = walks;
+            walkUsWas = us;
+            walkCpuWas = cpu;
+        }
+        const uint32_t measured = cpu::report(every, round);   // a stall's window is longer than the nominal one
+        if (oneios_memory_report) oneios_memory_report(measured);
+        if (oneios_disk_report) oneios_disk_report(measured);
+        cpu::costs(measured);
         uint64_t now[8], rs[3], h[10], cl[3], lv[4];
         for (unsigned i = 0; i < 8; i++) now[i] = droidvm_virtgpu_stats[i];
         for (unsigned i = 0; i < 3; i++) rs[i] = droidvm_virtgpu_rs_fences[i];
@@ -1022,9 +1712,15 @@ void report(void *, wait_result_t)
             // closed ones held (blobs:: above).
             static uint64_t wasMade[64], wasGone[64];
             blobs::print(wasMade, wasGone);
+            // Each client's blobs against the GPU address range its capset named, from a tenth of it on (watch:: above).
+            watch::reportRooms();
         }
         // Where the clients' IOSurface drawing goes (trail:: above): only what changed since the last report.
         trail::print(every);
+        // take20: the round's stutters under the hitch lines, with the time of the longest (watch:: above, watch.h).
+        watch::reportFrames(every);
+        // The stages of the render server's submissions, the transport's waits and the swaps' pace (stages:: above).
+        stages::report(every);
         // Who asked for a Metal device (read MetalPluginName), when that changed: with the clients line, a process that
         // asked and holds no GPU memory had its device refused or made none (its reason: the oneios-gpu-text lines).
         uint64_t asked = 0;
@@ -1065,6 +1761,7 @@ void oneios_adreno_start(void)
         // where iOS draws with them (the native kernel on QEMU, a host with no 3D); its GPU lines stay quiet without work.
         thread_t reporter = nullptr;
         if (kernel_thread_start(report, nullptr, &reporter) == KERN_SUCCESS) thread_deallocate(reporter);
+        watch::start();   // take17: the event lines (a hitch needs only the display's swaps)
         return;
     }
     oneios_adreno_stage = 2;
@@ -1075,4 +1772,44 @@ void oneios_adreno_start(void)
     if (test && kernel_thread_start(selftest, nullptr, &thread) == KERN_SUCCESS) thread_deallocate(thread);
     thread_t reporter = nullptr;
     if (kernel_thread_start(report, nullptr, &reporter) == KERN_SUCCESS) thread_deallocate(reporter);
+    watch::start();   // take17: the event lines (watch:: above)
+}
+
+// ---- take20: the render server's read wait and the writers it gave up on (staged/gpu.rs GPU3D_READ_WAIT)
+// take19's second session (-loggpu): for 2.5 minutes after the notification panel closed, every frame of backboardd waited the
+// whole 100 ms (droidvm_surface_read_wait_ms) for a writer whose ticket never ended, and gave up (oneios-gpu-sync `reads that
+// waited for writers +97, gave up +97`): the Home screen drew 10 frames a second while the finger moved. DroidVMVirtioGpu3D.cpp's
+// awaitWriters now, once a wait gave up, marks those writers' uses not written (staleWriters), so no read waits for them again;
+// their tickets end as before when their command buffers complete. A writer is said once (the first 64 of a boot):
+//   oneios-gpu-sync: WidgetRenderer_[pid]'s GPU write of surface 0x2f (ticket 9123) never ended: the render server waited
+//     100 ms for it and gave up; no longer waited for
+// and counted on a sync line of its own (`oneios-gpu-sync: 10 s: writers the render server's read wait gave up on, no longer waited
+// for: +N (M since the boot)`). CPU locks still wait for such a writer. oneios-read-wait-stale=0: as before (every read waits).
+extern "C" {
+volatile uint64_t oneios_gpu_read_wait_stale_count;
+extern volatile uint32_t droidvm_surface_read_wait_ms;   // DroidVMVirtioGpu3D.cpp: the read wait's most (100 ms)
+void proc_name(int pid, char *buf, int size);            // sys/proc.h
+}
+
+extern "C" bool oneios_gpu_read_wait_stale_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        uint32_t value = 1;
+        PE_parse_boot_argn("oneios-read-wait-stale", &value, sizeof value);
+        on = value ? 1 : 0;
+    }
+    return on == 1;
+}
+
+// Under the tunnel's surface lock (an IOLock: IOLog is allowed), from the render server's submitting thread.
+extern "C" void oneios_gpu_read_wait_stale(uint32_t surface, int pid, uint64_t ticket)
+{
+    const uint64_t n = oneios_gpu_read_wait_stale_count;
+    oneios_gpu_read_wait_stale_count = n + 1;
+    if (n >= 64) return;
+    char name[24] = {};
+    proc_name(pid, name, sizeof name);
+    IOLog("oneios-gpu-sync: %.20s[%d]'s GPU write of surface 0x%x (ticket %llu) never ended: the render server waited %u ms for it and "
+          "gave up; no longer waited for\n", name[0] ? name : "?", pid, surface, ticket, droidvm_surface_read_wait_ms);
 }
