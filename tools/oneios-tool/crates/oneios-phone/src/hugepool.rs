@@ -25,6 +25,11 @@ use std::time::{Duration, Instant};
 
 /// The module's folder on the phone, its parameters, and its name.
 pub const DIR: &str = "/data/local/tmp/oneios-hugepool";
+/// take23: the least `hugepool load --system-reserve-mb` takes. Not what Android needs (vm-boot's --host-keep-mib asks that
+/// at each boot, after One UI's stop): only the bound of the module's table.
+pub const RESERVE_MIN_MB: u32 = 2048;
+/// take23: the most pool pages a want may ask for (4096 = 8 GiB; 3072 before).
+pub const WANT_MAX: u32 = 4096;
 pub const PARAMS: &str = "/sys/module/gh_hugepage_reserve/parameters";
 pub const KO: &str = "/data/local/tmp/oneios-hugepool/gh_hugepage_reserve.ko";
 /// take18's alternative module on the PC (`hugepool load --samfor12`; scripts/hugepage/build.sh WORK samfor12): samfor12's
@@ -70,7 +75,18 @@ pub fn pageblock_order(pagetypeinfo: &str) -> Option<u32> {
 /// -1 for its block order and computes its block size S as `1u << (-1 - 9)` (crash 1, 2026-11-23: a NULL slot in
 /// `gh_try_complete_block`, 4 Mi siblings scanned into a hole GB). Its own load.sh always passes it.
 pub fn insmod_line(want: u32, pb_order: u32, disable_kapi: &str) -> String {
+    insmod_line_with(want, pb_order, disable_kapi, None)
+}
+
+/// take23: the most pool pages the module's table can hold is set at insmod and never after (its system_reserve_mb, 0400):
+/// (RAM - min(RAM / 2, system_reserve_mb)) / 2 MiB, and the module's own 6144 MiB leave the S25 Ultra's 11 GiB a table of
+/// about 2500 pages (5 GiB): the "2560 pages" no session got past. `reserve_mb` (hugepool load --system-reserve-mb) is that
+/// parameter; None: the module's own. It bounds what the pool MAY take, not what it takes (pool_want and the acquire do).
+pub fn insmod_line_with(want: u32, pb_order: u32, disable_kapi: &str, reserve_mb: Option<u32>) -> String {
     let mut s = format!("insmod {KO} pool_want={want} pageblock_order_val={pb_order} migrate_cma_val=-1 pool_want_with_cma=0");
+    if let Some(mb) = reserve_mb {
+        s += &format!(" system_reserve_mb={mb}");
+    }
     if !disable_kapi.is_empty() {
         s += &format!(" disable_kapi={disable_kapi}");
     }
@@ -93,10 +109,18 @@ pub fn status(adb: &Adb) -> Result<()> {
 
 /// `phone hugepool load`.
 pub fn load(adb: &Adb, ko: &str, kapi_check: &str, want: u32, out: &str) -> Result<()> {
+    load_with(adb, ko, kapi_check, want, out, None)
+}
+
+/// `phone hugepool load --system-reserve-mb N` (insmod_line_with).
+pub fn load_with(adb: &Adb, ko: &str, kapi_check: &str, want: u32, out: &str, reserve_mb: Option<u32>) -> Result<()> {
+    if reserve_mb.is_some_and(|mb| !(RESERVE_MIN_MB..=6144).contains(&mb)) {
+        bail!("--system-reserve-mb: {RESERVE_MIN_MB} to 6144 MiB (the module's own is 6144; what Android keeps is asked again at each vm-boot, --host-keep-mib)");
+    }
     let data = fs::read(ko).with_context(|| format!("cannot read {ko} (scripts/hugepage/build.sh makes it)"))?;
     let sha = format!("{:x}", Sha256::digest(&data));
-    if want == 0 || want > 3072 {
-        bail!("--want {want}: 1 to 3072 pages of 2 MiB");
+    if want == 0 || want > WANT_MAX {
+        bail!("--want {want}: 1 to {WANT_MAX} pages of 2 MiB");
     }
     adb.need_root()?;
     adb.refuse_in_session()?;
@@ -130,7 +154,7 @@ pub fn load(adb: &Adb, ko: &str, kapi_check: &str, want: u32, out: &str) -> Resu
     if pb != 9 {
         bail!("the phone's page block order is {pb}, not 9: not loading the module");
     }
-    let line = insmod_line(want, pb, &disable);
+    let line = insmod_line_with(want, pb, &disable, reserve_mb);
     println!("load: {} bytes, sha256 {sha}; {line}", data.len());
     let script = format!(
         "got=$(sha256sum {KO} | cut -d' ' -f1); [ \"$got\" = \"{sha}\" ] || {{ echo \"sha256 $got, not {sha}\"; exit 1; }}\n\
@@ -362,8 +386,8 @@ start_ui "the pool is grown"
 
 /// `phone hugepool grow`.
 pub fn grow(adb: &Adb, want: u32, mode: u32, limit: u32, out: &str) -> Result<()> {
-    if want == 0 || want > 3072 || !(2..=3).contains(&mode) || !(90..=600).contains(&limit) {
-        bail!("--want 1..3072, --mode 2 or 3, --limit 90..600");
+    if want == 0 || want > WANT_MAX || !(2..=3).contains(&mode) || !(90..=600).contains(&limit) {
+        bail!("--want 1..{WANT_MAX}, --mode 2 or 3, --limit 90..600");
     }
     adb.need_root()?;
     adb.refuse_in_session()?;
@@ -445,8 +469,8 @@ pub fn acquire_script(want: Option<u32>, mode: u32, seconds: u32) -> String {
 
 /// `phone hugepool acquire`: the module's own acquire beside One UI (nothing stopped).
 pub fn acquire(adb: &Adb, want: Option<u32>, mode: u32, seconds: u32) -> Result<()> {
-    if !(1..=3).contains(&mode) || want.is_some_and(|w| w == 0 || w > 3072) || !(5..=600).contains(&seconds) {
-        bail!("--mode 1..3, --want 1..3072, --seconds 5..600");
+    if !(1..=3).contains(&mode) || want.is_some_and(|w| w == 0 || w > WANT_MAX) || !(5..=600).contains(&seconds) {
+        bail!("--mode 1..3, --want 1..{WANT_MAX}, --seconds 5..600");
     }
     adb.need_root()?;
     adb.refuse_in_session()?;

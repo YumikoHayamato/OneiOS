@@ -141,11 +141,14 @@ typedef struct {
   // The MEMCLASS group's device-perf-memory-class: Apple's value is 12 for an iPhone18,2 (read as the device's RAM in GiB, which
   // is not verified) and a VM has less. vm_ram_mib is the VM's RAM (xnuloader-crosvm --ram-mib; not dram_size, the kernel's
   // window, which is the RAM less the boot region and the pool): the class is its whole GiB, at least 2 and at most Apple's own,
-  // written as an integer of the width Apple's property has. memory_class (xnuloader-crosvm --memory-class) is the class itself,
+  // written as an integer of the width Apple's property has (take23: xl_machine_memory_class_of, CoreUI's classes). memory_class (xnuloader-crosvm --memory-class) is the class itself,
   // 1 to Apple's own (xl_machine_memory_class_max), written even where the source has no such property; refused without the
   // MEMCLASS group. 0: not set. The group with neither set and a source that has the property is refused (Apple's 12 is not the
   // VM's); without the group vm_ram_mib is not read.
   uint32_t    vm_ram_mib, memory_class;
+  // take23: names of /product properties that an identity group that is on does NOT take (xnuloader-crosvm --identity-omit):
+  // a comma-separated list, NULL for none. A name that no group that is on would take is refused (a typing mistake is not silent).
+  const char *identity_omit;
   // /arm-io soc-generation, a string with its NUL: the SoC's generation as Apple's trees give it ("H18" for the iPhone18,2).
   // Nothing else of the SoC's identity is written (not arm-io's compatible, "arm-io,t8150", which Apple's kexts match).
   // 1 to 31 of A-Z a-z 0-9 . _ - ; NULL: no property (the tools write one only when told: xnuloader-crosvm --soc-generation).
@@ -221,6 +224,13 @@ bool xl_identity_groups_parse(const char *list, unsigned *groups, char *bad, siz
 // The most xl_machine.memory_class can be for the identity tree `identity`: its own /product device-perf-memory-class, 16 where
 // it has none (or none that is an integer of 1 to 65535).
 uint32_t xl_machine_memory_class_max(const xl_adt_node *identity);
+// take23: the memory class of a VM with `ram_mib` of RAM, at most `most`'s size: the largest of CoreUI's classes that is not more
+// than the RAM. The classes are CoreUI's own table (_gThemeMemoryPerformanceClasses, read in 24A446's shared cache at
+// 0x1e1555ca0: value, constant, name): 0 512MB, 1 1GB, 15 1.5GB, 2 2GB, 4 3GB, 3 4GB, 6 6GB, 8 8GB, 9 9GB, 12 12GB, 16 16GB.
+// The value is NOT the GiB: 3 is the 4 GB class and 4 the 3 GB one, and there is no 5, 7, 10 or 11.
+uint32_t xl_machine_memory_class_of(uint32_t ram_mib, uint32_t most);
+// The MiB of a class of that table; 0 for a value that is not in it.
+uint32_t xl_machine_memory_class_mib(uint32_t value);
 
 // A fresh volatile CHRP NVRAM bank for IODTNVRAM (8192 bytes written to `image`).
 void xl_nvram_proxy(uint8_t image[8192]);

@@ -887,7 +887,7 @@ static void test_identity_groups(void)
           CHECK(product_is_donors(t, dp, name));
       }
     CHECK(product_str(t, "graphics-featureset-fallbacks", "APPLE9:APPLE3v1:APPLE1:GLES2,0"));
-    CHECK(product_int(t, "device-perf-memory-class", 4) == 4);
+    CHECK(product_int(t, "device-perf-memory-class", 4) == 3);   // 4608 MiB: CoreUI's 4 GB class (take23)
     CHECK(product_str(t, "artwork-display-gamut", "P3") && product_int(t, "artwork-scale-factor", 4) == 2);
     CHECK(product_str(t, "product-name", "OneiOS guest") && product_str(t, "model", "oneios,xnuhost") &&
           product_str(t, "jetsam-properties-product-type", "V54"));
@@ -980,25 +980,28 @@ static void test_identity_groups(void)
     xl_adt_free(poor);
   }
 
-  // the memory class of the VM's RAM: its whole GiB, at least 2, at most Apple's own (12)
+  // the memory class of the VM's RAM (take23): the largest of CoreUI's classes its RAM holds, at most Apple's own (12). The value
+  // is CoreUI's, not the GiB: 4 is its 3 GB class, 3 its 4 GB one, 15 its 1.5 GB one, and there is no 5 or 7
   static const struct { uint32_t ram, expect; } scaled[] = {
-    { 512, 2 }, { 1023, 2 }, { 1024, 2 }, { 2048, 2 }, { 3072, 3 }, { 4096, 4 }, { 4352, 4 }, { 4608, 4 }, { 5120, 5 }, { 6144, 6 },
-    { 12288, 12 }, { 16384, 12 }, { 65536, 12 },
+    { 512, 0 }, { 1023, 0 }, { 1024, 1 }, { 1536, 15 }, { 2048, 2 }, { 3072, 4 }, { 4096, 3 }, { 4352, 3 }, { 4608, 3 }, { 5120, 3 },
+    { 5632, 3 }, { 6144, 6 }, { 6656, 6 }, { 7168, 6 }, { 8192, 8 }, { 9216, 9 }, { 12288, 12 }, { 16384, 12 }, { 65536, 12 },
   };
+  CHECK(xl_machine_memory_class_mib(3) == 4096 && xl_machine_memory_class_mib(4) == 3072 && xl_machine_memory_class_mib(0) == 512 &&
+        xl_machine_memory_class_mib(5) == 0 && xl_machine_memory_class_mib(7) == 0 && xl_machine_memory_class_mib(15) == 1536);
   machine_default(&m);
   for (unsigned i = 0; i < sizeof scaled / sizeof *scaled; i++) CHECK(class_for(&m, donor, scaled[i].ram, 4) == scaled[i].expect);
-  // where Apple's is smaller the tool's RAM can reach the upper clamp; a class of 1 wins over the least of 2; one that is 0 is none
+  // where Apple's is smaller the tool's RAM can reach the upper bound (by size); one that is 0 is none
   xl_adt_set_u32(dp, "device-perf-memory-class", 6);
-  CHECK(class_for(&m, donor, 8192, 4) == 6 && class_for(&m, donor, 4608, 4) == 4 && class_for(&m, donor, 512, 4) == 2);
+  CHECK(class_for(&m, donor, 8192, 4) == 6 && class_for(&m, donor, 4608, 4) == 3 && class_for(&m, donor, 512, 4) == 0);
   xl_adt_set_u32(dp, "device-perf-memory-class", 1);
-  CHECK(class_for(&m, donor, 4608, 4) == 1 && class_for(&m, donor, 512, 4) == 1);
+  CHECK(class_for(&m, donor, 4608, 4) == 1 && class_for(&m, donor, 512, 4) == 0);
   xl_adt_set_u32(dp, "device-perf-memory-class", 0);
-  CHECK(class_for(&m, donor, 4608, 4) == 4 && class_for(&m, donor, 65536, 4) == 16 && xl_machine_memory_class_max(donor) == 16);
+  CHECK(class_for(&m, donor, 4608, 4) == 3 && class_for(&m, donor, 65536, 4) == 16 && xl_machine_memory_class_max(donor) == 16);
   // written in the width Apple's property has (1, 2, 4 or 8 bytes); another width is refused
   static const uint8_t twelve[8] = { 12 };
   for (uint32_t w = 1; w <= 8; w *= 2) {
     xl_adt_set(dp, "device-perf-memory-class", twelve, w);
-    CHECK(class_for(&m, donor, 4608, w) == 4 && class_for(&m, donor, 65536, w) == 12 && xl_machine_memory_class_max(donor) == 12);
+    CHECK(class_for(&m, donor, 4608, w) == 3 && class_for(&m, donor, 65536, w) == 12 && xl_machine_memory_class_max(donor) == 12);
   }
   for (uint32_t w = 0; w <= 8; w += w == 0 ? 3 : 4) {          // 0, 3, 7 bytes
     xl_adt_set(dp, "device-perf-memory-class", twelve, w);

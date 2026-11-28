@@ -232,7 +232,7 @@ check 'artwork: the gamut is the machine'"'"'s, not the tree'"'"'s SRGB; no scal
 check 'quality: the values (0x64 is the letter d and two NULs for the dump)' sh -c '[ "$(grep -c "^    ui-.*-quality = \"d||\"\$" "$1")" -eq 2 ]' sh "$T/g_quality.tree.product"
 check 'workgroup: the values' sh -c 'grep -q "^    display-workgroup-interval = 0x1\$" "$1" && grep -q "^    hid-workgroup-interval = 0x1\$" "$1"' sh "$T/g_workgroup.tree.product"
 check 'ids: the values' sh -c 'grep -q "^    udid-version = 0x2\$" "$1" && grep -q "^    public-key-accelerator = 0x1\$" "$1" && grep -q "^    product-description = \"Fixture Phone 17\"\$" "$1"' sh "$T/g_ids.tree.product"
-check 'memclass: the class is the VM'"'"'s 3072 MiB, not the 12 GB device'"'"'s' grep -q '^    device-perf-memory-class = 0x3$' "$T/g_memclass.tree.product"
+check 'memclass: the class is the VM'"'"'s 3072 MiB (CoreUI'"'"'s 3 GB class is 4), not the 12 GB device'"'"'s' grep -q '^    device-perf-memory-class = 0x4$' "$T/g_memclass.tree.product"
 check 'root: target-type and the board name first in compatible, then the machine'"'"'s own; the model stays' sh -c \
   'grep -q "^  target-type = \"F1\"\$" "$1" && grep -q "^  compatible = \"F1AP|oneios,xnuhost\"\$" "$1" && grep -q "^  model = \"iPhone18,2\"\$" "$1"' sh "$T/g_root.tree.rest"
 check 'root: /product keeps its product-name and model' sh -c 'grep -q "^    product-name = \"OneiOS guest\"\$" "$1" && grep -q "^    model = \"oneios,xnuhost\"\$" "$1"' sh "$T/g_root.tree.product"
@@ -240,7 +240,7 @@ check 'the layout names the properties of the artwork group' grep -q 'identity g
 check 'the layout names the properties of the quality group' grep -q 'identity group quality (b): on: 2 from the tree (ui-background-quality ui-weather-quality)$' "$T/g_quality.txt"
 check 'the layout names the properties of the workgroup group' grep -q 'identity group workgroup (c): on: 2 from the tree (display-workgroup-interval hid-workgroup-interval)$' "$T/g_workgroup.txt"
 check 'the layout names the properties of the ids group' grep -q 'identity group ids (d): on: 3 from the tree (udid-version public-key-accelerator product-description)$' "$T/g_ids.txt"
-check 'the layout names the class of the memclass group' grep -q "identity group memclass (e): on: device-perf-memory-class 3 in 4 bytes (the VM's 3072 MiB: its whole GiB, from 2 to 12)$" "$T/g_memclass.txt"
+check 'the layout names the class of the memclass group' grep -q "identity group memclass (e): on: device-perf-memory-class 4 in 4 bytes (the VM's 3072 MiB: CoreUI's 3072 MiB class, the largest its RAM holds; Apple's own is 12)$" "$T/g_memclass.txt"
 check 'the layout names the root of the root group' grep -q 'identity group root (f): on: root target-type "F1", compatible "F1AP" then "oneios,xnuhost" (' "$T/g_root.txt"
 
 # all, and the union of groups: the properties of each, the tree of the roots'
@@ -263,9 +263,24 @@ check 'a later --identity-groups replaces the earlier one' cmp -s "$T/g_twice.tr
 
 # --memory-class N (the memclass group only): N itself, 1 to the tree's own (12); the VM's class is at least 2
 check 'an Image of 512 MiB with the memclass group' mk mc2 --identity-tree "$T/identity.adt" --identity-groups memclass
-check 'memory class: the class is at least 2' grep -q '^    device-perf-memory-class = 0x2$' "$T/mc2.tree.product"
+check 'memory class: 512 MiB are CoreUI'"'"'s class 0' grep -q '^    device-perf-memory-class = "|||"$' "$T/mc2.tree.product"   # four zero bytes, as xnuloader-inspect prints them
 check 'an Image of 4608 MiB with the memclass group' mk mc4 --ram-mib 4608 --identity-tree "$T/identity.adt" --identity-groups memclass
-check 'memory class: 4608 MiB are 4 whole GiB' grep -q '^    device-perf-memory-class = 0x4$' "$T/mc4.tree.product"
+check 'memory class: 4608 MiB are CoreUI'"'"'s 4 GB class, 3' grep -q '^    device-perf-memory-class = 0x3$' "$T/mc4.tree.product"
+# take23: CoreUI's table (machine.h xl_machine_memory_class_of): the sizes of the new boot order's Images
+for pair in 4352:3 5120:3 5632:3 6144:6 6656:6 7168:6 8192:8 2048:2 1536:f 1024:1 3072:4; do
+  check "an Image of ${pair%%:*} MiB with the memclass group" mk "mcr${pair%%:*}" --ram-mib "${pair%%:*}" --identity-tree "$T/identity.adt" --identity-groups memclass
+  check "memory class: ${pair%%:*} MiB give 0x${pair##*:}" grep -q "^    device-perf-memory-class = 0x${pair##*:}\$" "$T/mcr${pair%%:*}.tree.product"
+done
+# take23: --identity-omit and --display-gamut (the artwork group as the owner chose it: no featureset keys, the gamut sRGB)
+check 'an Image with the artwork group, the featureset keys left out, the gamut sRGB' mk g_art_omit --ram-mib 3072 --identity-tree "$T/identity.adt" --identity-groups artwork,memclass --identity-omit graphics-featureset-class,graphics-featureset-fallbacks --display-gamut sRGB
+check 'omit: no graphics-featureset key in /product' sh -c '! grep -q "graphics-featureset" "$1"' sh "$T/g_art_omit.tree.product"
+check 'omit: the other artwork keys are there' sh -c 'grep -q "artwork-device-idiom" "$1" && grep -q "artwork-device-subtype" "$1" && grep -q "artwork-dynamic-displaymode" "$1"' sh "$T/g_art_omit.tree.product"
+check 'gamut: sRGB is written' grep -q 'artwork-display-gamut = "sRGB"' "$T/g_art_omit.tree.product"
+check 'omit: the layout says what was left out' grep -q 'left out by --identity-omit where the group has them: graphics-featureset-class,graphics-featureset-fallbacks' "$T/g_art_omit.txt"
+refuse '--identity-omit without groups' '--identity-omit needs --identity-groups' --identity-tree "$T/identity.adt" --identity-omit graphics-featureset-class
+refuse '--identity-omit of a name no group that is on takes' 'is not a property of an identity group that is on' --identity-tree "$T/identity.adt" --identity-groups memclass --identity-omit graphics-featureset-class
+refuse '--display-gamut of another word' '--display-gamut: sRGB or P3' --identity-tree "$T/identity.adt" --identity-groups artwork --display-gamut Rec2020
+refuse '--display-gamut without the artwork group' '--display-gamut needs --identity-groups artwork' --identity-tree "$T/identity.adt" --identity-groups memclass --display-gamut sRGB
 check 'an Image with --memory-class 8' mk mc8 --ram-mib 3072 --identity-tree "$T/identity.adt" --identity-groups memclass --memory-class 8
 check 'memory class: N is written' grep -q '^    device-perf-memory-class = 0x8$' "$T/mc8.tree.product"
 check 'memory class: the layout says it is N' grep -q 'identity group memclass (e): on: device-perf-memory-class 8 in 4 bytes (--memory-class, 1 to 12)$' "$T/mc8.txt"

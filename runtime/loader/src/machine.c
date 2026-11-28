@@ -160,6 +160,40 @@ uint32_t xl_machine_memory_class_max(const xl_adt_node *identity)
   return class_max(product ? xl_adt_get(product, "device-perf-memory-class") : NULL);
 }
 
+// CoreUI's memory classes (machine.h xl_machine_memory_class_of), the largest first: the class's size in MiB and its value.
+static const struct { uint32_t mib, value; } memory_classes[] = {
+  { 16384, 16 }, { 12288, 12 }, { 9216, 9 }, { 8192, 8 }, { 6144, 6 }, { 4096, 3 }, { 3072, 4 }, { 2048, 2 }, { 1536, 15 }, { 1024, 1 }, { 0, 0 },
+};
+
+uint32_t xl_machine_memory_class_mib(uint32_t value)
+{
+  for (unsigned i = 0; i < sizeof memory_classes / sizeof memory_classes[0]; i++)
+    if (memory_classes[i].value == value) return memory_classes[i].mib ? memory_classes[i].mib : 512;
+  return 0;
+}
+
+uint32_t xl_machine_memory_class_of(uint32_t ram_mib, uint32_t most)
+{
+  // `most` (Apple's own class) bounds the size, not the number: a class the table does not hold bounds nothing
+  const uint32_t most_mib = xl_machine_memory_class_mib(most);
+  for (unsigned i = 0; i < sizeof memory_classes / sizeof memory_classes[0]; i++)
+    if (memory_classes[i].mib <= ram_mib && (!most_mib || memory_classes[i].mib <= most_mib)) return memory_classes[i].value;
+  return 0;
+}
+
+// Is `name` in the comma-separated list `list` (xl_machine.identity_omit)?
+static bool omitted(const char *list, const char *name)
+{
+  const size_t n = strlen(name);
+  for (const char *p = list; p && *p; ) {
+    const char *end = strchr(p, ',');
+    const size_t len = end ? (size_t)(end - p) : strlen(p);
+    if (len == n && !memcmp(p, name, n)) return true;
+    p = end ? end + 1 : p + len;
+  }
+  return false;
+}
+
 static void set_integer(xl_adt_node *node, const char *name, uint32_t width, uint64_t value)
 {
   uint8_t bytes[8];
@@ -201,11 +235,9 @@ static const char *copy_product(xl_adt_node *product, const xl_adt_prop *p, cons
   else if (!m->memory_class && !m->vm_ram_mib) return "the identity tree's device-perf-memory-class needs the VM's RAM size or a memory class";
   else {
     uint64_t value = m->memory_class;
-    if (!value) {
-      value = m->vm_ram_mib / 1024;                 // the whole GiB, at least 2, at most Apple's
-      if (value < 2) value = 2;
-      if (value > class_max(p)) value = class_max(p);
-    }
+    // take23: the largest of CoreUI's classes that the VM's RAM holds, at most Apple's (take19 wrote the whole GiB: 4 for
+    // 4608 MiB, which CoreUI's table reads as its 3 GB class, and 5 or 7, which it does not hold)
+    if (!value) value = xl_machine_memory_class_of(m->vm_ram_mib, class_max(p));
     set_integer(product, p->name, p->length, value);
   }
   return NULL;
@@ -297,6 +329,15 @@ xl_adt_node *xl_machine_tree(const xl_machine *m, const char **error)
   if ((groups & XL_IDENTITY_ROOT) && (!source_target || !source_target->length || !board_size))
     FAIL("the identity tree has no target-type or compatible for the root group");
   if (m->memory_class && !(groups & XL_IDENTITY_MEMCLASS)) FAIL("a memory class needs the identity group memclass");
+  for (const char *o = m->identity_omit; o && *o; ) {
+    char name[64];
+    const char *end = strchr(o, ',');
+    const size_t len = end ? (size_t)(end - o) : strlen(o);
+    if (!len || len >= sizeof name) FAIL("an --identity-omit name that is empty or too long");
+    memcpy(name, o, len); name[len] = 0;
+    if (!(groups & xl_identity_group_of(name))) FAIL("an --identity-omit name that no identity group that is on takes");
+    o = end ? end + 1 : o + len;
+  }
   if (m->memory_class && m->memory_class > xl_machine_memory_class_max(source))
     FAIL("the memory class: 1 to the identity's own (16 where it has none)");
   if (m->soc_generation && !xl_machine_soc_generation_ok(m->soc_generation))
@@ -485,6 +526,7 @@ xl_adt_node *xl_machine_tree(const xl_machine *m, const char **error)
     for (unsigned i = 0; from && i < from->nprops; i++) {
       const xl_adt_prop *p = &from->props[i];
       if (!(groups & xl_identity_group_of(p->name)) || (p->flags & 1)) continue;
+      if (omitted(m->identity_omit, p->name)) continue;   // take23: --identity-omit
       const char *why = copy_product(product, p, m);
       if (why) FAIL(why);
     }

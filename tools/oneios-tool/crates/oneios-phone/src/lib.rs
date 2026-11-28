@@ -12,6 +12,7 @@ pub mod cycle;
 pub mod droidvm;
 pub mod hostshare;
 pub mod hugepool;
+pub mod take23;
 pub mod hw;
 pub mod local;
 pub mod log;
@@ -338,6 +339,29 @@ pub enum Command {
         /// at the end, how often and how long it was held
         #[arg(long, value_name = "HZ", default_value_t = 0)]
         panel_rate_min: u32,
+        /// take23, with --takeover and a shared-RAM Image: the new boot order. The memory rule (--host-keep-mib left to
+        /// Android beside the VM) is asked AFTER One UI's stop and the cache drop, when the pool is filled, not before the
+        /// stop (where it refused an Image that fits once One UI is down). run.txt's `pick:` lines say what was found
+        #[arg(long)]
+        fill_after_stop: bool,
+        /// take23, repeatable; implies --fill-after-stop: Images of the same build with more RAM than --image. After One
+        /// UI's stop the VM runs the largest that fits (the module's table, --host-keep-mib, the pool's pages coming),
+        /// --image when none of them does. Each is pushed (146 MiB a file)
+        #[arg(long, value_name = "FILE")]
+        image_larger: Vec<String>,
+        /// take23, with --fill-after-stop: what Android keeps available beside the VM, MiB (the 1024 of the old rule; what
+        /// it really needs while the VM runs is in hostmem.txt from take23 on)
+        #[arg(long, value_name = "MIB", default_value_t = take23::KEEP_MIB)]
+        host_keep_mib: u32,
+        /// take23, with --takeover and take18's renderer: the clocks' orchestrator. The GPU's cap follows its load from 607 MHz
+        /// up (the renderer's floor held it at 1200 MHz for 67 % of take22b at 16 % busy) and the vCPUs' clamp follows the
+        /// guest's swaps on time (1024 down to 512). orch.txt; leave the flag out for the clocks as in take22
+        #[arg(long)]
+        orchestrator: bool,
+        /// take23, repeatable, with --orchestrator: KEY=VALUE of gpu-floor (MHz), gpu-up, gpu-down (% busy), gpu-hold (looks),
+        /// clamp-floor, clamp-step, good, bad (% of swaps on time), hot (C)
+        #[arg(long, value_name = "KEY=VALUE")]
+        orchestrator_set: Vec<String>,
     },
     /// One run of runtime/vmprobe's payload as a protected VM under Gunyah with AVF's crosvm: 1 vCPU, no device but
     /// the serial port; it powers off by itself, else crosvm stop after SECONDS. Refused during a session
@@ -475,6 +499,11 @@ pub enum HugepoolCommand {
         /// module name, parameters and preflight. Off unless named; `unload`, then `load` without it, goes back
         #[arg(long, conflicts_with = "ko")]
         samfor12: bool,
+        /// take23: the module's system_reserve_mb (insmod only): the RAM its table never counts as the pool's. Its own 6144
+        /// leaves the S25 Ultra a table of about 2700 pages; 3072 one of about 4000 (8 GiB), for the Images above 5 GiB of the
+        /// new boot order. It bounds what the pool may take, not what it takes: vm-boot asks --host-keep-mib at each boot
+        #[arg(long, value_name = "MIB")]
+        system_reserve_mb: Option<u32>,
     },
     /// One UI's framework stopped (as the switch stops it), the file cache dropped, the pool's want raised to N and its
     /// acquire pressed, One UI started again (as the return starts it): a script on the phone, detached, with a
@@ -667,8 +696,8 @@ pub fn main(cli: Cli) -> i32 {
         Command::Hugeblocks { free } => Adb::connect(serial).and_then(|adb| vmprobe::hugeblocks(&adb, free)),
         Command::Hugepool { command } => Adb::connect(serial).and_then(|adb| match command {
             HugepoolCommand::Status => hugepool::status(&adb),
-            HugepoolCommand::Load { ko, kapi_check, want, out, samfor12 } => {
-                hugepool::load(&adb, if samfor12 { hugepool::KO_SAMFOR12 } else { &ko }, &kapi_check, want, &out)
+            HugepoolCommand::Load { ko, kapi_check, want, out, samfor12, system_reserve_mb } => {
+                hugepool::load_with(&adb, if samfor12 { hugepool::KO_SAMFOR12 } else { &ko }, &kapi_check, want, &out, system_reserve_mb)
             }
             HugepoolCommand::Grow { want, mode, limit, out } => hugepool::grow(&adb, want, mode, limit, &out),
             HugepoolCommand::Acquire { want, mode, seconds } => hugepool::acquire(&adb, want, mode, seconds),
@@ -690,8 +719,8 @@ pub fn main(cli: Cli) -> i32 {
             HaltpollCommand::Load { ko, out } => haltpoll::load(&adb, &ko, &out),
             HaltpollCommand::Unload => haltpoll::unload(&adb),
         }),
-        Command::VmBoot { image, seconds, thp, out, stop, bridge, swipe_test, pin, droidvm, gpu_floor, cpu_floor, gpu_idle_timer, touch_boost, takeover, gpu_cap_lift, keep_gpu_cap, no_max_volume, pin_first, thermal_log, touch_time, vsync_lock, vsync_phase_us, pacectl, perf_log, unpin_workers, audio_uid, mic_capture, video_decoder, video_decoder_uid, wifictl, bridgectl, no_haptics, virgl, crosvm, gpu_host_floors, crosvm_env, no_takeover_reclaim, takeover_swappiness, no_takeover_wake, panel_rate_min } => Adb::connect(serial).and_then(|adb| {
-            if stop { vmboot::stop(&adb) } else { vmboot::vm_boot(&adb, &image, &out, &vmboot::Options { seconds, thp, bridge, swipe_test, pin, droidvm, gpu_floor_mhz: gpu_floor, cpu_floor_percent: cpu_floor, gpu_idle_ms: gpu_idle_timer, touch_boost, takeover, gpu_cap_lift: vmboot::gpu_cap_lift(takeover, gpu_cap_lift, keep_gpu_cap), max_volume: !no_max_volume, pin_first, thermal_log, touch_time, vsync: vsync_lock.then_some(vsync_phase_us), pacectl, perf: vmperf::Perf { log: perf_log, unpin: unpin_workers }, audio_uid, mic_capture, video_decoder: video_decoder.then_some(video_decoder_uid), wifictl, bridgectl, haptics: !no_haptics, virgl, crosvm, gpu_host_floors: vmboot::Floors::parse(&gpu_host_floors)?, crosvm_env, takeover_reclaim: !no_takeover_reclaim, takeover_swappiness, takeover_wake: !no_takeover_wake, panel_rate_min }) }
+        Command::VmBoot { image, seconds, thp, out, stop, bridge, swipe_test, pin, droidvm, gpu_floor, cpu_floor, gpu_idle_timer, touch_boost, takeover, gpu_cap_lift, keep_gpu_cap, no_max_volume, pin_first, thermal_log, touch_time, vsync_lock, vsync_phase_us, pacectl, perf_log, unpin_workers, audio_uid, mic_capture, video_decoder, video_decoder_uid, wifictl, bridgectl, no_haptics, virgl, crosvm, gpu_host_floors, crosvm_env, no_takeover_reclaim, takeover_swappiness, no_takeover_wake, panel_rate_min, fill_after_stop, image_larger, host_keep_mib, orchestrator, orchestrator_set } => Adb::connect(serial).and_then(|adb| {
+            if stop { vmboot::stop(&adb) } else { vmboot::vm_boot(&adb, &image, &out, &vmboot::Options { seconds, thp, bridge, swipe_test, pin, droidvm, gpu_floor_mhz: gpu_floor, cpu_floor_percent: cpu_floor, gpu_idle_ms: gpu_idle_timer, touch_boost, takeover, gpu_cap_lift: vmboot::gpu_cap_lift(takeover, gpu_cap_lift, keep_gpu_cap), max_volume: !no_max_volume, pin_first, thermal_log, touch_time, vsync: vsync_lock.then_some(vsync_phase_us), pacectl, perf: vmperf::Perf { log: perf_log, unpin: unpin_workers }, audio_uid, mic_capture, video_decoder: video_decoder.then_some(video_decoder_uid), wifictl, bridgectl, haptics: !no_haptics, virgl, crosvm, gpu_host_floors: vmboot::Floors::parse(&gpu_host_floors)?, crosvm_env, takeover_reclaim: !no_takeover_reclaim, takeover_swappiness, takeover_wake: !no_takeover_wake, panel_rate_min, take23: take23::Opts { fill_after_stop: fill_after_stop || !image_larger.is_empty(), larger: image_larger, keep_mib: host_keep_mib, orchestrator, orch_set: orchestrator_set } }) }
         }),
         Command::VmProbe { payload, mem, timeout, out, thp, droidvm, shared_ram, thp_shmem } => Adb::connect(serial).and_then(|adb| {
             let crosvm = match droidvm.as_deref() {

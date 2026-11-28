@@ -1209,7 +1209,7 @@ tsock=
 pid=
 {checks}# the last session's, kept once more: when the PC did not see its end they are all there is of it
 for f in ui.log stop.txt; do [ ! -s $f ] || mv -f $f $f.prev; done
-rm -f serial.txt crosvm.log crosvm.sock fdt.dtb dmesg.txt display.txt touch.txt touch.sock stop.request screen.off wifi.txt wifi.mac thermal.txt ui.log stop.txt perf.txt pace.txt vsync.phase boost.state.new bridge.txt bridge.sock
+rm -f serial.txt crosvm.log crosvm.sock fdt.dtb dmesg.txt display.txt touch.txt touch.sock stop.request screen.off wifi.txt wifi.mac thermal.txt ui.log stop.txt perf.txt pace.txt hostmem.txt orch.txt orch.stop vsync.phase boost.state.new bridge.txt bridge.sock
 {touch_find}
 ulimit -l unlimited 2>/dev/null || echo "ulimit -l unlimited: refused"
 # crosvm holds a file for every GPU buffer of the guest: at 32768 (the shell's) it ran out after 11 minutes of iOS (full2:
@@ -1429,6 +1429,8 @@ pub struct Options {
     pub takeover_wake: bool,
     /// --panel-rate-min HZ (Tuning::panel_rate_min; 0: the panel held at its top as before)
     pub panel_rate_min: u32,
+    /// take23: the new boot order, hostmem.txt and the clocks' orchestrator (take23.rs)
+    pub take23: crate::take23::Opts,
 }
 
 /// The power floors of take18's renderer (virglrenderer 2529a9f) that crosvm keeps (--gpu-host-floors). The renderer has
@@ -1591,6 +1593,64 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
         }
     }
     let sha = format!("{:x}", Sha256::digest(&data));
+    // take23 (take23.rs): the new boot order's Images, the largest first and the main one last; the orchestrator's numbers
+    let t23 = &o.take23;
+    let mut cands: Vec<crate::take23::Candidate> = Vec::new();
+    let mut larger_files: Vec<(String, String)> = Vec::new();
+    let orch = if t23.orchestrator {
+        if !o.takeover || !o.gpu_cap_lift || !l.gpu || o.gpu_host_floors == Floors::Off || o.virgl == "prebuilt" {
+            bail!("--orchestrator: with --takeover (its GPU cap lifted), an Image with the GPU, take18's renderer and its floors (--gpu-host-floors deadline or on)");
+        }
+        Some(crate::take23::Orch::parse(&t23.orch_set)?)
+    } else {
+        if !t23.orch_set.is_empty() {
+            bail!("--orchestrator-set needs --orchestrator");
+        }
+        None
+    };
+    if t23.fill_after_stop {
+        let need_of = |ram: u32| (u64::from(ram).saturating_sub(SMALL_PAGES_MIB_SHARED) + 1) / 2;
+        let arena_of = |d: Option<&Disks>| d.and_then(|d| d.gpu.as_ref()).map(|g| format!("{:x}", g.drm_host)).unwrap_or_default();
+        if !o.takeover || !l.shared {
+            bail!("--fill-after-stop and --image-larger: with --takeover and a shared-RAM Image");
+        }
+        if o.vsync.is_some() {
+            bail!("--fill-after-stop with --vsync-lock: the vsync page's place follows the RAM's size; not done");
+        }
+        if !(512..=4096).contains(&t23.keep_mib) {
+            bail!("--host-keep-mib: 512 to 4096 MiB");
+        }
+        if l.ram > crate::take23::MAX_RAM_MIB {
+            bail!("the Image's {} MiB: {} at most", l.ram, crate::take23::MAX_RAM_MIB);
+        }
+        // the same build but for the RAM: FILE.disks equal but for the two addresses that follow it
+        let shape = |text: &str| text.lines().filter(|l| !l.starts_with("pool ") && !l.starts_with("gpu ")).collect::<Vec<_>>().join("\n");
+        let main_text = fs::read_to_string(&list).unwrap_or_default();
+        for path in &t23.larger {
+            let more = fs::read(path).with_context(|| format!("cannot read {path}"))?;
+            let l2 = label(&more).with_context(|| format!("{path}: not an Image of xnuloader-crosvm"))?;
+            if l2.ram <= l.ram || l2.ram > crate::take23::MAX_RAM_MIB || (l2.cpus, l2.swiotlb, l2.shared, l2.gpu) != (l.cpus, l.swiotlb, l.shared, l.gpu) {
+                bail!("--image-larger {path}: {} MiB, {} vCPUs: it must have more RAM than --image ({} MiB), {} MiB at most, and the same vCPUs, pool and GPU",
+                      l2.ram, l2.cpus, l.ram, crate::take23::MAX_RAM_MIB);
+            }
+            let text2 = fs::read_to_string(format!("{path}.disks")).with_context(|| format!("no {path}.disks"))?;
+            let d2 = parse_disks(&text2).with_context(|| format!("{path}.disks"))?;
+            let drm = d2.gpu.as_ref().map(|g| g.drm_mib << 20).unwrap_or(0);
+            if shape(&text2) != shape(&main_text) || d2.pool != RAM_BASE + ((l2.ram as u64) << 20) - drm - ((l2.swiotlb as u64) << 20) {
+                bail!("--image-larger {path}: its .disks is not {list} with the pool and the GPU's arena moved to its own RAM's top: not the same build");
+            }
+            if cands.iter().any(|c| c.ram == l2.ram) {
+                bail!("--image-larger: two Images of {} MiB", l2.ram);
+            }
+            let file = format!("kernel-{}.img", l2.ram);
+            larger_files.push((path.clone(), file.clone()));
+            cands.push(crate::take23::Candidate { ram: l2.ram, need: need_of(l2.ram), arena: arena_of(Some(&d2)), file, sha: format!("{:x}", Sha256::digest(&more)) });
+        }
+        cands.sort_by(|a, b| b.ram.cmp(&a.ram));
+        cands.push(crate::take23::Candidate { ram: l.ram, need: need_of(l.ram), arena: arena_of(disks.as_ref()), file: "kernel.img".into(), sha: sha.clone() });
+    } else if !t23.larger.is_empty() {
+        bail!("--image-larger needs --fill-after-stop");
+    }
     adb.need_root()?;
     adb.refuse_in_session()?;
     if disks.as_ref().is_some_and(|d| d.fb.is_some()) && !Path::new(&o.bridge).is_file() {
@@ -1609,11 +1669,19 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
     )?;
     let available = crate::vmprobe::mem_available_mib(&meminfo).with_context(|| format!("no MemAvailable in \"{}\"", meminfo.trim()))?;
     let pool_mib = crate::hugepool::stat(&meminfo, "pool_avail").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 2;
+    if t23.fill_after_stop {
+        // take23: the rule is the script's, after One UI's stop (take23::pick_block): asked here it refused what fits then
+        println!(
+            "vm-boot: --fill-after-stop: Android has {available} MiB available and the pool {pool_mib} MiB free now, beside One UI; the Images ({}) are tried after its stop, the largest first, with {} MiB left to Android (run.txt's `pick:` lines)",
+            cands.iter().map(|c| c.ram.to_string()).collect::<Vec<_>>().join(", "), t23.keep_mib
+        );
+    } else {
     crate::vmprobe::check_mem(l.ram, available + pool_mib.min(l.ram as u64))?;
     // A takeover tops the pool up itself once One UI is down (takeover_script); beside One UI it must hold the VM already
     match check_pool(l.ram as u64, pool_mib, l.shared) {
         Err(e) if o.takeover => println!("vm-boot: {e:#}\nvm-boot: the takeover tops the pool up while One UI is down, and stops if it cannot"),
         r => r?,
+    }
     }
     if l.shared {
         let dev = adb.root_ok(&format!("[ -c {} ] && echo there || echo absent\n", crate::hostshare::DEV), "gunyah_share")?;
@@ -1626,6 +1694,13 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
     adb.root_ok(&format!("mkdir -p {DIR} && chmod 777 {DIR} && rm -f {DIR}/result {DIR}/run.txt {DIR}/serial.txt\n"), "the VM's folder")?;
     println!("vm-boot: {} MiB Image, sha256 {sha}: pushing", data.len() >> 20);
     adb.push(image, &format!("{DIR}/kernel.img"))?;
+    if t23.fill_after_stop {
+        adb.root_ok(&format!("rm -f {DIR}/kernel-[0-9]*.img\n"), "the last session's larger Images")?;
+        for (path, file) in &larger_files {
+            println!("vm-boot: --image-larger {path}: pushing as {file}");
+            adb.push(path, &format!("{DIR}/{file}"))?;
+        }
+    }
     if let Some(f) = disks.as_ref().and_then(|d| d.fb.as_ref()) {
         // The bridge and the display helper the VM runs, as built beside each other (runtime/display: make): the VM's
         // own copy, root's, so that neither depends on the staged runtime's version nor can be changed by the shell
@@ -1704,9 +1779,36 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
         bail!("--swipe-test needs an Image with the touch (xnuloader-crosvm --display)");
     }
     check_boost(&l, o, disks.as_ref())?;
-    fs::write(&script, boot_script_with(&l, o.seconds, o.thp, &sha, disks.as_ref(), o.swipe_test, o.pin, &Tuning { gpu_floor_mhz: o.gpu_floor_mhz, cpu_floor_percent: o.cpu_floor_percent, gpu_idle_ms: o.gpu_idle_ms, touch_boost: o.touch_boost, touch_time: o.touch_time, vsync: o.vsync, takeover: o.takeover, gpu_cap_lift: o.gpu_cap_lift, max_volume: o.max_volume, pin_first: o.pin_first, thermal_log: o.thermal_log, perf: o.perf, audio_uid: o.audio_uid, mic_capture: o.mic_capture, crosvm_env: crosvm_env.clone(),
+    let mut text = boot_script_with(&l, o.seconds, o.thp, &sha, disks.as_ref(), o.swipe_test, o.pin, &Tuning { gpu_floor_mhz: o.gpu_floor_mhz, cpu_floor_percent: o.cpu_floor_percent, gpu_idle_ms: o.gpu_idle_ms, touch_boost: o.touch_boost, touch_time: o.touch_time, vsync: o.vsync, takeover: o.takeover, gpu_cap_lift: o.gpu_cap_lift, max_volume: o.max_volume, pin_first: o.pin_first, thermal_log: o.thermal_log, perf: o.perf, audio_uid: o.audio_uid, mic_capture: o.mic_capture, crosvm_env: crosvm_env.clone(),
         takeover_reclaim: o.takeover_reclaim, takeover_swappiness: o.takeover_swappiness, takeover_wake: o.takeover_wake, video_decoder: o.video_decoder,
-        panel_rate_min: o.panel_rate_min }))?;
+        panel_rate_min: o.panel_rate_min });
+    // take23: the choice of the Image after One UI's stop, Android's memory log and the clocks' orchestrator (take23.rs),
+    // each at a line of the script that must be there
+    if t23.fill_after_stop {
+        let main = cands.last().context("no main Image among the candidates")?;
+        if let Some(d) = &disks {
+            if text.contains(&format!("{:x}", d.pool)) {
+                bail!("--fill-after-stop: the boot script names the pool's address (an Image without the GPU's scanout): not done for it");
+            }
+        }
+        text = crate::take23::apply_pick(&text, main, &crate::take23::pick_block(&cands, t23.keep_mib))?;
+    }
+    if t23.fill_after_stop || orch.is_some() {
+        let (start, after) = match &orch {
+            Some(orch) => (format!("{}{}", crate::take23::HOSTMEM, crate::take23::orch_start(orch)), "orch_end\n"),
+            None => (crate::take23::HOSTMEM.to_string(), ""),
+        };
+        text = crate::take23::around_wait(&text, o.seconds, &start, after)?;
+        if orch.is_some() {
+            // an end that is not the script's own (its trap): the clamp's file must not outlive the session
+            let trap = "trap 'thp_restore; gpu_restore; cpu_restore; caps_restore;";
+            if text.matches(trap).count() != 1 {
+                bail!("take23: the boot script has not its one takeover trap");
+            }
+            text = text.replace(trap, "trap 'rm -f /data/local/tmp/drm2kgsl-vcpu-uclamp; thp_restore; gpu_restore; cpu_restore; caps_restore;");
+        }
+    }
+    fs::write(&script, text)?;
     adb.push(script.to_str().context("path")?, &format!("{DIR}/boot.sh"))?;
     if o.takeover {
         // One UI's stop and start (ui.sh, sourced by boot.sh): its failsafe gives the session 5 minutes past its seconds
@@ -1723,6 +1825,12 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
     let r = adb.root(&crate::adb::detached_start(&format!("{DIR}/boot.sh")))?;
     if !r.out.contains("started") {
         bail!("the VM's script did not start (status {}): {}", r.status, r.err.trim());
+    }
+    if t23.fill_after_stop {
+        println!("vm-boot: the Image is chosen on the phone after One UI's stop: {} MiB (the largest of the list that fits); the line below names --image's", cands.iter().map(|c| c.ram.to_string()).collect::<Vec<_>>().join(" or "));
+    }
+    if orch.is_some() {
+        println!("vm-boot: the clocks' orchestrator is on (orch.txt): the GPU's cap by its load, the vCPUs' clamp by the guest's swaps on time");
     }
     match &disks {
         Some(d) => println!(
@@ -1761,7 +1869,7 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
         }
     };
     println!();
-    for name in ["serial.txt", "crosvm.log", "dmesg.txt", "run.txt", "fdt.dtb", "display.txt", "touch.txt", "thermal.txt", "wifi.txt", "bridge.txt", "ui.log", "stop.txt", "perf.txt", "pace.txt"] {
+    for name in ["serial.txt", "crosvm.log", "dmesg.txt", "run.txt", "fdt.dtb", "display.txt", "touch.txt", "thermal.txt", "wifi.txt", "bridge.txt", "ui.log", "stop.txt", "perf.txt", "pace.txt", "hostmem.txt", "orch.txt"] {
         let path = Path::new(out).join(name);
         let mut child = adb.exec_out(&format!("su -c 'cat {DIR}/{name}'"))?;
         let mut file = fs::File::create(&path)?;
@@ -1799,6 +1907,40 @@ mod tests {
         image[0x38..0x3c].copy_from_slice(b"ARM\x64");
         image[0x100..0x100 + text.len()].copy_from_slice(text);
         image
+    }
+
+    // take23: the whole chain on the script of a takeover with the GPU's scanout (take22's Images' .disks)
+    #[test]
+    fn take23s_additions_find_their_lines_in_a_takeover_script() {
+        let text = "swiotlb-mib 32\npool 0x19d800000\nstore /data/local/tmp/oneios-vmboot/data.img 16\nfb 0 4492800 720 1560 2880 4505600\ninput touch\n\
+            gpu 00:0c.0 8 0x19f800000\nscanout 720 1560 120\naudio\nwifi\nbridge\n\
+            block 10359930880 path=/data/local/tmp/oneios/image/os.img,ro=true,id=os,pci-address=00:02.0\n\
+            block - path=/data/local/tmp/oneios-vmboot/data.img,ro=false,id=data,pci-address=00:06.0\n";
+        let d = parse_disks(text).unwrap();
+        let l = Label { ram: 4608, cpus: 6, swiotlb: 32, shared: true, gpu: true };
+        let script = boot_script_with(&l, 3600, true, "ab12", Some(&d), false, true,
+            &Tuning { takeover: true, gpu_cap_lift: true, touch_boost: true, thermal_log: true, pin_first: 2, ..Tuning::DEFAULT });
+        assert!(!script.contains("19d800000"), "the pool's address is in the script");
+        let cand = |ram: u32, arena: &str, file: &str| crate::take23::Candidate { ram, need: (u64::from(ram) - 32 + 1) / 2, arena: arena.into(), file: file.into(), sha: "cd".repeat(32) };
+        let main = cand(4608, "19f800000", "kernel.img");
+        let cands = [cand(7168, "23f800000", "kernel-7168.img"), cand(6144, "1ff800000", "kernel-6144.img"), main.clone()];
+        let picked = crate::take23::apply_pick(&script, &main, &crate::take23::pick_block(&cands, 1024)).unwrap();
+        // the choice comes after One UI's stop and the cache drop, before the top-up, and nothing names 4608 MiB's values after it
+        let at = |s: &str| picked.find(s).unwrap_or_else(|| panic!("{s}"));
+        assert!(at("takeover: One UI is down while the VM runs") < at("# take23 (vm-boot --fill-after-stop"));
+        assert!(at("# take23 (vm-boot --fill-after-stop") < at("need=$NEED\n") && at("need=$NEED\n") < at("topped up while One UI is down"));
+        assert!(picked.contains("--mem size=$RAM ") && picked.contains(" $KIMG </dev/null >$D/crosvm.log") && picked.contains("drm2kgsl_host@$ARENA"));
+        assert!(!picked.contains("--mem size=4608") && !picked.contains("need=2288") && picked.matches("19f800000").count() == 1);
+        assert!(picked.contains("\n4608 2288 19f800000 kernel.img "));
+        let orch = crate::take23::Orch::DEFAULT;
+        let whole = crate::take23::around_wait(&picked, 3600, &format!("{}{}", crate::take23::HOSTMEM, crate::take23::orch_start(&orch)), "orch_end\n").unwrap();
+        let at = |s: &str| whole.find(s).unwrap_or_else(|| panic!("{s}"));
+        assert!(at("pid=$!\n") < at(") > $D/hostmem.txt 2>&1 &") && at(") > $D/hostmem.txt 2>&1 &") < at("orch_end() {"));
+        assert!(at("orchp=$!\n") < at("how=itself\n") && at("wait $pid; rc=$?\norch_end\n") < at("\ncaps_restore\n"));
+        assert_eq!(whole.matches("trap 'thp_restore; gpu_restore; cpu_restore; caps_restore;").count(), 1);
+        // without the takeover there is no `need=` line: refused, the script not half changed
+        let plain = boot_script_with(&l, 3600, true, "ab12", Some(&d), false, true, &Tuning::DEFAULT);
+        assert!(crate::take23::apply_pick(&plain, &main, "X").is_err());
     }
 
     #[test]
@@ -2405,7 +2547,7 @@ mod tests {
                           touch_boost: false, touch_time: false, vsync: None, pacectl: String::new(), perf: crate::vmperf::Perf { log: false, unpin: false },
                           takeover: false, gpu_cap_lift: true, max_volume: true, pin_first: 0, thermal_log: false, audio_uid: None, mic_capture: false, video_decoder: None, wifictl: String::new(),
                           bridgectl: String::new(), haptics: true, virgl: String::new(), crosvm: String::new(), gpu_host_floors: Floors::Deadline, crosvm_env: Vec::new(),
-                          takeover_reclaim: true, takeover_swappiness: None, takeover_wake: true, panel_rate_min: 0 };
+                          takeover_reclaim: true, takeover_swappiness: None, takeover_wake: true, panel_rate_min: 0, take23: Default::default() };
         assert!(check_boost(&l, &o, Some(&d)).unwrap_err().to_string().contains("--gpu-cap-lift needs --takeover"));
         assert!(check_boost(&l, &Options { takeover: true, ..o }, Some(&d)).is_ok());
     }
@@ -2751,7 +2893,7 @@ mod tests {
         let plain = with(crate::vmperf::Perf::default());
         // without the flags: the last session's perf.txt is cleared with the other files, and that is all
         assert!(!plain.contains("perf_") && !plain.contains("perfp") && !plain.contains("taskset") && !plain.contains("CROSVM_DRM2KGSL_DIAG") && !plain.contains("--timestats"));
-        assert!(plain.contains(" stop.txt perf.txt pace.txt vsync.phase boost.state.new bridge.txt bridge.sock\n"));
+        assert!(plain.contains(" stop.txt perf.txt pace.txt hostmem.txt orch.txt orch.stop vsync.phase boost.state.new bridge.txt bridge.sock\n"));
         let both = with(crate::vmperf::Perf { log: true, unpin: true });
         let at = |what: &str| both.find(what).unwrap_or_else(|| panic!("no {what:?}"));
         // crosvm's environment is the same with the log: no switch of drm2kgsl's (its prebuilt reads CROSVM_DRM2KGSL_DIAG as on by default)
@@ -2835,7 +2977,7 @@ ${boostv:+ --boost $boostv --boost-state $D/boost.state}${kl:+ --keys $kl --scre
         assert!(end < at("echo \"end $(date +%s)"));
         // nothing else changes, and the files of the last session go
         assert_eq!(locked.replace(&crate::vmperf::vsync_start_script(page, 2500), "").replace(&crate::vmperf::vsync_end_script(), ""), plain);
-        assert!(plain.contains(" perf.txt pace.txt vsync.phase boost.state.new bridge.txt bridge.sock\n"));
+        assert!(plain.contains(" perf.txt pace.txt hostmem.txt orch.txt orch.stop vsync.phase boost.state.new bridge.txt bridge.sock\n"));
         // a protected VM's host cannot write the VM's RAM: no pacectl there, whatever was asked
         let protected = Label { shared: false, ..l };
         assert!(!with(Some(0), &protected).contains("pacectl"));
@@ -2954,7 +3096,7 @@ ${boostv:+ --boost $boostv --boost-state $D/boost.state}${kl:+ --keys $kl --scre
                           thermal_log: false, touch_time: false, vsync: None, pacectl: String::new(), perf: crate::vmperf::Perf { log: false, unpin: false },
                           audio_uid: None, mic_capture: false, video_decoder: None, wifictl: String::new(), bridgectl: String::new(), haptics: true,
                           virgl: String::new(), crosvm: String::new(), gpu_host_floors: Floors::Deadline, crosvm_env: Vec::new(), takeover_reclaim: true,
-                          takeover_swappiness: None, takeover_wake: true, panel_rate_min: 24 };
+                          takeover_swappiness: None, takeover_wake: true, panel_rate_min: 24, take23: Default::default() };
         let refused = check_boost(&l, &o, Some(&d)).unwrap_err().to_string();
         assert!(refused.contains("--panel-rate-min HZ: 1 to 119, with --takeover, --touch-boost"), "{refused}");
         assert!(check_boost(&l, &Options { panel_rate_min: 120, touch_boost: true, ..o }, Some(&d)).is_err());

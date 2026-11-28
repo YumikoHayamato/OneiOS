@@ -150,6 +150,11 @@
 //                most the tree's (4352 and 4608 MiB give 4), in the width the tree's property has. --memory-class N (valid only with
 //                this group) is N instead: 1 to the tree's own (to 16 where the tree has none, and then written in 4 bytes); where
 //                the tree has no such property and no N is given, nothing is written
+//   take23: --identity-omit NAMES (comma-separated /product property names) leaves those out of the groups that are on (the artwork
+//                group without graphics-featureset-class and graphics-featureset-fallbacks); a name no group that is on takes: status 2.
+//                --display-gamut sRGB|P3 (with the artwork group): the gamut written, default "P3" as before (iOS and the panel say
+//                sRGB here: take19's identity-evidence.txt). The memclass group's class is now CoreUI's (machine.h
+//                xl_machine_memory_class_of): 4352 to 6143 MiB give 3 (its 4 GB class), 6144 to 8191 give 6.
 //   f root       not /product: the root's target-type, from the tree's root ("V54"), and its compatible: the tree's FIRST entry (the
 //                board name, "V54AP") and then "oneios,xnuhost" (without the group: no target-type, "oneios,xnuhost" alone). The
 //                root's model stays "iPhone18,2". The tree needs a target-type and a compatible, else status 2. xnuhost's merge
@@ -229,7 +234,7 @@ static void usage(void)
   fprintf(stderr, "usage: xnuloader-crosvm KERNEL OUT [--cpus N] [--ram-mib N] [--timebase HZ] [--args TEXT] [--args-add TEXT] [--swiotlb MIB]\n"
                   "                        [--image DIR [--phone-image DIR] [--phone-data FILE] [--display WxH [--scale 2|3] [--hz N]]] [--shared-ram [--gpu | --gpu-scanout [--gpu-intid N]] [--audio [--audio-intid N,SLOT]] [--wifi] [--media [--media-mib N]]] [--bridge]\n"
                   "                        [--jetsam-product NAME] [--prime-list FILE] [--gpu-addon FILE]\n"
-                  "                        [--identity-tree FILE [--identity-groups LIST [--memory-class N]]] [--soc-generation NAME|none]\n"
+                  "                        [--identity-tree FILE [--identity-groups LIST [--memory-class N] [--identity-omit NAMES] [--display-gamut sRGB|P3]]] [--soc-generation NAME|none]\n"
                   "                        [--display-corner-radius PT[,WORD2]]\n"
                   "  LIST: artwork, quality, workgroup, ids, memclass, root (or a to f), comma-separated, or all\n");
   exit(2);
@@ -300,6 +305,7 @@ int main(int argc, char **argv)
   unsigned gpu_intid = 0, audio_intid = 0, audio_slot = 0;
   const char *jetsam_product = NULL;
   const char *identity_path = NULL, *identity_list = NULL, *soc_generation = NULL, *corner_text = NULL;
+  const char *identity_omit = NULL, *display_gamut = NULL;   // take23
   unsigned identity_groups = 0, memory_class = 0, corner_radius = 0, corner_word2 = 1;
   bool memory_class_given = false;
   unsigned display_w = 0, display_h = 0, display_scale = 3, display_hz = 60;
@@ -345,6 +351,8 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[i], "--jetsam-product")) jetsam_product = argv[++i];
     else if (!strcmp(argv[i], "--identity-tree")) identity_path = argv[++i];
     else if (!strcmp(argv[i], "--identity-groups")) identity_list = argv[++i];
+    else if (!strcmp(argv[i], "--identity-omit")) identity_omit = argv[++i];
+    else if (!strcmp(argv[i], "--display-gamut")) display_gamut = argv[++i];
     else if (!strcmp(argv[i], "--memory-class")) {
       const char *text = argv[++i];
       memory_class_given = true;
@@ -355,7 +363,7 @@ int main(int argc, char **argv)
     else if (!strcmp(argv[i], "--media-mib")) media_mib = (unsigned)strtoul(argv[++i], NULL, 0);
     else usage();
   }
-  if (cpus < 1 || cpus > XL_MAX_CPUS || ram_mib < 512 || ram_mib > 6144) { fprintf(stderr, "xnuloader-crosvm: 1-%d CPUs, 512-6144 MiB\n", XL_MAX_CPUS); return 2; }
+  if (cpus < 1 || cpus > XL_MAX_CPUS || ram_mib < 512 || ram_mib > 8192) { fprintf(stderr, "xnuloader-crosvm: 1-%d CPUs, 512-8192 MiB\n", XL_MAX_CPUS); return 2; }   // take23: 6144 before (the new boot order's Images); nothing of the layout is at a fixed address above the RAM (crosvm's PCI window follows it)
   // the GPU's buffers are the guest's own pages, which only a shared-RAM VM's host reaches
   if (gpu && !shared_ram) { fprintf(stderr, "xnuloader-crosvm: --gpu needs --shared-ram\n"); return 2; }
   // the sound card's queues and periods are the guest's own pages too
@@ -383,6 +391,27 @@ int main(int argc, char **argv)
       return 2;
     }
     if (!identity_path) { fprintf(stderr, "xnuloader-crosvm: --identity-groups needs --identity-tree\n"); return 2; }
+  }
+  if (identity_omit && !identity_groups) { fprintf(stderr, "xnuloader-crosvm: --identity-omit needs --identity-groups\n"); return 2; }
+  if (display_gamut && strcmp(display_gamut, "sRGB") && strcmp(display_gamut, "P3")) {
+    fprintf(stderr, "xnuloader-crosvm: --display-gamut: sRGB or P3 (CoreUI's names; default P3, written only with the artwork group)\n");
+    return 2;
+  }
+  if (display_gamut && !(identity_groups & XL_IDENTITY_ARTWORK)) {
+    fprintf(stderr, "xnuloader-crosvm: --display-gamut needs --identity-groups artwork (the gamut is written only with that group)\n");
+    return 2;
+  }
+  for (const char *o = identity_omit; o && *o; ) {   // each name: one a group that is on takes
+    char name[64];
+    const char *end = strchr(o, ',');
+    const size_t len = end ? (size_t)(end - o) : strlen(o);
+    if (!len || len >= sizeof name) { fprintf(stderr, "xnuloader-crosvm: --identity-omit: an empty or too long name\n"); return 2; }
+    memcpy(name, o, len); name[len] = 0;
+    if (!(identity_groups & xl_identity_group_of(name))) {
+      fprintf(stderr, "xnuloader-crosvm: --identity-omit: \"%s\" is not a property of an identity group that is on\n", name);
+      return 2;
+    }
+    o = end ? end + 1 : o + len;
   }
   if (memory_class_given && !(identity_groups & XL_IDENTITY_MEMCLASS)) {
     fprintf(stderr, "xnuloader-crosvm: --memory-class needs --identity-tree and --identity-groups memclass (or all)\n");
@@ -565,6 +594,8 @@ int main(int argc, char **argv)
   // generation and the panel's corner radius, which are the machine's own
   m.identity_product = identity;
   m.identity_groups = identity_groups;
+  m.identity_omit = identity_omit;
+  if (display_gamut) m.display_gamut = display_gamut;
   m.vm_ram_mib = ram_mib;
   m.memory_class = memory_class;
   m.soc_generation = soc_generation;
@@ -834,8 +865,8 @@ int main(int argc, char **argv)
           printf("on: device-perf-memory-class %llu in %u bytes (--memory-class, 1 to %u)\n", (unsigned long long)klass, wrote->length,
                  xl_machine_memory_class_max(identity));
         else
-          printf("on: device-perf-memory-class %llu in %u bytes (the VM's %u MiB: its whole GiB, from 2 to %u)\n", (unsigned long long)klass,
-                 wrote->length, ram_mib, xl_machine_memory_class_max(identity));
+          printf("on: device-perf-memory-class %llu in %u bytes (the VM's %u MiB: CoreUI's %u MiB class, the largest its RAM holds; Apple's own is %u)\n",
+                 (unsigned long long)klass, wrote->length, ram_mib, xl_machine_memory_class_mib((uint32_t)klass), xl_machine_memory_class_max(identity));
       } else {
         char names[1024];
         const unsigned count = group_written(tree, group, names, sizeof names);
@@ -843,6 +874,7 @@ int main(int argc, char **argv)
         if (count) printf("on: %u from the tree (%s)", count, names);
         else printf("on: nothing from the tree (it has none of them)");
         if (gamut) printf(", and artwork-display-gamut \"%s\" (the machine's)", (const char *)gamut->value);
+        if (identity_omit) printf("; left out by --identity-omit where the group has them: %s", identity_omit);
         printf("\n");
       }
     }
