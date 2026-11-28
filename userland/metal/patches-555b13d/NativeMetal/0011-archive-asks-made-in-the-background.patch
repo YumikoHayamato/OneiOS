@@ -8,7 +8,8 @@ it needs no compile") was left alone by 0009 and refused by the runtime (no bina
 the kept states when an equal descriptor's state is kept; when none is, the ask is refused as before and a copy of the descriptor
 (binaryArchives cleared) is made on a serial utility-QoS queue, after the render server's own asks have been quiet for 100 ms, one
 every 4 ms; the state is kept (and recorded in prewarm2.log) by 0009's oneiosKeepState, so the first real use is returned at once
-and the next boot's pass makes it too. Each descriptor is queued once a boot; nothing is queued past oneios-prewarm-max.
+and the next boot's pass makes it too. Each descriptor is queued once a boot (one that was made leaves the queued set: it is a kept state then; one that failed stays and
+is not tried again); nothing is queued past oneios-prewarm-max (kept + queued).
 Why: take22b's iOS log, backboardd, 03:49:08.3-08.5 UTC: 64 "render pipeline refused: ... BinaryArchiveMiss ... compiler untried"
 lines in 0.2 s (the log's limit; the count after it is not printed), for fixed_frag_lph_cpf, the path_*, blur, downsample and all the
 glass_* functions: Core Animation's own list of the pipelines the system's animations need, asked before any of them is drawn. They
@@ -28,18 +29,20 @@ says backboardd made +1277, +970 and +889 GPU blobs in 10 s each (28 in a round 
 were under 64 KiB, oneios-gpu-legs that 62 of the 1277 took 8 ms or longer (8 over 33 ms). The kernel cannot say whether they are
 buffers or textures, nor which call made them; this line does, for the diagnostic image.
 Checked on the PC: applies to 935c468 after 0001-0010 (git apply); the base's build-adreno-metal-plugin.py (UniXNU 8789b8d) edits none
-of the lines touched. Not compiled here (no iPhoneOS SDK): the CI is its first compile. Nothing of it has run.
+of the lines touched; the new code and its three call sites pass clang++ -fsyntax-only -Werror -Wall -Wextra against stand-in
+declarations (the CI's first compile, run 46109240136, stopped at -Wvexing-parse on `bool oneiosResOn();` declared inside a
+method: `(void)` now). Nothing of it has run.
 Removable: yes (ONEIOS_METAL_SKIP=archive-asks-made-in-the-background).
 
 diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
-index 28b3f23..b6ba859 100644
+index 28b3f23..cbe2f6c 100644
 --- a/NativeBridgeMetalFrontend.mm
 +++ b/NativeBridgeMetalFrontend.mm
 @@ -5647,7 +5647,10 @@ static void fillBaseLimits(id device);
   NBQueue *queue=[NBQueue new];queue.handle=handle;return (id<MTLCommandQueue>)queue;
  }
  - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
-+ bool oneiosResOn();void oneiosResNote(int,uint64_t,uint64_t);   // OneiOS 0011, at the end of this file
++ bool oneiosResOn(void);void oneiosResNote(int,uint64_t,uint64_t);   // OneiOS 0011, at the end of this file
 + const uint64_t resBegan=oneiosResOn()?nowUs():0;
   NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,nullptr);
 + if(resBegan)oneiosResNote(0,length,resBegan);
@@ -50,7 +53,7 @@ index 28b3f23..b6ba859 100644
  }
  - (id<MTLBuffer>)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options {
   if(!bytes)return nil;
-+ bool oneiosResOn();void oneiosResNote(int,uint64_t,uint64_t);   // OneiOS 0011
++ bool oneiosResOn(void);void oneiosResNote(int,uint64_t,uint64_t);   // OneiOS 0011
 + const uint64_t resBegan=oneiosResOn()?nowUs():0;
   NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,bytes);
 + if(resBegan)oneiosResNote(0,length,resBegan);
@@ -61,7 +64,7 @@ index 28b3f23..b6ba859 100644
  }
  - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
   NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
-+ bool oneiosResOn();void oneiosResNote(int,uint64_t,uint64_t);   // OneiOS 0011
++ bool oneiosResOn(void);void oneiosResNote(int,uint64_t,uint64_t);   // OneiOS 0011
 + const uint64_t resBegan=oneiosResOn()?nowUs():0;
   NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
 + if(resBegan)oneiosResNote(1,(uint64_t)descriptor.width*(uint64_t)descriptor.height*4,resBegan);
@@ -76,7 +79,7 @@ index 28b3f23..b6ba859 100644
 +// menus opened, backboardd made 900-1300 GPU blobs in 10 s, nearly all under 64 KiB, 5 % of them 8 ms or longer (the kernel's
 +// oneios-gpu-legs); the kernel cannot say what they are. With ONEIOS_RES_LOG=1 (oneios-res-log=1), backboardd only: buffers and
 +// textures made since the last line, by size, with the time spent making them; at most a line every 2 s, none while nothing is made.
-+bool oneiosResOn() {static const bool on=[](){const char *v=getenv("ONEIOS_RES_LOG");return v && !strcmp(v,"1") && !strcmp(getprogname(),"backboardd");}();return on;}
++bool oneiosResOn(void) {static const bool on=[](){const char *v=getenv("ONEIOS_RES_LOG");return v && !strcmp(v,"1") && !strcmp(getprogname(),"backboardd");}();return on;}
 +void oneiosResNote(int kind,uint64_t bytes,uint64_t began) {
 + static std::atomic<uint64_t> count[2][5],us[2],slow[2],most[2],said{0};
 + const uint64_t now=nowUs(),took=now-began;
@@ -97,7 +100,7 @@ index 28b3f23..b6ba859 100644
  static bool prewarmOn() {static const bool on=[](){const char *v=getenv("ONEIOS_PREWARM");return v && !strcmp(v,"1") && !strcmp(getprogname(),"backboardd");}();return on;}
  static std::mutex &gKeptLock=*new std::mutex;   // never destroyed (see gAskedLock)
  static std::unordered_map<std::string,id> &gKept=*new std::unordered_map<std::string,id>;
-@@ -7215,16 +7246,61 @@ static void prewarmStart();
+@@ -7215,16 +7246,66 @@ static void prewarmStart();
  static thread_local bool tPrewarming;   // the made-again thread's own creations do not hold it back
  // The creation's hooks (newRenderPipelineStateWithDescriptor:options:reflection:error: declares them where it calls them): the kept
  // state of an equal descriptor, or nil; and the state it made, to keep.
@@ -115,11 +118,12 @@ index 28b3f23..b6ba859 100644
 +       when,(unsigned long long)gArchiveAsks.load(),(unsigned long long)gArchiveHits.load(),(unsigned long long)gArchiveMade.load(),
 +       (unsigned long long)gArchiveFailed.load(),(unsigned long long)gArchiveFull.load(),keptMost());
 +}
-+static void archiveMake(MTLRenderPipelineDescriptor *d) {
++static void archiveMake(MTLRenderPipelineDescriptor *d,const std::string &queuedKey) {
 + static dispatch_queue_t queue=dispatch_queue_create("oneios.prewarm.archive",dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_UTILITY,0));
 + MTLRenderPipelineDescriptor *copy=[d copy];
 + if(!copy)return;
 + copy.binaryArchives=nil;
++ const std::string key=queuedKey;
 + dispatch_async(queue,^{
 +  struct Flag {Flag(){tPrewarming=true;} ~Flag(){tPrewarming=false;}} flag;   // GCD's thread serves others after this block
 +  while(nowUs()-gLastAsked.load()<100000)usleep(20000);   // the render server first
@@ -128,6 +132,8 @@ index 28b3f23..b6ba859 100644
 +   NSError *e=nil;
 +   id<MTLRenderPipelineState> state=[device newRenderPipelineStateWithDescriptor:copy error:&e];   // kept by oneiosKeepState
 +   if(state)gArchiveMade++;else gArchiveFailed++;
++   // made: it is among the kept states now and no longer counts as queued (a failed one stays: not tried again this boot)
++   if(state){std::lock_guard<std::mutex> lock(gKeptLock);gArchiveQueued.erase(key);}
 +  }
 +  const uint64_t done=gArchiveMade.load()+gArchiveFailed.load();
 +  if(done==1 || done%64==0)archiveSay("so far");
@@ -147,6 +153,7 @@ index 28b3f23..b6ba859 100644
 - const uint64_t hits=++gKeptHits;
 - if(hits%1000==0)NBLOG(@"native-metal: kept states: %llu returned, %llu made",(unsigned long long)hits,(unsigned long long)gKeptMade.load());
 - return it->second;
++ std::string queued;
 + {std::string line;std::lock_guard<std::mutex> lock(gKeptLock);
 +  const std::string key=keptKey(d,&line);if(key.empty())return nil;
 +  if(archiveAsk)gArchiveAsks++;
@@ -160,13 +167,14 @@ index 28b3f23..b6ba859 100644
 +  if(!archiveAsk)return nil;
 +  if(gKept.size()+gArchiveQueued.size()>=keptMost()){gArchiveFull++;return nil;}
 +  if(!gArchiveQueued.insert(key).second)return nil;   // asked before: being made, or it failed
++  queued=key;
 + }
-+ archiveMake(d);
++ archiveMake(d,queued);
 + return nil;
  }
  void oneiosKeepState(MTLRenderPipelineDescriptor *d,id state) {
   if(!prewarmOn() || !state)return;
-@@ -7369,5 +7445,6 @@ static void prewarmStart() {
+@@ -7369,5 +7450,6 @@ static void prewarmStart() {
    }
    NBLOG(@"native-metal: prewarm: %u of %zu descriptors made in %llu ms (%u refused, %u already kept)",made,lines.size(),
          (unsigned long long)((nowUs()-began)/1000),refused,kept);
