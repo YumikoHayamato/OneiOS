@@ -118,7 +118,7 @@ index a533aea..fa15535 100644
 +}
 +// The descriptor's text for the journal's R line (samples, topology, depth/stencil, label, attachments, vertex descriptor, both
 +// functions); `sorted`: with each function's constant words sorted (the key's form).
-+static std::string prewarmLine(MTLRenderPipelineDescriptor *d,NBFunction *vf,NBFunction *ff,bool sorted=false) {
++static std::string oneiosFnToken(NBFunction *f){const char *s=f.sourceName.UTF8String,*n=f.name.UTF8String;if(!s || !*s)return n && *n?n:"-";std::string t=s;if(n && *n && strcmp(n,s)){t+="@";t+=n;}return t;}   /* take22: SOURCE or SOURCE@SPECIALIZED. Core Animation makes its functions with MTLFunctionDescriptor.specializedName and .name then says that label ("VfxU10Xh"), which no library has: take21b's prewarm refused 846 of 1024 descriptors for it */ static id<MTLFunction> oneiosPrewarmFunction(id<MTLLibrary> library,const std::string &token,MTLFunctionConstantValues *values){NSError *e=nil;const size_t at=token.find('@');if(at==std::string::npos)return values?[library newFunctionWithName:[NSString stringWithUTF8String:token.c_str()] constantValues:values error:&e]:[library newFunctionWithName:[NSString stringWithUTF8String:token.c_str()]];MTLFunctionDescriptor *fd=[MTLFunctionDescriptor new];fd.name=[NSString stringWithUTF8String:token.substr(0,at).c_str()];fd.specializedName=[NSString stringWithUTF8String:token.substr(at+1).c_str()];fd.constantValues=values;return [library newFunctionWithDescriptor:fd error:&e];} static std::string prewarmLine(MTLRenderPipelineDescriptor *d,NBFunction *vf,NBFunction *ff,bool sorted=false) {
 + char head[160];
 + snprintf(head,sizeof head,"R t=0 us=0 ok=1 samples=%lu topo=%lu ds=%lu/%lu label=",(unsigned long)d.rasterSampleCount,(unsigned long)d.inputPrimitiveTopology,
 +     (unsigned long)d.depthAttachmentPixelFormat,(unsigned long)d.stencilAttachmentPixelFormat);
@@ -137,8 +137,8 @@ index a533aea..fa15535 100644
 +      (unsigned long)l.stepFunction,(unsigned long)l.stepRate);
 +  line+=head;
 + }
-+ line+=" | v ";line+=vf.name.UTF8String?:"-";line+=" ";line+=sorted?sortedWords(vf.constantsText):vf.constantsText;
-+ line+=" | f ";line+=ff?(ff.name.UTF8String?:"-"):"-";line+=" ";line+=ff?(sorted?sortedWords(ff.constantsText):ff.constantsText):std::string();
++ line+=" | v ";line+=oneiosFnToken(vf);line+=" ";line+=sorted?sortedWords(vf.constantsText):vf.constantsText;
++ line+=" | f ";line+=ff?oneiosFnToken(ff):std::string("-");line+=" ";line+=ff?(sorted?sortedWords(ff.constantsText):ff.constantsText):std::string();
 + for(char &c:line)if(c=='\n')c=' ';
 + return line;
 +}
@@ -164,10 +164,10 @@ index a533aea..fa15535 100644
 +// (the user's ~/Library/Caches/com.apple.backboardd/m2v, its marker 0x6814).
 +static std::string prewarmPath() {
 + static const std::string path=[](){
-+  if(!gJournalPath.empty())return gJournalPath.substr(0,gJournalPath.rfind('/'))+"/prewarm.log";
++  if(!gJournalPath.empty())return gJournalPath.substr(0,gJournalPath.rfind('/'))+"/prewarm2.log";   // take22: prewarm.log holds take21's label-form records
 +  const passwd *user=getpwuid(getuid());
 +  const std::string home=user && user->pw_dir && user->pw_dir[0]?user->pw_dir:"/var/mobile";
-+  return home+"/Library/Caches/com.apple.backboardd/m2v/prewarm.log";
++  return home+"/Library/Caches/com.apple.backboardd/m2v/prewarm2.log";
 + }();
 + return path;
 +}
@@ -312,13 +312,13 @@ index a533aea..fa15535 100644
 +    bool found=false;
 +    for(id<MTLLibrary> library:loaded) {
 +     NSError *e=nil;
-+     id<MTLFunction> vf=vc?[library newFunctionWithName:[NSString stringWithUTF8String:p.vertex.c_str()] constantValues:vc error:&e]:
-+                           [library newFunctionWithName:[NSString stringWithUTF8String:p.vertex.c_str()]];
++     id<MTLFunction> vf=oneiosPrewarmFunction(library,p.vertex,vc);   // take22: by its source name, specialized as the record says
++     (void)e;
 +     if(!vf)continue;
 +     id<MTLFunction> ff=nil;
 +     if(p.fragment!="-" && !p.fragment.empty()) {
-+      ff=fc?[library newFunctionWithName:[NSString stringWithUTF8String:p.fragment.c_str()] constantValues:fc error:&e]:
-+            [library newFunctionWithName:[NSString stringWithUTF8String:p.fragment.c_str()]];
++      ff=oneiosPrewarmFunction(library,p.fragment,fc);
++      (void)e;
 +      if(!ff)continue;
 +     }
 +     d.vertexFunction=vf;d.fragmentFunction=ff;found=true;break;
