@@ -40,6 +40,9 @@ pub struct Opts {
 }
 
 pub const KEEP_MIB: u32 = 1024;
+/// The most seconds the choice may spend on one candidate (two settles of 30 s, the acquire's 3 + 120 + 2, the hash): the
+/// takeover's failsafe is given this much more for each (vm_boot).
+pub const PICK_SECONDS: u32 = 200;
 /// The most RAM of an Image in the new order (the loader's own limit).
 pub const MAX_RAM_MIB: u32 = 8192;
 
@@ -60,7 +63,7 @@ pub fn pick_block(cands: &[Candidate], keep_mib: u32) -> String {
 
 const PICK: &str = r##"# take23 (vm-boot --fill-after-stop / --image-larger): the largest Image that fits, now that One UI is down
 KEEP=__KEEP__
-PMAX=$(cat $P/pool_size_max 2>/dev/null); case $PMAX in ''|*[!0-9]*) PMAX=0 ;; esac
+PMAX=$(cat $P/pool_size_max 2>/dev/null); case $PMAX in ''|*[!0-9]*|0) PMAX=; echo "pick: the module's pool_size_max is not readable: its table is not asked (the pool's pages coming is the test)" ;; esac
 RAM=; NEED=; ARENA=; KIMG=
 pool_n() { v=$(grep "^$1=" $P/refill_stat 2>/dev/null | cut -d= -f2); case $v in ''|*[!0-9]*) v=0 ;; esac; echo $v; }
 pool_settle() { ps=0; while [ $ps -lt $1 ] && ! grep -q '^acquire_active=0$' $P/refill_stat; do sleep 1; ps=$((ps + 1)); done; }
@@ -69,7 +72,7 @@ while read cram cneed carena cfile csha; do
   ma=$(sed -n 's/^MemAvailable: *\([0-9]*\).*/\1/p' /proc/meminfo); ma=$((${ma:-0} / 1024))
   pa=$(pool_n pool_avail)
   left=$((ma - 2 * (cneed - pa) - 32))
-  if [ $cneed -gt $PMAX ]; then
+  if [ -n "$PMAX" ] && [ $cneed -gt $PMAX ]; then
     echo "pick: $cram MiB: no: it takes $cneed pool pages and the module's table holds $PMAX (hugepool load --system-reserve-mb)"; continue
   fi
   if [ $left -lt $KEEP ]; then
@@ -187,10 +190,10 @@ impl Orch {
                 _ => bail!("--orchestrator-set {k}: gpu-floor, gpu-up, gpu-down, gpu-hold, clamp-floor, clamp-step, good, bad or hot"),
             }
         }
-        if !(160..=1200).contains(&o.gpu_floor) || !(20..=95).contains(&o.gpu_up) || o.gpu_down >= o.gpu_up || !(1..=120).contains(&o.gpu_hold)
+        if !(607..=1200).contains(&o.gpu_floor) || !(20..=95).contains(&o.gpu_up) || o.gpu_down >= o.gpu_up || !(1..=120).contains(&o.gpu_hold)
             || o.clamp_floor > 1024 || !(16..=512).contains(&o.clamp_step) || !(50..=100).contains(&o.good) || o.bad >= o.good || !(70..=110).contains(&o.hot)
         {
-            bail!("--orchestrator-set: gpu-floor 160..1200 MHz, gpu-up 20..95 %, gpu-down under gpu-up, gpu-hold 1..120 looks, clamp-floor 0..1024, clamp-step 16..512, good 50..100 %, bad under good, hot 70..110 C");
+            bail!("--orchestrator-set: gpu-floor 607..1200 MHz (the touch boost's lowest clock is 607: a cap under it would fight it), gpu-up 20..95 %, gpu-down under gpu-up, gpu-hold 1..120 looks, clamp-floor 0..1024, clamp-step 16..512, good 50..100 %, bad under good, hot 70..110 C");
         }
         Ok(o)
     }
@@ -369,7 +372,7 @@ mod tests {
         assert_eq!(Orch::parse(&[]).unwrap(), Orch::DEFAULT);
         let o = Orch::parse(&["gpu-floor=734".into(), "good=95".into(), "clamp-floor=640".into()]).unwrap();
         assert_eq!((o.gpu_floor, o.good, o.clamp_floor), (734, 95, 640));
-        for bad in ["gpu-floor=100", "gpu-up=10", "gpu-down=60", "good=40", "bad=95", "hot=200", "what=1", "gpu-floor", "gpu-floor=x", "clamp-step=0"] {
+        for bad in ["gpu-floor=100", "gpu-floor=525", "gpu-up=10", "gpu-down=60", "good=40", "bad=95", "hot=200", "what=1", "gpu-floor", "gpu-floor=x", "clamp-step=0"] {
             assert!(Orch::parse(&[bad.to_string()]).is_err(), "{bad}");
         }
         let s = orch_start(&Orch::DEFAULT);

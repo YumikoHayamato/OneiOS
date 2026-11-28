@@ -1801,25 +1801,29 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
         text = crate::take23::around_wait(&text, o.seconds, &start, after)?;
         if orch.is_some() {
             // an end that is not the script's own (its trap): the clamp's file must not outlive the session
+            // (and the loop must not write the cap after caps_restore put Samsung's back)
             let trap = "trap 'thp_restore; gpu_restore; cpu_restore; caps_restore;";
             if text.matches(trap).count() != 1 {
                 bail!("take23: the boot script has not its one takeover trap");
             }
-            text = text.replace(trap, "trap 'rm -f /data/local/tmp/drm2kgsl-vcpu-uclamp; thp_restore; gpu_restore; cpu_restore; caps_restore;");
+            text = text.replace(trap, "trap '[ -z \"$orchp\" ] || kill $orchp 2>/dev/null; rm -f /data/local/tmp/drm2kgsl-vcpu-uclamp; thp_restore; gpu_restore; cpu_restore; caps_restore;");
         }
     }
     fs::write(&script, text)?;
     adb.push(script.to_str().context("path")?, &format!("{DIR}/boot.sh"))?;
+    // take23: the choice of the Image runs between One UI's stop and crosvm's start; the failsafe and this tool's own wait
+    // for the end are that much longer
+    let pick_extra = if t23.fill_after_stop { crate::take23::PICK_SECONDS * cands.len() as u32 } else { 0 };
     if o.takeover {
         // One UI's stop and start (ui.sh, sourced by boot.sh): its failsafe gives the session 5 minutes past its seconds
         let ui = Path::new(out).join("ui.sh");
-        fs::write(&ui, ui_script(o.seconds + 300))?;
+        fs::write(&ui, ui_script(o.seconds + 300 + pick_extra))?;
         adb.push(ui.to_str().context("path")?, &format!("{DIR}/ui.sh"))?;
         adb.root_ok(&format!("chown root:root {DIR}/ui.sh && chmod 755 {DIR}/ui.sh\n"), "ui.sh's owner")?;
         println!(
             "vm-boot: takeover: One UI's framework stops while the VM runs and starts again when it ends (volume down 10 s, \
              --stop, its seconds, or any end of the script); its failsafe starts it after {} s whatever happens",
-            o.seconds + 300
+            o.seconds + 300 + pick_extra
         );
     }
     let r = adb.root(&crate::adb::detached_start(&format!("{DIR}/boot.sh")))?;
@@ -1846,7 +1850,7 @@ pub fn vm_boot(adb: &Adb, image: &str, out: &str, o: &Options) -> Result<()> {
     let mut shown = 0u64;
     let result = loop {
         std::thread::sleep(Duration::from_secs(2));
-        if t0.elapsed() > Duration::from_secs(o.seconds as u64 + 120) {
+        if t0.elapsed() > Duration::from_secs(o.seconds as u64 + 120 + pick_extra as u64) {
             bail!("no end after {} s: read {DIR}/run.txt", t0.elapsed().as_secs());
         }
         let r = match adb.root(&format!(
